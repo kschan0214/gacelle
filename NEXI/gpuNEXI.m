@@ -1,4 +1,4 @@
-classdef gpuNEXIdot
+classdef gpuNEXI
 
     properties (GetAccess = public, SetAccess = protected)
         b;
@@ -8,7 +8,7 @@ classdef gpuNEXIdot
     
     methods
 
-        function this = gpuNEXIdot(b, Delta, varargin)
+        function this = gpuNEXI(b, Delta, varargin)
 %NEXIDOT Exchange rate estimation using NEXI model with dot compartment
 % smt = NEXIdot(b, Delta[, Nav])
 %       output:
@@ -48,7 +48,9 @@ classdef gpuNEXIdot
             end
         end
 
-        function [fa, Da, De, ra, fdot] = fit(this,y,mask,fitting,pars0)
+        function [fa, Da, De, ra, out] = fit(this,y,mask,fitting,pars0)
+
+            gpuDevice;
 
             dims = size(y);
 
@@ -60,6 +62,10 @@ classdef gpuNEXIdot
             if nargin < 4
                 fitting = struct();
             end
+            numMaskVox = numel(mask(mask ~= 0)) / dims(1);
+
+            mask = gpuArray(single(mask));  
+            y    = gpuArray(single(y));
 
             if nargin == 5
                 % if prior is provided
@@ -67,7 +73,6 @@ classdef gpuNEXIdot
                 parameters.Da   = gpuArray( dlarray(pars0(2,:,:,:)));
                 parameters.De   = gpuArray( dlarray(pars0(3,:,:,:)));
                 parameters.ra   = gpuArray( dlarray(pars0(4,:,:,:)));
-                parameters.fdot = gpuArray( dlarray(pars0(5,:,:,:)));
             else
                 % otherwise initialise model parameters randomly
                 parameters = this.initialise_model(dims(2:end));
@@ -102,6 +107,21 @@ classdef gpuNEXIdot
             else
                 tol = 1e-6;
             end
+            if isfield(fitting,'lambda')
+                lambda = fitting.lambda;
+            else
+                lambda = 0;
+            end
+            if isfield(fitting,'TVmode')
+                TVmode = fitting.TVmode;
+            else
+                TVmode = '2D';
+            end
+            if isfield(fitting,'display')
+                isdisplay = fitting.display;
+            else
+                isdisplay = 0;
+            end
 
             % display optimisation algorithm parameters
             disp(['Maximum no. of iteration = ' num2str(numEpochs)]);
@@ -109,12 +129,14 @@ classdef gpuNEXIdot
             disp(['Loss step tolerance      = ' num2str(stepTol)]);
             disp(['Initial learning rate    = ' num2str(initialLearnRate)]);
             disp(['Learning rate decay rate = ' num2str(decayRate)]);
+            if lambda > 0 
+                disp(['Regularisation parameter = ' num2str(lambda)]);
+            end
     
             % optimisation process
             averageGrad     = [];
             averageSqGrad   = [];
             
-            isdisplay = 1;
             if isdisplay
                 figure
                 C = colororder;
@@ -127,40 +149,47 @@ classdef gpuNEXIdot
                 start = tic;
             end
 
-            scaleFactor     = [0.5, 3, 1, 0.1, 0.1];
+            scaleFactor     = [0.5, 3, 1, 0.1];
+            ub              = [1,   3, 3, 1];
+            lb              = [eps,eps,eps,1/250];
             
+            minLoss         = inf;
             loss_last       = 0;
-            gradient_loss   = 1+stepTol;
+            loss_gradient   = 1+stepTol;
             % optimisation
             for epoch = 1:numEpochs
 
-                if gradient_loss > stepTol || tol < loss
+                if loss_gradient > stepTol || tol < loss
 
                     % Lower bound
-                    parameters.fa   = max(parameters.fa,eps)  ;
-                    parameters.Da   = max(parameters.Da,eps)  ;   
-                    parameters.De   = max(parameters.De,eps)  ;
-                    parameters.ra   = max(parameters.ra,eps)  ;
-                    parameters.fdot = max(parameters.fdot,eps);
+                    parameters.fa   = max(parameters.fa,lb(1))  ;
+                    parameters.Da   = max(parameters.Da,lb(2))  ;   
+                    parameters.De   = max(parameters.De,lb(3))  ;
+                    parameters.ra   = max(parameters.ra,lb(4))  ;
                     % upper bound
-                    parameters.fa   = min(parameters.fa,1/scaleFactor(1))  ;
-                    parameters.Da   = min(parameters.Da,3/scaleFactor(2))  ;
-                    parameters.De   = min(parameters.De,3/scaleFactor(3))  ;
-                    parameters.ra   = min(parameters.ra,1/scaleFactor(4))  ;
-                    parameters.fdot = min(parameters.fdot,1/scaleFactor(5));
+                    parameters.fa   = min(parameters.fa,ub(1)/scaleFactor(1))  ;
+                    parameters.Da   = min(parameters.Da,ub(2)/scaleFactor(2))  ;
+                    parameters.De   = min(parameters.De,ub(3)/scaleFactor(3))  ;
+                    parameters.ra   = min(parameters.ra,ub(4)/scaleFactor(4))  ;
                     
                     % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                    [gradients,loss] = dlfeval(accfun,parameters,y,mask,scaleFactor);
+                    [gradients,loss] = dlfeval(accfun,parameters,y,mask,scaleFactor,numMaskVox,lambda,TVmode);
                 
                     % Update learning rate.
                     learningRate = initialLearnRate / (1+decayRate*epoch);
+
+                    loss = loss/numMaskVox;
                 
+                    loss_gradient   = abs(loss_last - loss);
+                    loss_last       = loss;
+                    if minLoss > loss
+                        minLoss = loss;
+                        parameters_minLoss = parameters;
+                    end
+
                     % Update the network parameters using the adamupdate function.
                     [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
                         averageSqGrad,epoch,learningRate);
-
-                    gradient_loss = abs(loss_last - loss);
-                    loss_last = loss;
     
                     if isdisplay
                         loss = double(gather(extractdata(loss)));
@@ -174,38 +203,76 @@ classdef gpuNEXIdot
                 end
                 
             end
+            
+            % make sure the final results stay within boundary
+            % Lower bound
+            parameters.fa   = max(parameters.fa,lb(1))  ;
+            parameters.Da   = max(parameters.Da,lb(2))  ;   
+            parameters.De   = max(parameters.De,lb(3))  ;
+            parameters.ra   = max(parameters.ra,lb(4))  ;
+            % upper bound
+            parameters.fa   = min(parameters.fa,ub(1)/scaleFactor(1))  ;
+            parameters.Da   = min(parameters.Da,ub(2)/scaleFactor(2))  ;
+            parameters.De   = min(parameters.De,ub(3)/scaleFactor(3))  ;
+            parameters.ra   = min(parameters.ra,ub(4)/scaleFactor(4))  ;
+            
+            fa      = double(gather(extractdata(parameters.fa.* mask(1,:,:,:))))    * scaleFactor(1) ; fa    = reshape(fa, [dims(2:end) 1]);
+            Da      = double(gather(extractdata(parameters.Da.* mask(1,:,:,:))))    * scaleFactor(2) ; Da    = reshape(Da, [dims(2:end) 1]);
+            De      = double(gather(extractdata(parameters.De.* mask(1,:,:,:))))    * scaleFactor(3) ; De    = reshape(De, [dims(2:end) 1]);
+            ra      = double(gather(extractdata(parameters.ra.* mask(1,:,:,:))))    * scaleFactor(4) ; ra    = reshape(ra, [dims(2:end) 1]);
+            
+            out.final.fa = fa;
+            out.final.Da = Da;
+            out.final.De = De;
+            out.final.ra = ra;
+            out.final.loss = double(gather(extractdata(loss_last)));
 
-            fa      = double(gather(extractdata(parameters.fa)))    * scaleFactor(1); fa    = reshape(fa, [dims(2:end) 1]);
-            Da      = double(gather(extractdata(parameters.Da)))    * scaleFactor(2); Da    = reshape(Da, [dims(2:end) 1]);
-            De      = double(gather(extractdata(parameters.De)))    * scaleFactor(3); De    = reshape(De, [dims(2:end) 1]);
-            ra      = double(gather(extractdata(parameters.ra)))    * scaleFactor(4); ra    = reshape(ra, [dims(2:end) 1]);
-            fdot    = double(gather(extractdata(parameters.fdot)))  * scaleFactor(5); fdot  = reshape(fdot, [dims(2:end) 1]);
+            out.min.fa      = double(gather(extractdata(parameters_minLoss.fa.* mask(1,:,:,:))))    * scaleFactor(1) ; out.min.fa    = reshape(out.min.fa, [dims(2:end) 1]);
+            out.min.Da      = double(gather(extractdata(parameters_minLoss.Da.* mask(1,:,:,:))))    * scaleFactor(2) ; out.min.Da    = reshape(out.min.Da, [dims(2:end) 1]);
+            out.min.De      = double(gather(extractdata(parameters_minLoss.De.* mask(1,:,:,:))))    * scaleFactor(3) ; out.min.De    = reshape(out.min.De, [dims(2:end) 1]);
+            out.min.ra      = double(gather(extractdata(parameters_minLoss.ra.* mask(1,:,:,:))))    * scaleFactor(4) ; out.min.ra    = reshape(out.min.ra, [dims(2:end) 1]);
+            out.min.loss    = double(gather(extractdata(minLoss)));
+            
+            disp('The processing is completed.')
+            
+            if gpuDeviceCount > 0
+                gpuDevice([]);
+            end
 
         end
 
-        function [gradients,loss] = modelGradients(this, parameters, dlR, mask, scaleFactor)
+        function [gradients,loss] = modelGradients(this, parameters, dlR, mask, scaleFactor, numMaskVox, lambda, TVmode)
 
             % scaling network parameter
             parameters.fa   = parameters.fa  * scaleFactor(1);
             parameters.Da   = parameters.Da  * scaleFactor(2);
             parameters.De   = parameters.De  * scaleFactor(3);
             parameters.ra   = parameters.ra  * scaleFactor(4);
-            parameters.fdot = parameters.fdot* scaleFactor(5);
             
             % Make predictions with the initial conditions.
             R = this.FWD(parameters);
             R(isinf(R)) = 0;
             R(isnan(R)) = 0;
 
-%             R   = dlarray(R(:).',     'CB');
-%             dlR = dlarray(dlR(:).',   'CB');
-
+            % Masking
             R   = dlarray(R(mask>0).',     'CB');
             dlR = dlarray(dlR(mask>0).',   'CB');
+
+            % Data fidelity term
+            % loss_fidelity = mse(R, dlR);
+            loss_fidelity = l1loss(R, dlR);
+            
+            % regularisation term
+            if lambda > 0
+                cost = this.reg_TV(squeeze(parameters.Da),squeeze(mask(1,:,:,:)),TVmode);
+                loss_reg      = sum(abs(cost),"all")/numMaskVox *lambda;
+                % lambda = 0.001;
+            else
+                loss_reg = 0;
+            end
             
             % compute loss
-%             loss = mse(R, dlR);
-            loss = l1loss(R, dlR);
+            loss = loss_fidelity + loss_reg;
             
             % Calculate gradients with respect to the learnable parameters.
             gradients = dlgradient(loss,parameters);
@@ -218,16 +285,13 @@ classdef gpuNEXIdot
                 Da   = pars.Da;
                 De   = pars.De;
                 ra   = pars.ra;
-                fdot = pars.fdot;
                 
                 % Forward model
-                S = this.S(fa, Da, De, ra);
+                s = this.S(fa, Da, De, ra);
                 
-                % Combined signal
-                s = (1-fdot).*S + fdot;
-                           
         end
-
+        
+        % NEXI signal
         function S = S(this, fa, Da, De, ra)
             Da = this.b.*Da;
             De = this.b.*De;
@@ -235,13 +299,20 @@ classdef gpuNEXIdot
             re = ra.*fa./(1-fa);
             
             % Trapezoidal's rule replacement
-            Nx = 14;    % NRMSE<0.05% for Nx=14
-            x       = zeros([ones(1,ndims(fa)), Nx]);
-            x(:)    = linspace(0,1,Nx);
-            S = trapz(x(:),this.M(x, fa, Da, De, ra, re),ndims(x));
+            Nx  = 14;    % NRMSE<0.05% for Nx=14
+            x   = zeros([ones(1,ndims(fa)), Nx]); x(:) = linspace(0,1,Nx);
+            S   = trapz(x(:),this.M(x, fa, Da, De, ra, re),ndims(x));
             % myfun = @(x) this.M(x, fa, Da, De, ra, re);
             % S = integral(myfun, 0, 1, 'AbsTol', 1e-14, 'ArrayValued', true);
 
+        end
+
+        function cost = reg_TV(this,img,mask,TVmode)
+            voxel_size = [1 1 1];
+            % Vr      = 1./sqrt(abs(mask.*this.gradient_operator(img,voxel_size)).^2+eps);
+            cost = sum(abs(mask.*this.gradient_operator(img,voxel_size,TVmode)),4);
+
+            % cost    = this.divergence_operator(mask.*(Vr.*(mask.*this.gradient_operator(img,voxel_size))),voxel_size);
         end
     end
 
@@ -257,17 +328,49 @@ classdef gpuNEXIdot
 
         function parameters = initialise_model(img_size)
 
-            % Initialize the parameters for the first fully connect operation. The first fully connect operation has two input channels.
+            % Initialize the parameters for the first fully connect operation.
             parameters = struct;
 
             parameters.fa   = gpuArray( dlarray(rand([1 img_size],'single') ));
             parameters.Da   = gpuArray( dlarray(rand([1 img_size],'single') )) ;
             parameters.De   = gpuArray( dlarray(rand([1 img_size],'single') )) ;
             parameters.ra   = gpuArray( dlarray(rand([1 img_size],'single') ));
-            parameters.fdot = gpuArray( dlarray(rand([1 img_size],'single') ));
             
         end
-    
+
+        function G = gradient_operator(img,voxel_size,TVmode)
+            Dx = circshift(img,-1,1) - img;
+            Dy = circshift(img,-1,2) - img;
+            switch TVmode
+                case '2D'
+                    G = cat(4,Dx/voxel_size(1),Dy/voxel_size(2));
+                case '3D'
+                    Dz = circshift(img,-1,3) - img;
+                    G = cat(4,Dx/voxel_size(1),Dy/voxel_size(2),Dz/voxel_size(3));
+            end
+            
+        end
+
+        function div = divergence_operator(G,voxel_size)
+
+            G_x = G(:,:,:,1);
+            G_y = G(:,:,:,2);
+            G_z = G(:,:,:,3);
+            
+            [Mx, My, Mz] = size(G_x);
+            
+            Dx = [G_x(1:end-1,:,:); zeros(1,My,Mz)]...
+                - [zeros(1,My,Mz); G_x(1:end-1,:,:)];
+            
+            Dy = [G_y(:,1:end-1,:), zeros(Mx,1,Mz)]...
+                - [zeros(Mx,1,Mz), G_y(:,1:end-1,:)];
+            
+            Dz = cat(3, G_z(:,:,1:end-1), zeros(Mx,My,1))...
+                - cat(3, zeros(Mx,My,1), G_z(:,:,1:end-1));
+            
+            div = -( Dx/voxel_size(1) + Dy/voxel_size(2) + Dz/voxel_size(3) );
+
+        end
     end
 
 end
