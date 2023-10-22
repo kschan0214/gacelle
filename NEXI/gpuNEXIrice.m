@@ -386,7 +386,7 @@ classdef gpuNEXIrice
                 parameters.ra   = gpuArray( dlarray( pars0(4,:,:,:) )) /(ub(4)-lb(4));     % values between [0,1]
 
                 % add a bit randomness to avoid trapped at initial points
-                randomness = 0.5; % 1: totally random; 0: use entirely the prior
+                randomness = 1/3; % 1: totally random; 0: use entirely the prior
                 parameters.fa   = (1-randomness)*double(parameters.fa) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
                 parameters.Da   = (1-randomness)*double(parameters.Da) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
                 parameters.De   = (1-randomness)*double(parameters.De) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
