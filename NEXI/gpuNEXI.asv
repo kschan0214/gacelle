@@ -56,7 +56,7 @@ classdef gpuNEXI
             % check image size
             dims = size(y);
 
-            if nargin < 3 || isempty(mask)
+            if nargin == 2 || isempty(mask)
                 % if no mask input then fit everthing
                 mask = ones(dims);
             else
@@ -154,8 +154,8 @@ classdef gpuNEXI
                 ylabel("Loss")
                 grid on
                 
+                start = tic;
             end
-            start = tic;
 
             minLoss         = inf;
             loss_last       = 0;
@@ -197,8 +197,7 @@ classdef gpuNEXI
                 [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
                     averageSqGrad,epoch,learningRate);
                 
-                loss        = double(gather(extractdata(loss)));
-                loss_step   = double(gather(extractdata(loss_step)));
+                loss = double(gather(extractdata(loss)));
                 if isdisplay
                     
                     addpoints(lineLoss,epoch, loss);
@@ -207,15 +206,12 @@ classdef gpuNEXI
                     title("Epoch: " + epoch + ", Elapsed: " + string(D) + ", Loss: " + loss)
                     drawnow
                 end
-                if mod(epoch,100) == 0 || epoch == 1
-                    % display some info
-                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                    fprintf('Iteration #%d,     Loss = %f,      Loss step = %e,     Elapsed:%s \n',epoch,loss,loss_step,string(D));
-                end
+                if mod(epoch,100) || epoch == 1
+                    fprintf('Iteration')
                 
             end
             fprintf('Final loss         =  %e\n',double(loss));
-            fprintf('Final loss step    =  %e\n',double(loss_step));
+            fprintf('Final loss step    =  %e\n',double(gather(extractdata(loss_step))));
             fprintf('Final #iterations  =  %d\n',epoch);
             
             % make sure the final results stay within boundary
@@ -225,20 +221,17 @@ classdef gpuNEXI
             parameters.De   = max(parameters.De,0)  ;   parameters.De   = min(parameters.De,1)  ;
             parameters.ra   = max(parameters.ra,0)  ;   parameters.ra   = min(parameters.ra,1)  ;
             
-            % rescale the network parameters
             fa      = double(gather(extractdata(parameters.fa.* mask(1,:,:,:))))    * (ub(1)-lb(1)) + lb(1) ; fa    = reshape(fa, [dims(2:end) 1]);
             Da      = double(gather(extractdata(parameters.Da.* mask(1,:,:,:))))    * (ub(2)-lb(2)) + lb(2) ; Da    = reshape(Da, [dims(2:end) 1]);
             De      = double(gather(extractdata(parameters.De.* mask(1,:,:,:))))    * (ub(3)-lb(3)) + lb(3) ; De    = reshape(De, [dims(2:end) 1]);
             ra      = double(gather(extractdata(parameters.ra.* mask(1,:,:,:))))    * (ub(4)-lb(4)) + lb(4) ; ra    = reshape(ra, [dims(2:end) 1]);
             
-            % result at final iteration
             out.final.fa = fa;
             out.final.Da = Da;
             out.final.De = De;
             out.final.ra = ra;
             out.final.loss = double(gather(extractdata(loss_last)));
-            
-            % result at minimum loss
+
             out.min.fa      = double(gather(extractdata(parameters_minLoss.fa.* mask(1,:,:,:))))    * (ub(1)-lb(1)) + lb(1);  out.min.fa    = reshape(out.min.fa, [dims(2:end) 1]);
             out.min.Da      = double(gather(extractdata(parameters_minLoss.Da.* mask(1,:,:,:))))    * (ub(2)-lb(2)) + lb(2) ; out.min.Da    = reshape(out.min.Da, [dims(2:end) 1]);
             out.min.De      = double(gather(extractdata(parameters_minLoss.De.* mask(1,:,:,:))))    * (ub(3)-lb(3)) + lb(3) ; out.min.De    = reshape(out.min.De, [dims(2:end) 1]);
@@ -358,7 +351,7 @@ classdef gpuNEXI
                 parameters.ra   = gpuArray( dlarray( pars0(4,:,:,:) )) /(ub(4)-lb(4));     % values between [0,1]
 
                 % add a bit randomness to avoid trapped at initial points
-                randomness = 1/3; % 1: totally random; 0: use entirely the prior
+                randomness = 0.2; % 1: total random; 0: use entirely the prior
                 parameters.fa   = (1-randomness)*parameters.fa + randomness*gpuArray( dlarray(rand([1 img_size],'single') ));
                 parameters.Da   = (1-randomness)*parameters.Da + randomness*gpuArray( dlarray(rand([1 img_size],'single') ));
                 parameters.De   = (1-randomness)*parameters.De + randomness*gpuArray( dlarray(rand([1 img_size],'single') ));

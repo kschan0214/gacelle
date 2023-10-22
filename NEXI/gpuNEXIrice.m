@@ -50,40 +50,43 @@ classdef gpuNEXIrice
 
         function [fa, Da, De, ra, out] = fit(this,y,sigma,mask,fitting,pars0)
 
-            D = gpuDevice;
-
+            % check GPU
+            gpuDevice;
+            
+            % check image size
             dims = size(y);
 
-            if nargin == 3 || isempty(mask)
+            if nargin < 4 || isempty(mask)
+                % if no mask input then fit everthing
                 mask = ones(dims);
             else
+                % assume mask is 3D
                 mask = permute(repmat(mask,[1 1 1 dims(1)]),[4 1 2 3]);
             end
             if nargin < 5
                 fitting = struct();
             end
             numMaskVox = numel(mask(mask ~= 0)) / dims(1);
-
-            mask = gpuArray(single(mask));  
-            y    = gpuArray(single(y));
-            sigma= gpuArray(single(sigma));
             
+            % put data input gpuArray
+            mask = gpuArray(logical(mask));  
+            y    = gpuArray(double(y));
+            sigma= gpuArray(double(sigma));
 
-            if nargin == 5
-                % if prior is provided
-                parameters.fa   = gpuArray( dlarray(pars0(1,:,:,:)));
-                parameters.Da   = gpuArray( dlarray(pars0(2,:,:,:)));
-                parameters.De   = gpuArray( dlarray(pars0(3,:,:,:)));
-                parameters.ra   = gpuArray( dlarray(pars0(4,:,:,:)));
+            % set scale factor so that they have comparable gradients
+            % scaleFactor     = [0.5, 3, 1, 0.1];
+            ub              = [1,   3, 3, 1];
+            lb              = [eps,eps,eps,1/250];
+
+            if nargin < 6
+                % no initial starting points
+                pars0 = [];
             else
-                % otherwise initialise model parameters randomly
-                parameters = this.initialise_model(dims(2:end));
+                pars0 = single(pars0);
             end
-    
-            % clear cache before running everthing
-            accfun = dlaccelerate(@this.modelGradients);
-            clearCache(accfun)
+            parameters      = this.initialise_model(dims(2:end),pars0,ub,lb);   % all parameters are betwwen [0,1]
             
+            % get fitting algorithm setting
             if isfield(fitting,'Nepoch')
                 numEpochs = fitting.Nepoch;
             else
@@ -134,7 +137,11 @@ classdef gpuNEXIrice
             if lambda > 0 
                 disp(['Regularisation parameter = ' num2str(lambda)]);
             end
-    
+            
+            % clear cache before running everthing
+            accfun = dlaccelerate(@this.modelGradients);
+            clearCache(accfun)
+
             % optimisation process
             averageGrad     = [];
             averageSqGrad   = [];
@@ -148,104 +155,113 @@ classdef gpuNEXIrice
                 ylabel("Loss")
                 grid on
                 
-                start = tic;
             end
+            start = tic;
 
-            scaleFactor     = [0.5, 3, 1, 0.1];
-            ub              = [1,   3, 3, 1];
-            lb              = [eps,eps,eps,1/200];
-            
             minLoss         = inf;
             loss_last       = 0;
-            loss_gradient   = 1+stepTol;
+            loss            = inf;
+            loss_step       = 1+stepTol;
             % optimisation
             for epoch = 1:numEpochs
 
-                if loss_gradient > stepTol || tol < loss
-
-                    % Lower bound
-                    parameters.fa   = max(parameters.fa,lb(1))  ;
-                    parameters.Da   = max(parameters.Da,lb(2))  ;   
-                    parameters.De   = max(parameters.De,lb(3))  ;
-                    parameters.ra   = max(parameters.ra,lb(4))  ;
-                    % upper bound
-                    parameters.fa   = min(parameters.fa,ub(1)/scaleFactor(1))  ;
-                    parameters.Da   = min(parameters.Da,ub(2)/scaleFactor(2))  ;
-                    parameters.De   = min(parameters.De,ub(3)/scaleFactor(3))  ;
-                    parameters.ra   = min(parameters.ra,ub(4)/scaleFactor(4))  ;
-                    
-                    % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                    [gradients,loss] = dlfeval(accfun,parameters,y,sigma,mask,scaleFactor,numMaskVox,lambda,TVmode);
+                % Lower bound                               % upper bound
+                parameters.fa   = max(parameters.fa,0);     parameters.fa   = min(parameters.fa,1)  ;
+                parameters.Da   = max(parameters.Da,0);     parameters.Da   = min(parameters.Da,1)  ;
+                parameters.De   = max(parameters.De,0);     parameters.De   = min(parameters.De,1)  ;
+                parameters.ra   = max(parameters.ra,0);     parameters.ra   = min(parameters.ra,1)  ;
                 
-                    % Update learning rate.
-                    learningRate = initialLearnRate / (1+decayRate*epoch);
+                % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
+                [gradients,loss] = dlfeval(accfun,parameters,y,sigma,mask,ub,lb,numMaskVox,lambda,TVmode);
+            
+                % Update learning rate.
+                learningRate = initialLearnRate / (1+decayRate*epoch);
                 
-                    loss_gradient   = abs(loss_last - loss);
-                    loss_last       = loss;
-                    if minLoss > loss
-                        minLoss = loss;
-                        parameters_minLoss = parameters;
-                    end
+                % get loss
+                loss_step   = abs(loss_last - loss);
+                loss_last   = loss;
+                if minLoss > loss
+                    minLoss = loss;
+                    parameters_minLoss = parameters;
+                end
+                % check if the optimisation should be stopped
+                if loss_step < stepTol 
+                    fprintf('Loss step size is less than the tolerance %e \n',stepTol);
+                    break
+                end
+                if loss < tol
+                    fprintf('Loss is less than the tolerance %e \n',tol);
+                    break
+                end
 
-                    % Update the network parameters using the adamupdate function.
-                    [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
-                        averageSqGrad,epoch,learningRate);
-    
-                    if isdisplay
-                        loss = double(gather(extractdata(loss)));
-                        addpoints(lineLoss,epoch, loss);
+                % Update the network parameters using the adamupdate function.
+                [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
+                    averageSqGrad,epoch,learningRate);
+                
+                loss        = double(gather(extractdata(loss)));
+                loss_step   = double(gather(extractdata(loss_step)));
+                if isdisplay
                     
-                        D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                        title("Epoch: " + epoch + ", Elapsed: " + string(D) + ", Loss: " + loss)
-                        drawnow
-                    end
-
+                    addpoints(lineLoss,epoch, loss);
+                
+                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
+                    title("Epoch: " + epoch + ", Elapsed: " + string(D) + ", Loss: " + loss)
+                    drawnow
+                end
+                if mod(epoch,100) == 0 || epoch == 1
+                    % display some info
+                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
+                    fprintf('Iteration #%d,     Loss = %f,      Loss step = %e,     Elapsed:%s \n',epoch,loss,loss_step,string(D));
                 end
                 
             end
+            fprintf('Final loss         =  %e\n',double(loss));
+            fprintf('Final loss step    =  %e\n',double(loss_step));
+            fprintf('Final #iterations  =  %d\n',epoch);
             
             % make sure the final results stay within boundary
-            % Lower bound
-            parameters.fa   = max(parameters.fa,lb(1))  ;
-            parameters.Da   = max(parameters.Da,lb(2))  ;   
-            parameters.De   = max(parameters.De,lb(3))  ;
-            parameters.ra   = max(parameters.ra,lb(4))  ;
-            % upper bound
-            parameters.fa   = min(parameters.fa,ub(1)/scaleFactor(1))  ;
-            parameters.Da   = min(parameters.Da,ub(2)/scaleFactor(2))  ;
-            parameters.De   = min(parameters.De,ub(3)/scaleFactor(3))  ;
-            parameters.ra   = min(parameters.ra,ub(4)/scaleFactor(4))  ;
+            % Lower bound                               % upper bound
+            parameters.fa   = max(parameters.fa,0)  ;   parameters.fa   = min(parameters.fa,1)  ;
+            parameters.Da   = max(parameters.Da,0)  ;   parameters.Da   = min(parameters.Da,1)  ;
+            parameters.De   = max(parameters.De,0)  ;   parameters.De   = min(parameters.De,1)  ;
+            parameters.ra   = max(parameters.ra,0)  ;   parameters.ra   = min(parameters.ra,1)  ;
             
-            fa      = double(gather(extractdata(parameters.fa.* mask(1,:,:,:))))    * scaleFactor(1) ; fa    = reshape(fa, [dims(2:end) 1]);
-            Da      = double(gather(extractdata(parameters.Da.* mask(1,:,:,:))))    * scaleFactor(2) ; Da    = reshape(Da, [dims(2:end) 1]);
-            De      = double(gather(extractdata(parameters.De.* mask(1,:,:,:))))    * scaleFactor(3) ; De    = reshape(De, [dims(2:end) 1]);
-            ra      = double(gather(extractdata(parameters.ra.* mask(1,:,:,:))))    * scaleFactor(4) ; ra    = reshape(ra, [dims(2:end) 1]);
+            % rescale the network parameters
+            fa      = double(gather(extractdata(parameters.fa.* mask(1,:,:,:))))    * (ub(1)-lb(1)) + lb(1) ; fa    = reshape(fa, [dims(2:end) 1]);
+            Da      = double(gather(extractdata(parameters.Da.* mask(1,:,:,:))))    * (ub(2)-lb(2)) + lb(2) ; Da    = reshape(Da, [dims(2:end) 1]);
+            De      = double(gather(extractdata(parameters.De.* mask(1,:,:,:))))    * (ub(3)-lb(3)) + lb(3) ; De    = reshape(De, [dims(2:end) 1]);
+            ra      = double(gather(extractdata(parameters.ra.* mask(1,:,:,:))))    * (ub(4)-lb(4)) + lb(4) ; ra    = reshape(ra, [dims(2:end) 1]);
             
+            % result at final iteration
             out.final.fa = fa;
             out.final.Da = Da;
             out.final.De = De;
             out.final.ra = ra;
             out.final.loss = double(gather(extractdata(loss_last)));
-
-            out.min.fa      = double(gather(extractdata(parameters_minLoss.fa.* mask(1,:,:,:))))    * scaleFactor(1) ; out.min.fa    = reshape(out.min.fa, [dims(2:end) 1]);
-            out.min.Da      = double(gather(extractdata(parameters_minLoss.Da.* mask(1,:,:,:))))    * scaleFactor(2) ; out.min.Da    = reshape(out.min.Da, [dims(2:end) 1]);
-            out.min.De      = double(gather(extractdata(parameters_minLoss.De.* mask(1,:,:,:))))    * scaleFactor(3) ; out.min.De    = reshape(out.min.De, [dims(2:end) 1]);
-            out.min.ra      = double(gather(extractdata(parameters_minLoss.ra.* mask(1,:,:,:))))    * scaleFactor(4) ; out.min.ra    = reshape(out.min.ra, [dims(2:end) 1]);
+            
+            % result at minimum loss
+            out.min.fa      = double(gather(extractdata(parameters_minLoss.fa.* mask(1,:,:,:))))    * (ub(1)-lb(1)) + lb(1);  out.min.fa    = reshape(out.min.fa, [dims(2:end) 1]);
+            out.min.Da      = double(gather(extractdata(parameters_minLoss.Da.* mask(1,:,:,:))))    * (ub(2)-lb(2)) + lb(2) ; out.min.Da    = reshape(out.min.Da, [dims(2:end) 1]);
+            out.min.De      = double(gather(extractdata(parameters_minLoss.De.* mask(1,:,:,:))))    * (ub(3)-lb(3)) + lb(3) ; out.min.De    = reshape(out.min.De, [dims(2:end) 1]);
+            out.min.ra      = double(gather(extractdata(parameters_minLoss.ra.* mask(1,:,:,:))))    * (ub(4)-lb(4)) + lb(4) ; out.min.ra    = reshape(out.min.ra, [dims(2:end) 1]);
             out.min.loss    = double(gather(extractdata(minLoss)));
             
             disp('The processing is completed.')
-
-            reset(D);
+            
+            % clear GPU
+            if gpuDeviceCount > 0
+                gpuDevice([]);
+            end
 
         end
 
-        function [gradients,loss] = modelGradients(this, parameters, dlR, sigma, mask, scaleFactor, numMaskVox, lambda, TVmode)
+        function [gradients,loss] = modelGradients(this, parameters, dlR, sigma, mask, ub, lb, numMaskVox, lambda, TVmode)
 
             % scaling network parameter
-            parameters.fa   = parameters.fa  * scaleFactor(1);
-            parameters.Da   = parameters.Da  * scaleFactor(2);
-            parameters.De   = parameters.De  * scaleFactor(3);
-            parameters.ra   = parameters.ra  * scaleFactor(4);
+            parameters.fa   = parameters.fa  * (ub(1)-lb(1)) + lb(1);
+            parameters.Da   = parameters.Da  * (ub(2)-lb(2)) + lb(2);
+            parameters.De   = parameters.De  * (ub(3)-lb(3)) + lb(3);
+            parameters.ra   = parameters.ra  * (ub(4)-lb(4)) + lb(4);
             
             % Make predictions with the initial conditions.
             R = this.FWD(parameters,sigma);
@@ -316,12 +332,20 @@ classdef gpuNEXIrice
         end
 
         function M1 = myriceM1(this, nu, sigma)
-            if sigma < 1/75
+            % if sigma < 1/75
                 % TODO: this neeeded to be tested
-                M1 = sigma .* sqrt(pi/2) .* hypergeom(-1/2, 1, -nu.^2/2./sigma.^2);
-            else
+                % M1 = sigma .* sqrt(pi/2) .* hypergeom(-1/2, 1, -nu.^2/2./sigma.^2);
+                % disp('SNR is too high. PLease use the ordinary NEXI model instead.')
+            % else
                 M1 = sigma .* sqrt(pi/2) .* this.myL12(-nu.^2/2./sigma.^2);
-            end
+            % end
+        end
+
+        function y = myL12(this, x)
+            % TODO: besseli does not support dlarray
+            y = exp(x/2) .* ( (1-x).*this.mybesseli(0,-x/2) - x.*this.mybesseli(1,-x/2) );
+            % y = exp(x/2) .* ( (1-x).*besseli(0,-x/2) - x.*besseli(1,-x/2) );
+            % y = hypergeom(-1/2,1,x);
         end
 
     end
@@ -336,21 +360,38 @@ classdef gpuNEXIrice
             M  = Pp.*exp(-(l1+l2)) + (1-Pp).*exp(-lm); 
         end
 
-        function y = myL12(x)
-            % TODO: besseli does not support dlarray
-            y = exp(x/2) .* ( (1-x).*besseli(0,-x/2) - x.*besseli(1,-x/2) );
-            % y = hypergeom(-1/2,1,x);
+        function I = mybesseli(nu,z)
+            Nx  = 34;    % NRMSE<0.05% for Nx=34
+            x   = zeros([ones(1,ndims(z)), Nx]); x(:) = linspace(0,pi,Nx);
+            I   = 1/pi * trapz(x(:),exp(z.*cos(x)).*cos(nu*x),ndims(x));
         end
 
-        function parameters = initialise_model(img_size)
+        function parameters = initialise_model(img_size,pars0,ub,lb)
 
             % Initialize the parameters for the first fully connect operation.
             parameters = struct;
+            
+            if isempty(pars0)
+                % 1st dimension preserves for DWI data points 
+                % initialise model parameters randomly
+                % single precision does not work very well with the besseli function
+                parameters.fa   = gpuArray( dlarray(rand([1 img_size],'double') ));     % values between [0,1]
+                parameters.Da   = gpuArray( dlarray(rand([1 img_size],'double') ));     % values between [0,1]
+                parameters.De   = gpuArray( dlarray(rand([1 img_size],'double') ));     % values between [0,1]
+                parameters.ra   = gpuArray( dlarray(rand([1 img_size],'double') ));     % values between [0,1]
+            else
+                parameters.fa   = gpuArray( dlarray( pars0(1,:,:,:) )) /(ub(1)-lb(1));     % values between [0,1]
+                parameters.Da   = gpuArray( dlarray( pars0(2,:,:,:) )) /(ub(2)-lb(2));     % values between [0,1]
+                parameters.De   = gpuArray( dlarray( pars0(3,:,:,:) )) /(ub(3)-lb(3));     % values between [0,1]
+                parameters.ra   = gpuArray( dlarray( pars0(4,:,:,:) )) /(ub(4)-lb(4));     % values between [0,1]
 
-            parameters.fa   = gpuArray( dlarray(rand([1 img_size],'single') ));
-            parameters.Da   = gpuArray( dlarray(rand([1 img_size],'single') )) ;
-            parameters.De   = gpuArray( dlarray(rand([1 img_size],'single') )) ;
-            parameters.ra   = gpuArray( dlarray(rand([1 img_size],'single') ));
+                % add a bit randomness to avoid trapped at initial points
+                randomness = 0.5; % 1: totally random; 0: use entirely the prior
+                parameters.fa   = (1-randomness)*double(parameters.fa) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
+                parameters.Da   = (1-randomness)*double(parameters.Da) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
+                parameters.De   = (1-randomness)*double(parameters.De) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
+                parameters.ra   = (1-randomness)*double(parameters.ra) + randomness*gpuArray( dlarray(rand([1 img_size],'double') ));
+            end
             
         end
 
