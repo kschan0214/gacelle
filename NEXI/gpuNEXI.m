@@ -63,27 +63,11 @@ classdef gpuNEXI
                 % assume mask is 3D
                 mask = permute(repmat(mask,[1 1 1 dims(1)]),[4 1 2 3]);
             end
+            numMaskVox = numel(mask(mask ~= 0)) / dims(1);
+
             if nargin < 4
                 fitting = struct();
             end
-            numMaskVox = numel(mask(mask ~= 0)) / dims(1);
-            
-            % put data input gpuArray
-            mask = gpuArray(single(mask));  
-            y    = gpuArray(single(y));
-
-            % set scale factor so that they have comparable gradients
-            % scaleFactor     = [0.5, 3, 1, 0.1];
-            ub              = [1,   3, 3, 1];
-            lb              = [eps,eps,eps,1/250];
-
-            if nargin < 5
-                % no initial starting points
-                pars0 = [];
-            else
-                pars0 = single(pars0);
-            end
-            parameters      = this.initialise_model(dims(2:end),pars0,ub,lb);   % all parameters are betwwen [0,1]
             
             % get fitting algorithm setting
             if isfield(fitting,'Nepoch')
@@ -121,12 +105,37 @@ classdef gpuNEXI
             else
                 TVmode = '2D';
             end
+            if isfield(fitting,'voxelSize')
+                voxelSize = fitting.voxelSize;
+            else
+                voxelSize = [2,2,2];
+            end
             if isfield(fitting,'display')
                 isdisplay = fitting.display;
             else
                 isdisplay = 0;
             end
+            if isfield(fitting,'randomness')
+                randomness = fitting.randomness;
+            else
+                randomness = 0;
+            end
+            
+            % put data input gpuArray
+            mask = gpuArray(logical(mask));  
+            y    = gpuArray(single(y));
 
+            ub              = [1,   3, 3, 1];
+            lb              = [eps,eps,eps,1/250];
+
+            if nargin < 5
+                % no initial starting points
+                pars0 = [];
+            else
+                pars0 = single(pars0);
+            end
+            parameters      = this.initialise_model(dims(2:end),pars0,ub,lb,randomness);   % all parameters are betwwen [0,1]
+         
             % display optimisation algorithm parameters
             disp(['Maximum no. of iteration = ' num2str(numEpochs)]);
             disp(['Loss tolerance           = ' num2str(tol)]);
@@ -171,7 +180,7 @@ classdef gpuNEXI
                 parameters.ra   = max(parameters.ra,0);     parameters.ra   = min(parameters.ra,1)  ;
                 
                 % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                [gradients,loss] = dlfeval(accfun,parameters,y,mask,ub,lb,numMaskVox,lambda,TVmode);
+                [gradients,loss] = dlfeval(accfun,parameters,y,mask,ub,lb,numMaskVox,lambda,TVmode,voxelSize);
             
                 % Update learning rate.
                 learningRate = initialLearnRate / (1+decayRate*epoch);
@@ -254,7 +263,7 @@ classdef gpuNEXI
 
         end
 
-        function [gradients,loss] = modelGradients(this, parameters, dlR, mask, ub,lb, numMaskVox, lambda, TVmode)
+        function [gradients,loss] = modelGradients(this, parameters, dlR, mask, ub,lb, numMaskVox, lambda, TVmode,voxelSize)
 
             % scaling network parameter
             parameters.fa   = parameters.fa  * (ub(1)-lb(1)) + lb(1);
@@ -277,7 +286,7 @@ classdef gpuNEXI
             
             % regularisation term
             if lambda > 0
-                cost = this.reg_TV(squeeze(parameters.Da),squeeze(mask(1,:,:,:)),TVmode);
+                cost = this.reg_TV(squeeze(parameters.fa),squeeze(mask(1,:,:,:)),TVmode,voxelSize);
                 loss_reg      = sum(abs(cost),"all")/numMaskVox *lambda;
                 % lambda = 0.001;
             else
@@ -320,10 +329,10 @@ classdef gpuNEXI
 
         end
 
-        function cost = reg_TV(this,img,mask,TVmode)
-            voxel_size = [1 1 1];
+        function cost = reg_TV(this,img,mask,TVmode,voxelSize)
+            % voxel_size = [1 1 1];
             % Vr      = 1./sqrt(abs(mask.*this.gradient_operator(img,voxel_size)).^2+eps);
-            cost = sum(abs(mask.*this.gradient_operator(img,voxel_size,TVmode)),4);
+            cost = sum(abs(mask.*this.gradient_operator(img,voxelSize,TVmode)),4);
 
             % cost    = this.divergence_operator(mask.*(Vr.*(mask.*this.gradient_operator(img,voxel_size))),voxel_size);
         end
@@ -339,7 +348,7 @@ classdef gpuNEXI
             M  = Pp.*exp(-(l1+l2)) + (1-Pp).*exp(-lm); 
         end
 
-        function parameters = initialise_model(img_size,pars0,ub,lb)
+        function parameters = initialise_model(img_size,pars0,ub,lb,randomness)
 
             % Initialize the parameters for the first fully connect operation.
             parameters = struct;
@@ -357,8 +366,8 @@ classdef gpuNEXI
                 parameters.De   = gpuArray( dlarray( pars0(3,:,:,:) )) /(ub(3)-lb(3));     % values between [0,1]
                 parameters.ra   = gpuArray( dlarray( pars0(4,:,:,:) )) /(ub(4)-lb(4));     % values between [0,1]
 
-                % add a bit randomness to avoid trapped at initial points
-                randomness = 1/3; % 1: totally random; 0: use entirely the prior
+                % For noise propagation add a bit randomness to avoid trapped at initial points
+                % randomness = 1/3; % 1: totally random; 0: use entirely the prior
                 parameters.fa   = (1-randomness)*parameters.fa + randomness*gpuArray( dlarray(rand([1 img_size],'single') ));
                 parameters.Da   = (1-randomness)*parameters.Da + randomness*gpuArray( dlarray(rand([1 img_size],'single') ));
                 parameters.De   = (1-randomness)*parameters.De + randomness*gpuArray( dlarray(rand([1 img_size],'single') ));
