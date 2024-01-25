@@ -327,7 +327,7 @@ classdef gpuNEXI
             if fitting.lambda == 0
                 out.final.loss_reg      = 0;
             else
-                out.final.loss_reg      = double(gather(extractdata(minLossRegularisation)));
+                out.final.loss_reg      = double(gather(extractdata(loss_reg)));
             end
             
             % result at minimum loss
