@@ -1,8 +1,8 @@
-classdef gpuMCRDIMWI_option2
+classdef gpuMCRMWI
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% MCR-MWI and MCR-DIMWI models
-% Date created: 21 Jan 2024 (need further testing)
+% No support for DIMWI yet
+% Date created: 21 Jan 2024 (v0.0.2)
 % Date modified:
 
     properties (Constant)
@@ -29,22 +29,13 @@ classdef gpuMCRDIMWI_option2
     
     methods
         %% Constructor
-        function obj = gpuMCRDIMWI_option2(te,tr,fa,fixed_params)
+        function obj = gpuMCRMWI(te,tr,fa,fixed_params)
             obj.te = double(te(:));
             obj.tr = double(tr(:));
             obj.fa = double(fa(:));
 
             % fixed tissue and scanner parameters
             if nargin == 4
-                if isfield(fixed_params,'x_i')
-                    obj.x_i     = double(fixed_params.x_i);
-                end
-                if isfield(fixed_params,'x_a')
-                    obj.x_a     = double(fixed_params.x_a);
-                end
-                if isfield(fixed_params,'E')
-                    obj.E       = double(fixed_params.E);
-                end
                 if isfield(fixed_params,'rho_mw')
                     obj.rho_mw  = double(fixed_params.rho_mw);
                 end
@@ -65,9 +56,9 @@ classdef gpuMCRDIMWI_option2
         % prepare data for MCR-MWI fitting
         function [algoPara,data_obj_all] = data_preparation(obj,algoPara,imgPara)
 
-            disp('===============================================');
-            disp('Myelin water imaing: MCR-DIMWI Data Preparation');
-            disp('===============================================');
+            disp('=================================================');
+            disp('Myelin water imaing: MCR-(DI)MWI Data Preparation');
+            disp('=================================================');
 
             %%%%%%%%%% create directory for temporary results %%%%%%%%%%
             default_output_filename = 'mcrmwi_results.mat';
@@ -84,9 +75,6 @@ classdef gpuMCRDIMWI_option2
             mask  = imgPara.mask>0;
             fm0   = double(imgPara.fieldmap);
             pini0 = double(imgPara.pini);
-
-            %%%%%%%%%% DIMWI %%%%%%%%%%
-            [icvf, ff, theta] = obj.setup_DIMWI(imgPara, algoPara);
             
             if algoPara.isNormData
                 [scaleFactor, data] = mwi_image_normalisation(data, mask);
@@ -168,11 +156,7 @@ classdef gpuMCRDIMWI_option2
             data_obj_all = obj.setup_batch_create_data_obj_slice(r2s0,      mask, 'r2s0',	data_obj_all);
             if exist('mwf0','var');     data_obj_all = obj.setup_batch_create_data_obj_slice(mwf0,      mask, 'mwf0',       data_obj_all); end
             if exist('t2siew0','var');  data_obj_all = obj.setup_batch_create_data_obj_slice(t2siew0,   mask, 't2siew0',	data_obj_all); end
-            % DIMWI
-            data_obj_all = obj.setup_batch_create_data_obj_slice(icvf,      mask, 'icvf',   data_obj_all);
-            data_obj_all = obj.setup_batch_create_data_obj_slice(theta,     mask, 'theta',  data_obj_all);
-            data_obj_all = obj.setup_batch_create_data_obj_slice(ff,        mask, 'ff',     data_obj_all);
-
+            
             m00_max = max(prctile(m00(mask>0),99),iqr(m00(mask>0))*3 + median(m00(mask>0)));
             
             NTotalSamples = numel(mask(mask>0));
@@ -202,9 +186,9 @@ classdef gpuMCRDIMWI_option2
             gpuDevice([]);
             gpu = gpuDevice;
 
-            disp('=============================================================');
-            disp('Myelin water imaing: MCR-DIMWI model fitting - askAdam solver');
-            disp('=============================================================');
+            disp('===============================================================');
+            disp('Myelin water imaing: MCR-(DI)MWI model fitting - askAdam solver');
+            disp('===============================================================');
 
             % display some messages
             obj.display_algorithm_info(algoPara);
@@ -435,11 +419,8 @@ classdef gpuMCRDIMWI_option2
             
             % set fitting boundary
             %    [M0MW,       M0IW,       M0EW,       R2sMW,R2sIW,R2sEW,T1IEW,kIEWM,FreqMW,FreqIW,totalfield,pini]
-            % ub = [rho_max*1.5,rho_max*1.5,rho_max*1.5,200,  50,   50,   2,    20,   20,  -eps,    300,       2*pi];
-            % lb = [eps,        eps,        eps,         50,   2,    2, 0.2,   eps,  -10,   -20,   -300,      -2*pi];
-            %    [S0,       MWF,       ICVF,       R2sMW,R2sIW,R2sEW,T1IEW,kIEWM,FreqMW,FreqIW,totalfield,pini]
-            ub = [rho_max*1.5,  1,          1,        200,  50,   50,   2,    20,   20,  -eps,    300,       2*pi];
-            lb = [eps,        eps,        eps,         50,   2,    2, 0.2,   eps,  -10,   -20,   -300,      -2*pi];
+            ub = [rho_max*1.5,rho_max*1.5,rho_max*1.5,200,  50,   50,   2,    20,   20,    20,    300,       2*pi];
+            lb = [eps,        eps,        eps,         50,   2,    2, 0.2,   eps,  -20,   -20,   -300,      -2*pi];
 
             [parameters,extra_data] = obj.initialise_model(data_obj,algoPara,ub,lb);   % all parameters are betwwen [0,1]
             parameters = obj.set_boundary(parameters);
@@ -566,90 +547,49 @@ classdef gpuMCRDIMWI_option2
             parameters = obj.set_boundary(parameters);
             
             % rescale the network parameters
-            parameters = obj.rescale_parameters(parameters,algoPara,ub,lb);
-
-            DIMWI = algoPara.DIMWI;
-
+            parameters  = obj.rescale_parameters(parameters,algoPara,ub,lb);
             % result at final iteration
-            fitRes.final.S0      = single(gather(extractdata(parameters.s0.* mask(:,:,:,1,1))));
-            fitRes.final.MWF      = single(gather(extractdata(parameters.mwf.* mask(:,:,:,1,1))));
-            % fitRes.final.S0_MW      = single(gather(extractdata(parameters.s0mw.* mask(:,:,:,1,1))));
-            if DIMWI.isFitVic
-                fitRes.final.ICVF      = single(gather(extractdata(parameters.icvf.* mask(:,:,:,1,1))));
-            %     fitRes.final.S0_IW      = single(gather(extractdata(parameters.s0iw.* mask(:,:,:,1,1))));
-            %     fitRes.final.S0_EW      = single(gather(extractdata(parameters.s0ew.* mask(:,:,:,1,1))));
-            % else
-            %     fitRes.final.S0_IEW     = single(gather(extractdata(parameters.s0iew.* mask(:,:,:,1,1))));
-            end
+            fitRes.final.S0_MW      = single(gather(extractdata(parameters.s0mw.* mask(:,:,:,1,1))));
+            fitRes.final.S0_IW      = single(gather(extractdata(parameters.s0iw.* mask(:,:,:,1,1))));
+            fitRes.final.S0_EW      = single(gather(extractdata(parameters.s0ew.* mask(:,:,:,1,1))));
             fitRes.final.R2s_MW     = single(gather(extractdata(parameters.r2smw.* mask(:,:,:,1,1))));
             fitRes.final.R2s_IW     = single(gather(extractdata(parameters.r2siw.* mask(:,:,:,1,1))));
-            if DIMWI.isFitR2sEW
-                fitRes.final.R2s_EW     = single(gather(extractdata(parameters.r2sew.* mask(:,:,:,1,1))));
-            end
+            fitRes.final.R2s_EW     = single(gather(extractdata(parameters.r2sew.* mask(:,:,:,1,1))));
             fitRes.final.R1_IEW     = single(gather(extractdata(parameters.r1iew.* mask(:,:,:,1,1))));
             fitRes.final.kiewm      = single(gather(extractdata(parameters.kiewm.* mask(:,:,:,1,1))));
-            if DIMWI.isFitFreqMW
-                fitRes.final.Freq_MW    = single(gather(extractdata(parameters.freq_mw.* mask(:,:,:,1,1))));
-            end
-            if DIMWI.isFitFreqIW
-                fitRes.final.Freq_IW    = single(gather(extractdata(parameters.freq_iw.* mask(:,:,:,1,1))));
-            end
+            fitRes.final.Freq_MW    = single(gather(extractdata(parameters.freq_mw.* mask(:,:,:,1,1))));
+            fitRes.final.Freq_IW    = single(gather(extractdata(parameters.freq_iw.* mask(:,:,:,1,1))));
             if algoPara.isComplex
                 fitRes.final.Freq_BKG   = single(gather(extractdata(parameters.totalField.* mask(:,:,:,1,1))));
                 fitRes.final.pini       = single(gather(extractdata(parameters.pini.* mask(:,:,:,1,1))));
             end
             fitRes.final.loss = loss;
-            fitRes.final.loss_fidelity = double(gather(extractdata(loss_fidelity)));
-            if algoPara.lambda == 0
-                fitRes.final.loss_reg      = 0;
-            else
-                fitRes.final.loss_reg      = double(gather(extractdata(loss_reg)));
-            end
 
             % result at minimum loss
             % rescale the network parameters
             parameters_minLoss      = obj.rescale_parameters(parameters_minLoss,algoPara,ub,lb);
-            fitRes.min.S0      = single(gather(extractdata(parameters_minLoss.s0.* mask(:,:,:,1,1))));
-            fitRes.min.MWF      = single(gather(extractdata(parameters_minLoss.mwf.* mask(:,:,:,1,1))));
-            % fitRes.min.S0_MW      = single(gather(extractdata(parameters_minLoss.s0mw.* mask(:,:,:,1,1))));
-            if DIMWI.isFitVic
-                fitRes.min.ICVF      = single(gather(extractdata(parameters_minLoss.icvf.* mask(:,:,:,1,1))));
-            %     fitRes.min.S0_IW      = single(gather(extractdata(parameters_minLoss.s0iw.* mask(:,:,:,1,1))));
-            %     fitRes.min.S0_EW      = single(gather(extractdata(parameters_minLoss.s0ew.* mask(:,:,:,1,1))));
-            % else
-            %     fitRes.min.S0_IEW     = single(gather(extractdata(parameters_minLoss.s0iew.* mask(:,:,:,1,1))));
-            end
+            fitRes.min.S0_MW        = single(gather(extractdata(parameters_minLoss.s0mw.* mask(:,:,:,1,1))));
+            fitRes.min.S0_IW        = single(gather(extractdata(parameters_minLoss.s0iw.* mask(:,:,:,1,1))));
+            fitRes.min.S0_EW        = single(gather(extractdata(parameters_minLoss.s0ew.* mask(:,:,:,1,1))));
             fitRes.min.R2s_MW       = single(gather(extractdata(parameters_minLoss.r2smw.* mask(:,:,:,1,1))));
             fitRes.min.R2s_IW       = single(gather(extractdata(parameters_minLoss.r2siw.* mask(:,:,:,1,1))));
-            if DIMWI.isFitR2sEW
-                fitRes.min.R2s_EW       = single(gather(extractdata(parameters_minLoss.r2sew.* mask(:,:,:,1,1))));
-            end
+            fitRes.min.R2s_EW       = single(gather(extractdata(parameters_minLoss.r2sew.* mask(:,:,:,1,1))));
             fitRes.min.R1_IEW       = single(gather(extractdata(parameters_minLoss.r1iew.* mask(:,:,:,1,1))));
             fitRes.min.kiewm        = single(gather(extractdata(parameters_minLoss.kiewm.* mask(:,:,:,1,1))));
-            if DIMWI.isFitFreqMW
-                fitRes.min.Freq_MW      = single(gather(extractdata(parameters_minLoss.freq_mw.* mask(:,:,:,1,1))));
-            end
-            if DIMWI.isFitFreqIW
-                fitRes.min.Freq_IW      = single(gather(extractdata(parameters_minLoss.freq_iw.* mask(:,:,:,1,1))));
-            end
+            fitRes.min.Freq_MW      = single(gather(extractdata(parameters_minLoss.freq_mw.* mask(:,:,:,1,1))));
+            fitRes.min.Freq_IW      = single(gather(extractdata(parameters_minLoss.freq_iw.* mask(:,:,:,1,1))));
             if algoPara.isComplex
                 fitRes.min.Freq_BKG   = single(gather(extractdata(parameters_minLoss.totalField.* mask(:,:,:,1,1))));
                 fitRes.min.pini       = single(gather(extractdata(parameters_minLoss.pini.* mask(:,:,:,1,1))));
             end
-            fitRes.min.loss             = minLoss;
-            fitRes.min.loss_fidelity    = double(gather(extractdata(minLossFidelity)));
-            if algoPara.lambda == 0
-                fitRes.min.loss_reg     = 0;
-            else
-                fitRes.min.loss_reg     = double(gather(extractdata(minLossRegularisation)));
-            end
+            fitRes.min.loss = loss;
 
             disp('The processing is completed.')
 
         end
 
         % compute the gradient and loss of forward modelling
-        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(obj, parameters, y, true_famp, mask, weights, extra_data,Nsample, ub, lb,fitParams,dlnet)
+        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(obj, parameters, dlR, true_famp, mask, weights, extra_data,Nsample, ub, lb,fitParams,dlnet)
             
            % rescale network parameter to true values
             parameters_true = obj.rescale_parameters(parameters,fitParams,ub,lb);
@@ -663,39 +603,36 @@ classdef gpuMCRDIMWI_option2
             end
             
             % Forward model
-            [Shat_real, Shat_imag]        = obj.FWD(parameters_true,totalfield,pini,extra_data,fitParams.DIMWI,true_famp,dlnet);
-            Shat_real(isinf(Shat_real))   = 0;
-            Shat_real(isnan(Shat_real))   = 0;
-            Shat_imag(isinf(Shat_imag))   = 0;
-            Shat_imag(isnan(Shat_imag))   = 0;
+            [dlR_real, dlR_imag]        = obj.FWD(parameters_true,totalfield,pini,true_famp,dlnet);
+            dlR_real(isinf(dlR_real))   = 0;
+            dlR_real(isnan(dlR_real))   = 0;
+            dlR_imag(isinf(dlR_imag))   = 0;
+            dlR_imag(isnan(dlR_imag))   = 0;
 
             % Masking
             if fitParams.isComplex
                 % complex-valued data
-                Shat    = dlarray(cat(1,Shat_real(mask>0),Shat_imag(mask>0)).',   'CB');
-                y       = dlarray(cat(1,real(y(mask>0)),imag(y(mask>0))).', 'CB');
+                R   = dlarray(cat(1,dlR_real(mask>0),dlR_imag(mask>0)).',   'CB');
+                dlR = dlarray(cat(1,real(dlR(mask>0)),imag(dlR(mask>0))).', 'CB');
             else
                 % magnitude data
-                Shat    = dlarray(sqrt(Shat_real(mask>0).^2 + Shat_imag(mask>0).^2).',    'CB');
-                y       = dlarray(abs(y(mask>0)).',                                   'CB');
+                R   = dlarray(sqrt(dlR_real(mask>0).^2 + dlR_imag(mask>0).^2).',    'CB');
+                dlR = dlarray(abs(dlR(mask>0)).',                                   'CB');
             end
 
             % Data fidelity term
             switch lower(fitParams.lossFunction)
                 case 'l1'
-                    loss_fidelity = l1loss(Shat, y, weights);
+                    loss_fidelity = l1loss(R, dlR, weights);
                 case 'l2'
-                    loss_fidelity = l2loss(Shat, y, weights);
+                    loss_fidelity = l2loss(R, dlR, weights);
                 case 'mse'
-                    loss_fidelity = mse(Shat, y);
+                    loss_fidelity = mse(R, dlR);
             end
             
             % regularisation term
             if fitParams.lambda > 0
-                cost        = obj.reg_TV(squeeze(parameters.r2smw),mask(:,:,:,1,1),fitParams.TVmode,fitParams.voxelSize);
-                % cost        = obj.reg_TV(parameters_true.s0mw+parameters_true.s0iew,mask(:,:,:,1,1),fitParams.TVmode,fitParams.voxelSize);
-                % cost        = obj.reg_TV(sqrt(dlR_real(:,:,:,1,1).^2 + dlR_imag(:,:,:,1,1).^2),mask(:,:,:,1,1),fitParams.TVmode,fitParams.voxelSize);
-                % cost        = obj.reg_TV(sqrt(parameters_true.s0iew),mask(:,:,:,1,1),fitParams.TVmode,fitParams.voxelSize);
+                cost        = obj.reg_TV(squeeze(parameters.s0ew),mask(:,:,:,1,1),fitParams.TVmode,fitParams.voxelSize);
                 loss_reg    = sum(abs(cost),"all")/Nsample *fitParams.lambda;
             else
                 loss_reg = 0;
@@ -710,99 +647,40 @@ classdef gpuMCRDIMWI_option2
         end
         
         % MCRMWI signal, compute the forward model
-        function [s_real, s_imag] = FWD(obj, pars, totalField, pini, extra_data, DIMWI, true_famp, dlnet)
+        function [s_real, s_imag] = FWD(obj, pars, totalField, pini, true_famp, dlnet)
         % Forward model to generate MCRMWI signal
-            TE  = permute(obj.te,[2 3 4 1 5]);
+            TE = permute(obj.te,[2 3 4 1 5]);
+
+            scaleFactor = pars.s0iw + pars.s0ew + pars.s0mw / obj.rho_mw;
+            fx = (pars.s0mw / obj.rho_mw) ./ scaleFactor;
+
             Nfa = numel(obj.fa);
             
-            %%%%%%%%%%%%%%%%%%%% DIMWI related operations %%%%%%%%%%%%%%%%%%%%
-            if ~DIMWI.isFitFreqMW || ~DIMWI.isFitFreqIW || ~DIMWI.isFitR2sEW
-                hcfm_obj = HCFM(obj.te,obj.B0);
-            end
-            % determine the source of S0ew and S0iw
-            s0mw = pars.s0 .* pars.mwf;
-            if DIMWI.isFitVic
-                s0ew = pars.s0 .* (1-pars.mwf) .* (1-pars.icvf) ;
-                s0iw = pars.s0 .* (1-pars.mwf) .* (pars.icvf) ;
-            else
-                s0ew = pars.s0 .* (1-pars.mwf) .* (1-extra_data.icvf);
-                s0iw = pars.s0 .* (1-pars.mwf) .* (extra_data.icvf);
-            end
-            % determine the source of compartmental frequency shifts
-            if ~DIMWI.isFitFreqMW || ~DIMWI.isFitFreqIW
-                
-                % derive g-ratio 
-                g = hcfm_obj.gratio(abs(s0iw),abs(s0mw)/obj.rho_mw);
-                
-                % compute frequency shifts given theta
-                if ~DIMWI.isFitFreqMW 
-                    freq_mw = hcfm_obj.FrequencyMyelin(obj.x_i,obj.x_a,g,extra_data.theta,obj.E);
-                    freq_mw = permute(freq_mw,[1 2 3 5 6 4]);
-                end
-                if ~DIMWI.isFitFreqIW 
-                    freq_iw = hcfm_obj.FrequencyAxon(obj.x_a,g,extra_data.theta);
-                    freq_iw = permute(freq_iw,[1 2 3 5 6 4]);
-                end
-            end
-            if DIMWI.isFitFreqMW
-                freq_mw = pars.freq_mw;
-            end
-            if DIMWI.isFitFreqIW
-                freq_iw = pars.freq_iw;
-            end
-            % extra decay on extracellular water estimated by HCFM 
-            if ~DIMWI.isFitR2sEW
-                
-                % assume extracellular water has the same T2* as intra-axonal water
-                r2sew = pars.r2siw;
-
-                fvf = hcfm_obj.FibreVolumeFraction(s0iw,s0ew,abs(s0mw)/obj.rho_mw);
-                % signal dephase in extracellular water due to myelin sheath, Eq.[A7]
-                decay_ew = hcfm_obj.DephasingExtraaxonal(fvf,g,obj.x_i,obj.x_a,extra_data.theta);
-                if ismatrix(extra_data.theta)
-                    decay_ew = permute(decay_ew,[1,2,4,5,6,3]);
-                else
-                    decay_ew = permute(decay_ew,[1,2,3,5,6,4]);
-                end
-            else
-                r2sew   = pars.r2sew;
-                decay_ew     = zeros([size(s0ew,1),size(s0ew,2),size(s0ew,3),length(TE)]);
-            end
-            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-            % main
-            totalVolume = s0iw + s0ew + s0mw / obj.rho_mw;
-            mvf         = (s0mw / obj.rho_mw) ./ totalVolume;
-
-            % T1 part, compute steady-state signal
-            signal_steadystate = zeros(2,numel(mvf),Nfa, 'like', pars.r2siw );
+            ss = zeros(2,numel(fx),Nfa, 'like', pars.r2siw );
             for k = 1:Nfa
                 tmp_famp = true_famp(:,:,:,1,k);
-                features    = feature_preprocess_LeeANN4MWImodel(mvf(:),1./pars.r1iew(:),...
+                features    = feature_preprocess_LeeANN4MWImodel(fx(:),1./pars.r1iew(:),...
                                                               pars.kiewm(:),tmp_famp(:),obj.tr,obj.t1_mw);
                 features    = gpuArray( dlarray(features,'CB'));
                 
-                signal_steadystate(:,:,k) = reshape(mlp_model_leakyRelu(dlnet.parameters,features,dlnet.alpha),[2 numel(mvf)]);
+                ss(:,:,k) = reshape(mlp_model_leakyRelu(dlnet.parameters,features,dlnet.alpha),[2 numel(fx)]);
             end
-            signal_steadystate = permute(reshape( signal_steadystate,2,size(mvf,1),size(mvf,2),size(mvf,3),Nfa),[2 3 4 6 5 1]).*totalVolume;
+            ss = permute(reshape( ss,2,size(fx,1),size(fx,2),size(fx,3),Nfa),[2 3 4 6 5 1]).*scaleFactor;
 
-            extra_data.ff = permute(extra_data.ff,[1 2 3 5 6 4]);
-
-            % Susceptibiloty effects
-            s_real =  sum((signal_steadystate(:,:,:,:,:,1).*(s0ew./(s0iw+s0ew)) .* exp(-TE .* r2sew ).*exp(-decay_ew) .* ...
+            s_real =  ss(:,:,:,:,:,1).*(pars.s0ew./(pars.s0iw+pars.s0ew)) .* exp(-TE .*  pars.r2sew ) .* ...
                         cos(2.*pi.*totalField.*TE + pini) + ...                                 % EW 
-                       signal_steadystate(:,:,:,:,:,1).*(s0iw./(s0iw+s0ew)) .* exp(-TE .* pars.r2siw) .* ...
-                        cos(2.*pi.*freq_iw.*TE + 2.*pi.*totalField.*TE + pini) + ...       % IW
-                       signal_steadystate(:,:,:,:,:,2).*obj.rho_mw .* exp(-TE .* (pars.r2smw)) .* ...
-                        cos(2.*pi.*freq_mw.*TE + 2.*pi.*totalField.*TE + pini)).*extra_data.ff,6);           % MW
+                      ss(:,:,:,:,:,1).*(pars.s0iw./(pars.s0iw+pars.s0ew)) .* exp(-TE .* pars.r2siw) .* ...
+                        cos(2.*pi.*pars.freq_iw.*TE + 2.*pi.*totalField.*TE + pini) + ...       % IW
+                      ss(:,:,:,:,:,2).*obj.rho_mw .* exp(-TE .* (pars.r2smw)) .* ...
+                        cos(2.*pi.*pars.freq_mw.*TE + 2.*pi.*totalField.*TE + pini) ;           % MW
 
-            s_imag =  sum((signal_steadystate(:,:,:,:,:,1).*(s0ew./(s0iw+s0ew)) .* exp(-TE .* r2sew ).*exp(-decay_ew) .* ...
+            s_imag =  ss(:,:,:,:,:,1).*(pars.s0ew./(pars.s0iw+pars.s0ew)) .* exp(-TE .*  pars.r2sew ) .* ...
                         sin(2.*pi.*totalField.*TE + pini) + ...                                 % EW 
-                       signal_steadystate(:,:,:,:,:,1).*(s0iw./(s0iw+s0ew)) .* exp(-TE .* pars.r2siw) .* ...
-                        sin(2.*pi.*freq_iw.*TE + 2.*pi.*totalField.*TE + pini) + ...       % IW
-                       signal_steadystate(:,:,:,:,:,2).*obj.rho_mw .* exp(-TE .* (pars.r2smw)) .* ...
-                        sin(2.*pi.*freq_mw.*TE + 2.*pi.*totalField.*TE + pini)).*extra_data.ff,6);           % MW
-
+                      ss(:,:,:,:,:,1).*(pars.s0iw./(pars.s0iw+pars.s0ew)) .* exp(-TE .* pars.r2siw) .* ...
+                        sin(2.*pi.*pars.freq_iw.*TE + 2.*pi.*totalField.*TE + pini) + ...       % IW
+                      ss(:,:,:,:,:,2).*obj.rho_mw .* exp(-TE .* (pars.r2smw)) .* ...
+                        sin(2.*pi.*pars.freq_mw.*TE + 2.*pi.*totalField.*TE + pini) ;           % MW
+                
         end
         
         % Total variation regularisation
@@ -850,11 +728,6 @@ classdef gpuMCRDIMWI_option2
             try algoPara2.lambda            = algoPara.lambda;          catch; algoPara2.lambda = 0;end
             try algoPara2.TVmode            = algoPara.TVmode;          catch; algoPara2.TVmode = '2D';end
             try algoPara2.voxelSize         = algoPara.voxelSize;       catch; algoPara2.voxelSize = [2,2,2];end
-            % check hollow cylinder fibre model parameters
-            try algoPara2.DIMWI.isFitFreqMW	= algoPara.DIMWI.isFitFreqMW;	catch; algoPara2.DIMWI.isFitFreqMW = false;end
-            try algoPara2.DIMWI.isFitFreqIW	= algoPara.DIMWI.isFitFreqIW;	catch; algoPara2.DIMWI.isFitFreqIW = false;end
-            try algoPara2.DIMWI.isFitR2sEW  = algoPara.DIMWI.isFitR2sEW;	catch; algoPara2.DIMWI.isFitR2sEW  = false;end
-            try algoPara2.DIMWI.isFitVic    = algoPara.DIMWI.isFitVic;      catch; algoPara2.DIMWI.isFitVic    = false;end
 
             % check advanced starting points strategy
             try algoPara2.advancedStarting  = algoPara.advancedStarting;catch; algoPara2.advancedStarting = [];end
@@ -896,28 +769,7 @@ classdef gpuMCRDIMWI_option2
                 imgPara2.pini = nan(size(imgPara2.mask));
                 disp('Initial phase input       : False');
             end
-            % check volume fraction of intra-axonal water
-            try
-                imgPara2.icvf = imgPara.icvf;
-                disp('Volume fraction of intra-axonal water input: True');
-            catch
-                disp('Volume fraction of intra-axonal water input: False');
-            end
-            % check fibre orientation map
-            try
-                imgPara2.fo = imgPara.fo;
-                disp('Fibre orientation input: True');
-            catch
-                try
-                    imgPara2.theta = imgPara.theta;
-                    disp('Fibre orientation input: False');
-                    disp('Theta input: True');
-                catch
-                    if ~algoPara2.DIMWI.isFitFreqMW || ~algoPara2.DIMWI.isFitFreqIW || ~algoPara2.DIMWI.isFitR2sEW
-                        error('Fibre orienation map or theta map is required for DIMWI');
-                    end
-                end
-            end
+            
             try algoPara2.autoSave = algoPara.autoSave; catch; algoPara2.autoSave = true; end
             disp('Input data is valid.')
 
@@ -960,77 +812,16 @@ classdef gpuMCRDIMWI_option2
             disp('--------------------------');
             disp('Exchange  - to be fitted');
             disp('T1mw      - fixed');
-
-            disp('------------------------------------');
-            disp('Diffusion informed MWI model options');
-            disp('------------------------------------');
-            if ~algoPara.DIMWI.isFitVic
-                disp('Intra-axonal and extra-cellular water signal are fitted together');
-            else
-                disp('Intra-axonal and extra-cellular water signal are fitted separately.');
-            end
-            if ~algoPara.DIMWI.isFitFreqMW
-                disp('Frequency - myelin water estimated by HCFM');
-            else
-                disp('Frequency - myelin water to be fitted');
-            end
-            if ~algoPara.DIMWI.isFitFreqIW
-                disp('Frequency - intra-axonal water estimated by HCFM');
-            else
-                disp('Frequency - intra-axonal water to be fitted');
-            end
-            if ~algoPara.DIMWI.isFitR2sEW
-                disp('R2*       - extra-cellular water estimated by HCFM');
-            else
-                disp('R2*       - extra-cellular water to be fitted');
-            end
             
-            disp('-------------------------------')
-            disp('Parameter to be fixed for DIMWI')
-            disp('-------------------------------')
-            disp(['Field strength (T)                       : ' num2str(obj.B0)]);
-            disp(['B0 direction(x,y,z)                      : ' num2str(obj.B0dir(:)')]);
-            disp(['Relative myelin water density            : ' num2str(obj.rho_mw)]);
-            disp(['Myelin isotropic susceptibility (ppm)    : ' num2str(obj.x_i)]);
-            disp(['Myelin anisotropic susceptibility (ppm)  : ' num2str(obj.x_a)]);
-            disp(['Exchange term (ppm)                      : ' num2str(obj.E)]);
-            
-        end
-
-        % set up DIMWI required data
-        function [icvf, ff, theta] = setup_DIMWI(obj,imgParam, algoParam)
-            
-            DIMWI = algoParam.DIMWI;
-            
-            dims	= size(imgParam.img);   
-            dims    = dims(1:3);
-            
-            % check if intra-axonal water volume fraction is needed
-            if ~DIMWI.isFitVic
-                icvf = double(imgParam.icvf);
-            else
-                icvf = zeros(dims);
-            end
-            
-            % check if fibre orientation is needed
-            if ~DIMWI.isFitFreqMW || ~DIMWI.isFitFreqIW || ~DIMWI.isFitR2sEW
-                ff    = double(imgParam.ff); % fibre fraction
-                try 
-                    fo    = double(imgParam.fo); % fibre orientation w.r.t. B0
-                    theta = zeros(size(ff));
-                    for kfo = 1:size(fo,5)
-                        theta(:,:,:,kfo) = AngleBetweenV1MapAndB0(fo(:,:,:,:,kfo),obj.B0dir);
-                    end
-                catch 
-                    theta = double(imgParam.theta); % theta map
-                end
-                % normalise fibre fraction
-                ff              = bsxfun(@rdivide,ff,sum(ff,4));
-                ff(isnan(ff))   = 0;
-            else
-                ff      = ones(dims);
-                theta   = zeros(dims);
-            end
+            % disp('-------------------------------')
+            % disp('Parameter to be fixed for DIMWI')
+            % disp('-------------------------------')
+            % disp(['Field strength (T)                       : ' num2str(obj.B0)]);
+            % disp(['B0 direction(x,y,z)                      : ' num2str(obj.B0dir(:)')]);
+            % disp(['Relative myelin water density            : ' num2str(obj.rho_mw)]);
+            % disp(['Myelin isotropic susceptibility (ppm)    : ' num2str(obj.x_i)]);
+            % disp(['Myelin anisotropic susceptibility (ppm)  : ' num2str(obj.x_a)]);
+            % disp(['Exchange term (ppm)                      : ' num2str(obj.E)]);
             
         end
 
@@ -1039,9 +830,7 @@ classdef gpuMCRDIMWI_option2
     methods(Static)
         
         % initialise network parameters
-        function [parameters,extra_data] = initialise_model(data_obj,algoPara,ub,lb)
-
-            DIMWI = algoPara.DIMWI;
+        function [parameters,extra_data] = initialise_model(data_obj,fitParams,ub,lb)
 
             img_size = size(data_obj.mask);
 
@@ -1051,54 +840,36 @@ classdef gpuMCRDIMWI_option2
             data_obj.fm0    = min(max(data_obj.fm0 ,  lb(11)),ub(11));
             data_obj.pini0  = min(max(data_obj.pini0, lb(12)),ub(12));
             
-            s0          = (data_obj.m00                     -lb(1)) / (ub(1)-lb(1));
-            mwf         = (0.1*ones(img_size,'single')      -lb(2)) / (ub(2)-lb(2));
-            icvf        = (0.7*ones(img_size,'single')      -lb(3)) / (ub(3)-lb(3));
-
-            % s0mw        = ((data_obj.m00 * 0.1)             -lb(1)) / (ub(1)-lb(1));
-            % s0iw        = ((data_obj.m00 * 0.6)             -lb(2)) / (ub(2)-lb(2));
-            % s0ew        = ((data_obj.m00 * 0.3)             -lb(3)) / (ub(3)-lb(3));
-            % s0iew       = ((data_obj.m00 * 0.9)             -lb(2)) / (ub(2)-lb(2));
-            % r2smw       = ((100 + rand(img_size,'single'))  -lb(4)) / (ub(4)-lb(4));
-            r2smw       = (100*ones(img_size,'single')      -lb(4)) / (ub(4)-lb(4));
+            s0mw        = ((data_obj.m00 * 0.1)             -lb(1)) / (ub(1)-lb(1));
+            s0iw        = ((data_obj.m00 * 0.6)             -lb(2)) / (ub(2)-lb(2));
+            s0ew        = ((data_obj.m00 * 0.3)             -lb(3)) / (ub(3)-lb(3));
+            r2smw       = ((100 + rand(img_size,'single'))  -lb(4)) / (ub(4)-lb(4));
+            % r2smw       = (100*ones(img_size,'single')      -lb(4)) / (ub(4)-lb(4));
             r2siw       = ((data_obj.r2s0 - 2.5)            -lb(5)) / (ub(5)-lb(5));
             r2sew       = ((data_obj.r2s0 + 2.5)            -lb(6)) / (ub(6)-lb(6));
             r1iew       = ((data_obj.r1iew0 )               -lb(7)) / (ub(7)-lb(7));
-            % kiewm       = (rand(img_size,'single')          -lb(8)) / (ub(8)-lb(8));
-            % freq_mw     = (5+rand(img_size,'single')        -lb(9)) / (ub(9)-lb(9));
-            % freq_iw     = (-2+rand(img_size,'single')       -lb(10)) / (ub(10)-lb(10));
-            kiewm       = (zeros(img_size,'single')         -lb(8)) / (ub(8)-lb(8));
-            freq_mw     = (5*ones(img_size,'single')        -lb(9)) / (ub(9)-lb(9));
-            freq_iw     = (-2*ones(img_size,'single')       -lb(10)) / (ub(10)-lb(10));
+            kiewm       = (rand(img_size,'single')          -lb(8)) / (ub(8)-lb(8));
+            % kiewm       = (0*rand(img_size,'single')        -lb(8)) / (ub(8)-lb(8));
+            freq_mw     = (5+rand(img_size,'single')        -lb(9)) / (ub(9)-lb(9));
+            freq_iw     = (-2+rand(img_size,'single')       -lb(10)) / (ub(10)-lb(10));
+            % freq_mw     = (5*ones(img_size,'single')        -lb(9)) / (ub(9)-lb(9));
+            % freq_iw     = (-2*ones(img_size,'single')       -lb(10)) / (ub(10)-lb(10));
             totalField  = (data_obj.fm0                     -lb(11)) / (ub(11)-lb(11));
             pini        = (data_obj.pini0                   -lb(12)) / (ub(12)-lb(12));
 
             % assume comparment a has long T1 and T2*
-            % parameters.s0mw         = gpuArray( dlarray(s0mw));
-            parameters.s0           = gpuArray( dlarray(s0));
-            parameters.mwf          = gpuArray( dlarray(mwf));
-            if DIMWI.isFitVic
-                parameters.icvf     = gpuArray( dlarray(icvf));
-                % parameters.s0ew     = gpuArray( dlarray(s0ew));
-                % parameters.s0iw     = gpuArray( dlarray(s0iw));
-            % else
-            %     parameters.s0iew    = gpuArray( dlarray(s0iew));
-            end
+            parameters.s0iw         = gpuArray( dlarray(s0iw));
+            parameters.s0ew         = gpuArray( dlarray(s0ew));
+            parameters.s0mw         = gpuArray( dlarray(s0mw));
             parameters.r1iew        = gpuArray( dlarray(r1iew)) ;
             parameters.kiewm        = gpuArray( dlarray(kiewm)) ;
-            parameters.r2smw        = gpuArray( dlarray(r2smw)) ;
             parameters.r2siw        = gpuArray( dlarray(r2siw)) ;
-            if DIMWI.isFitR2sEW
-                parameters.r2sew    = gpuArray( dlarray(r2sew)) ;
-            end
-            if DIMWI.isFitFreqMW
-                parameters.freq_mw      = gpuArray( dlarray(freq_mw)) ;
-            end
-            if DIMWI.isFitFreqIW
-                parameters.freq_iw      = gpuArray( dlarray(freq_iw)) ;
-            end
+            parameters.r2sew        = gpuArray( dlarray(r2sew)) ;
+            parameters.r2smw        = gpuArray( dlarray(r2smw)) ;
+            parameters.freq_mw      = gpuArray( dlarray(freq_mw)) ;
+            parameters.freq_iw      = gpuArray( dlarray(freq_iw)) ;
             
-            if algoPara.isComplex
+            if fitParams.isComplex
                 parameters.totalField   = gpuArray( dlarray( permute(totalField,[1 2 3 5 4])) );
                 parameters.pini         = gpuArray( dlarray(pini) );
                 extra_data              = [];
@@ -1106,16 +877,23 @@ classdef gpuMCRDIMWI_option2
                 extra_data.totalField   = gpuArray( dlarray(permute(totalField,[1 2 3 5 4]) * (ub(11)-lb(11))+lb(11)) );
                 extra_data.pini         = gpuArray( dlarray(pini * (ub(12)-lb(12))+lb(12)) );
             end
-            % get extra data
-            if ~DIMWI.isFitR2sEW || DIMWI.isFitFreqMW || DIMWI.isFitFreqIW
-                extra_data.ff       = gpuArray( dlarray(data_obj.ff) );
-                extra_data.theta    = gpuArray( dlarray(data_obj.theta) );
-            end
-            if ~DIMWI.isFitVic
-                extra_data.icvf = gpuArray( dlarray(data_obj.icvf) );
-            end
             
         end
+        
+        % % check and set default fitting algorithm parameters
+        % function fitting2 = check_set_default(fitting)
+        %     fitting2 = fitting;
+        % 
+        %     % get fitting algorithm setting
+        %     if ~isfield(fitting,'TVmode')
+        %         fitting2.TVmode = '2D';
+        %     end
+        %     if ~isfield(fitting,'voxelSize')
+        %         fitting2.voxelSize = [2,2,2];
+        %     end
+        % 
+        % 
+        % end
     
         function data_obj = setup_batch_create_data_obj_slice(data, mask, fieldName, data_obj)
         % data_obj = setup_batch_create_data_obj(data, mask, numBatch, nElement, fieldName, data_obj)
@@ -1196,31 +974,16 @@ classdef gpuMCRDIMWI_option2
         
         % rescale the network parameters between the defined lower/upper bounds
         function parameters = rescale_parameters(parameters,fitParams,ub,lb)
-            DIMWI = fitParams.DIMWI;
-
-            parameters.s0 = parameters.s0 * (ub(1)-lb(1)) + lb(1);
-            parameters.mwf = parameters.mwf * (ub(2)-lb(2)) + lb(2);
-            % parameters.s0mw     = parameters.s0mw     * (ub(1)-lb(1)) + lb(1);
-            if DIMWI.isFitVic
-                parameters.icvf = parameters.icvf     * (ub(3)-lb(3)) + lb(3);
-            %     parameters.s0iw     = parameters.s0iw     * (ub(2)-lb(2)) + lb(2);
-            %     parameters.s0ew     = parameters.s0ew     * (ub(3)-lb(3)) + lb(3);
-            % else
-            %     parameters.s0iew = parameters.s0iew     * (ub(2)-lb(2)) + lb(2);
-            end
+            parameters.s0mw     = parameters.s0mw     * (ub(1)-lb(1)) + lb(1);
+            parameters.s0iw     = parameters.s0iw     * (ub(2)-lb(2)) + lb(2);
+            parameters.s0ew     = parameters.s0ew     * (ub(3)-lb(3)) + lb(3);
             parameters.r2smw    = parameters.r2smw    * (ub(4)-lb(4)) + lb(4);
             parameters.r2siw    = parameters.r2siw    * (ub(5)-lb(5)) + lb(5);
-            if DIMWI.isFitR2sEW
-                parameters.r2sew    = parameters.r2sew    * (ub(6)-lb(6)) + lb(6);
-            end
+            parameters.r2sew    = parameters.r2sew    * (ub(6)-lb(6)) + lb(6);
             parameters.r1iew    = parameters.r1iew    * (ub(7)-lb(7)) + lb(7);
             parameters.kiewm    = parameters.kiewm    * (ub(8)-lb(8)) + lb(8);
-            if DIMWI.isFitFreqMW
-                parameters.freq_mw  = parameters.freq_mw  * (ub(9)-lb(9)) + lb(9);
-            end
-            if DIMWI.isFitFreqIW
-                parameters.freq_iw  = parameters.freq_iw  * (ub(10)-lb(10)) + lb(10);
-            end
+            parameters.freq_mw  = parameters.freq_mw  * (ub(9)-lb(9)) + lb(9);
+            parameters.freq_iw  = parameters.freq_iw  * (ub(10)-lb(10)) + lb(10);
 
             if fitParams.isComplex
                 parameters.totalField   = parameters.totalField  * (ub(11)-lb(11)) + lb(11);

@@ -96,9 +96,8 @@ classdef gpuMCRMWI
 
             %%%%%%%%%% check advanced starting point strategy %%%%%%%%%%
             % use lowest flip angle to estimate R2*
-            % [~,ind]         = min(obj.fa);
-            % r2s0            = R2star_trapezoidal(data(:,:,:,:,ind),obj.te);
-            r2s0            = R2star_trapezoidal(mean(data,5),obj.te);
+            [~,ind]         = min(obj.fa);
+            r2s0            = R2star_trapezoidal(data(:,:,:,:,ind),obj.te);
             mask_valida_r2s = and(~isnan(r2s0),~isinf(r2s0));
             r2s0(mask_valida_r2s == 0) = 0;
 
@@ -250,11 +249,8 @@ classdef gpuMCRMWI
             fprintf('Output directory                : %s\n',output_dir);
             fprintf('Intermediate results identifier : %s\n',identifier);
 
-            % load('MLP_EPGX_leakyrelu_LeeANN4MWImodel_epoch_100.mat');
-            ann_epgx_phase = load('MCRMWI_MLP_EPGX_leakyrelu_N2e6_phase_v2.mat','dlnet');
-            ann_epgx_phase.dlnet.alpha = 0.01;
-            ann_epgx_magn  = load('MCRMWI_MLP_EPGX_leakyrelu_N2e6_magn.mat','dlnet');
-            ann_epgx_magn.dlnet.alpha = 0.01;
+            load('MLP_EPGX_leakyrelu_LeeANN4MWImodel_epoch_100.mat');
+            dlnet.alpha = 0.01;
             % main
             try
                 
@@ -291,7 +287,7 @@ classdef gpuMCRMWI
                         % process non-empty slices
                         if ~data_obj.isEmptySlice
 
-                            res_obj = obj.fit(data_obj,algoPara,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
+                            res_obj = obj.fit(data_obj,algoPara,dlnet);
 
                             % save temporary result
                             if isBatch
@@ -385,7 +381,7 @@ classdef gpuMCRMWI
         end
 
         % Data fitting on 1 batch
-        function fitRes = fit(obj, data_obj, algoPara, dlnet_phase, dlnet_magn)
+        function fitRes = fit(obj, data_obj, algoPara, dlnet)
         %
         % Input
         % -----------
@@ -446,17 +442,15 @@ classdef gpuMCRMWI
             mask        = gpuArray(logical(mask));  
             img         = gpuArray(single(data_obj.data));
             rho_max     = data_obj.m00_max;
-            true_famp   = gpuArray(single(data_obj.b1map .* permute(deg2rad(obj.fa),[2 3 4 5 1])));
+            true_famp   = data_obj.b1map .* permute(deg2rad(obj.fa),[2 3 4 5 1]);
             
             % set fitting boundary
             % %    [M0MW,       M0IW,       M0EW,       R2sMW,R2sIW,R2sEW,T1IEW,kIEWM,FreqMW,FreqIW,totalfield,pini]
             % ub = [rho_max*1.5,rho_max*1.5,rho_max*1.5,200,  50,   50,   2,    20,   20,  -eps,    8*obj.B0,       2*pi];
             % lb = [eps,        eps,        eps,         50,   2,    2, 0.2,   eps,  -10,   -20,   -8*obj.B0,      -2*pi];
             %    [S0,       MWF,       ICVF,       R2sMW,R2sIW,R2sEW,T1IEW,kIEWM,FreqMW,FreqIW,totalfield,pini]
-            % ub = [rho_max*1.5,  1,          1,        200,  50,   50,   2,    20,   20,  -eps,    8*obj.B0,       2*pi];
-            % lb = [eps,        eps,        eps,         50,   2,    2, 0.2,   eps,  -10,   -20,   -8*obj.B0,      -2*pi];
             ub = [rho_max*1.5,  1,          1,        200,  50,   50,   2,    20,   20,  -eps,    8*obj.B0,       2*pi];
-            lb = [eps,        eps,        eps,         50,   2, 2,    0.2,   eps,  -10,   -20,   -8*obj.B0,      -2*pi];
+            lb = [eps,        eps,        eps,         50,   2,    2, 0.2,   eps,  -10,   -20,   -8*obj.B0,      -2*pi];
 
             [parameters,extra_data] = obj.initialise_model(data_obj,algoPara,ub,lb);   % all parameters are betwwen [0,1]
             parameters = obj.set_boundary(parameters);
@@ -526,13 +520,8 @@ classdef gpuMCRMWI
                 % make sure the parameters are [0,1]
                 parameters = obj.set_boundary(parameters);
 
-                % if epoch == 198
-                %     keyboard;
-                % end
-
                 % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                [gradients,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,img,true_famp,mask,w,extra_data,Nsample,ub,lb,algoPara,dlnet_phase,dlnet_magn);
-                % [gradients,loss,loss_fidelity,loss_reg] = dlfeval(@obj.modelGradients,parameters,img,true_famp,mask,w,extra_data,Nsample,ub,lb,algoPara,dlnet_phase);
+                [gradients,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,img,true_famp,mask,w,extra_data,Nsample,ub,lb,algoPara,dlnet);
             
                 % Update learning rate.
                 learningRate = algoPara.initialLearnRate / (1+ algoPara.decayRate*epoch);
@@ -674,7 +663,7 @@ classdef gpuMCRMWI
         end
 
         % compute the gradient and loss of forward modelling
-        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(obj, parameters, y, true_famp, mask, weights, extra_data,Nsample, ub, lb,fitParams,dlnet_phase,dlnet_magn)
+        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(obj, parameters, y, true_famp, mask, weights, extra_data,Nsample, ub, lb,fitParams,dlnet)
             
            % rescale network parameter to true values
             parameters_true = obj.rescale_parameters(parameters,fitParams,ub,lb);
@@ -688,7 +677,7 @@ classdef gpuMCRMWI
             end
             
             % Forward model
-            [Shat_real, Shat_imag]        = obj.FWD(parameters_true,totalfield,pini,extra_data,fitParams.DIMWI,true_famp,dlnet_phase,dlnet_magn);
+            [Shat_real, Shat_imag]        = obj.FWD(parameters_true,totalfield,pini,extra_data,fitParams.DIMWI,true_famp,dlnet);
             Shat_real(isinf(Shat_real))   = 0;
             Shat_real(isnan(Shat_real))   = 0;
             Shat_imag(isinf(Shat_imag))   = 0;
@@ -737,7 +726,7 @@ classdef gpuMCRMWI
         end
         
         % MCRMWI signal, compute the forward model
-        function [s_real, s_imag] = FWD(obj, pars, totalField, pini, extra_data, DIMWI, true_famp, dlnet_phase,dlnet_magn)
+        function [s_real, s_imag] = FWD(obj, pars, totalField, pini, extra_data, DIMWI, true_famp, dlnet)
         % Forward model to generate MCRMWI signal
             TE  = permute(obj.te,[2 3 4 1 5]);
             Nfa = numel(obj.fa);
@@ -810,39 +799,35 @@ classdef gpuMCRMWI
 
             % T1 part, compute steady-state signal
             % if EPGX.isEPG
-            if 1
-                features = feature_preprocess_MCRMWI_MLP_EPGX_leakyrelu(repmat(mvf(:),7,1),1./repmat(pars.r1iew(:),7,1),...
-                                                                repmat(pars.kiewm(:),7,1),true_famp(:),obj.tr,1./repmat(pars.r2siw(:),7,1),obj.t1_mw);
-                features    = gpuArray( dlarray(features,'CB'));
-                
-                signal_steadystate_phase   = mlp_model_leakyRelu(dlnet_phase.parameters,features,dlnet_phase.alpha);
-                signal_steadystate_phase   = reshape(signal_steadystate_phase,size(mvf,1),size(mvf,2),size(mvf,3),1,Nfa);
-                signal_steadystate_diff    = mlp_model_leakyRelu(dlnet_magn.parameters,features,dlnet_magn.alpha);
-                signal_steadystate_diff    = flip(permute(reshape(signal_steadystate_diff,2,size(mvf,1),size(mvf,2),size(mvf,3),1,Nfa),[2 3 4 5 6 1]),6);
-
-                % signal_steadystate         = permute(reshape(features(13:-1:12,:),2,size(mvf,1),size(mvf,2),size(mvf,3),Nfa),[2 3 4 6 5 1]) .* totalVolume;
-                
-                signal_steadystate          = (obj.model_BM_2T1(mvf,pars.r1iew,pars.kiewm,true_famp) + signal_steadystate_diff ) .* totalVolume;
-                
+            if 0
+                signal_steadystate = zeros(2,numel(mvf),Nfa, 'like', pars.r2siw );
+                for k = 1:Nfa
+                    tmp_famp    = true_famp(:,:,:,1,k);
+                    features    = feature_preprocess_LeeANN4MWImodel(mvf(:),1./pars.r1iew(:),...
+                                                                  pars.kiewm(:),tmp_famp(:),obj.tr,obj.t1_mw);
+                    features    = gpuArray( dlarray(features,'CB'));
+                    
+                    signal_steadystate(:,:,k) = reshape(mlp_model_leakyRelu(dlnet.parameters,features,dlnet.alpha),[2 numel(mvf)]);
+                end
+                signal_steadystate = permute(reshape( signal_steadystate,2,size(mvf,1),size(mvf,2),size(mvf,3),Nfa),[2 3 4 6 5 1]).*totalVolume;
             else
-                signal_steadystate          = obj.model_BM_2T1(mvf,pars.r1iew,pars.kiewm,true_famp) .* totalVolume;
-                signal_steadystate_phase    = zeros(size(signal_steadystate(:,:,:,:,:,1)));
+                signal_steadystate = obj.model_BM_2T1(mvf,pars.r1iew,pars.kiewm,true_famp) .* totalVolume;
             end
 
             extra_data.ff = permute(extra_data.ff,[1 2 3 5 6 4]);
 
             % Susceptibiloty effects
             s_real =  sum((signal_steadystate(:,:,:,:,:,2).*(s0ew./(s0iw+s0ew)) .* exp(-TE .* r2sew ).*exp(-decay_ew) .* ...
-                        cos(2.*pi.*totalField.*TE + pini + signal_steadystate_phase) + ...                                 % EW 
+                        cos(2.*pi.*totalField.*TE + pini) + ...                                 % EW 
                        signal_steadystate(:,:,:,:,:,2).*(s0iw./(s0iw+s0ew)) .* exp(-TE .* pars.r2siw) .* ...
-                        cos(2.*pi.*freq_iw.*TE + 2.*pi.*totalField.*TE + pini + signal_steadystate_phase) + ...       % IW
+                        cos(2.*pi.*freq_iw.*TE + 2.*pi.*totalField.*TE + pini) + ...       % IW
                        signal_steadystate(:,:,:,:,:,1).*obj.rho_mw .* exp(-TE .* (pars.r2smw)) .* ...
                         cos(2.*pi.*freq_mw.*TE + 2.*pi.*totalField.*TE + pini)).*extra_data.ff,6);           % MW
 
             s_imag =  sum((signal_steadystate(:,:,:,:,:,2).*(s0ew./(s0iw+s0ew)) .* exp(-TE .* r2sew ).*exp(-decay_ew) .* ...
-                        sin(2.*pi.*totalField.*TE + pini + signal_steadystate_phase) + ...                                 % EW 
+                        sin(2.*pi.*totalField.*TE + pini) + ...                                 % EW 
                        signal_steadystate(:,:,:,:,:,2).*(s0iw./(s0iw+s0ew)) .* exp(-TE .* pars.r2siw) .* ...
-                        sin(2.*pi.*freq_iw.*TE + 2.*pi.*totalField.*TE + pini + signal_steadystate_phase) + ...       % IW
+                        sin(2.*pi.*freq_iw.*TE + 2.*pi.*totalField.*TE + pini) + ...       % IW
                        signal_steadystate(:,:,:,:,:,1).*obj.rho_mw .* exp(-TE .* (pars.r2smw)) .* ...
                         sin(2.*pi.*freq_mw.*TE + 2.*pi.*totalField.*TE + pini)).*extra_data.ff,6);           % MW
             % s_real =  sum((signal_steadystate(:,:,:,:,:,1).*(s0ew./(s0iw+s0ew)) .* exp(-TE .* r2sew ).*exp(-decay_ew) .* ...

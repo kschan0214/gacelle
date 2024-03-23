@@ -114,6 +114,7 @@ classdef gpuNEXI
         %   .tol                : stop criteria on metric value, default = 1e-3
         %   .lambda             : regularisation parameter, default = 0 (no regularisation)
         %   .TVmode             : mode for TV regulariation, '2D'|'3D', default = '2D'
+        %   .regmap             : parameter map used for regularisation, 'fa'|'ra'|'Da'|'De', default = 'fa'
         %   .lmax               : Order of rotational invariant, 0|2, default = 0
         %   .lossFunction       : loss for data fidelity term, 'L1'|'L2'|'MSE', default = 'L1'
         %   .display            : online display the fitting process on figure, true|false, defualt = false
@@ -219,6 +220,8 @@ classdef gpuNEXI
             disp(['Learning rate decay rate = ' num2str( fitting.decayRate)]);
             if fitting.lambda > 0 
                 disp(['Regularisation parameter = ' num2str(fitting.lambda)]);
+                disp(['Regularisation Map       = ' fitting.regmap]);
+                disp(['Total variation mode     = ' fitting.TVmode]);
             end
             disp(['lmax                     = ' num2str(fitting.lmax)]);
             
@@ -388,7 +391,7 @@ classdef gpuNEXI
             
             % regularisation term
             if fitting.lambda > 0
-                cost        = this.reg_TV(squeeze(parameters.fa),squeeze(mask(1,:,:,:)),fitting.TVmode,fitting.voxelSize);
+                cost        = this.reg_TV(squeeze(parameters.(fitting.regmap)),squeeze(mask(1,:,:,:)),fitting.TVmode,fitting.voxelSize);
                 loss_reg    = sum(abs(cost),"all")/numMaskVox *fitting.lambda;
             else
                 loss_reg = 0;
@@ -629,6 +632,9 @@ classdef gpuNEXI
             end
             if ~isfield(fitting,'TVmode')
                 fitting2.TVmode = '2D';
+            end
+            if ~-isfield(fitting,'regmap')
+                fitting2.regmap = 'fa';
             end
             if ~isfield(fitting,'voxelSize')
                 fitting2.voxelSize = [2,2,2];
