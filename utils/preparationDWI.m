@@ -6,9 +6,34 @@ classdef preparationDWI
     end
 
     methods
+
+        function [dwi] = get_Sl_all(this,dwi,bval,bvec,ldelta,BDELTA,lmax)
+            % [bval_sorted,ldelta_sorted,BDELTA_sorted] = this.unique_shell(bval,ldelta,BDELTA);
+            % dims    = size(dwi);
+            % tmp     = size([dims(1:3) size(bval_sorted)]);
+            tmp = [];
+            % find unique little delta
+            ldelta_unique   = unique(ldelta);
+            for kldet = 1:numel(ldelta_unique)
+                % for each little delta, find unique big delta
+                idx_ldel    = find(ldelta == ldelta_unique(kldet));
+                BDELTA_unique = unique(BDELTA(idx_ldel));
+                for kBDE = 1:numel(BDELTA_unique)
+                
+                    % for each little delta and big delta, find unique b-values
+                    idx_BDEL= intersect(find(BDELTA == BDELTA_unique(kBDE)),idx_ldel);
+                    
+                    bval_tmp    = bval(idx_BDEL);
+                    bvec_tmp    = bvec(:,idx_BDEL);
+                    [dwi_Sl,~]  = this.Sl(dwi(:,:,:,idx_BDEL),bval_tmp,bvec_tmp,lmax);
+                    tmp = cat(4,tmp,dwi_Sl);
+                end
+            end
+            dwi = tmp;
+        end
         
         % compute rotational invariant DWI images
-        function [dwi_sh,bval_unique] = Slm(this,dwi,bval,bvec,lmax)
+        function [dwi_Sl,bval_unique] = Sl(this,dwi,bval,bvec,lmax)
         % [dwi_sh,bval_unique] = Slm(this,dwi,bval,bvec,lmax)
         % Input
         % -----------
@@ -43,7 +68,7 @@ classdef preparationDWI
             end
             
             % compute rotational invariant signal
-            dwi_sh       = zeros(numel(bval_unique)-1, Nsh, prod(dims(1:3)));
+            dwi_Sl       = zeros(numel(bval_unique)-1, Nsh, prod(dims(1:3)));
             counter = 0;
             for kb = 1:numel(bval_unique)
                 
@@ -51,14 +76,14 @@ classdef preparationDWI
                     counter = counter +1;
                     ind = bval == bval_unique(kb);
     
-                    dwi_sh(counter,:,:)   = this.SHrotinv(reshape( dwi(:,:,:,ind)./dwi_b0, prod(dims(1:3)),length(ind(ind>0))).', ...
+                    dwi_Sl(counter,:,:)   = this.SHrotinv(reshape( dwi(:,:,:,ind)./dwi_b0, prod(dims(1:3)),length(ind(ind>0))).', ...
                                                 bvec(ind,:), lmax);
                 end
 
             end
             
-            dwi_sh      = permute(reshape(dwi_sh,[NuniqueB, Nsh, dims(1:3)]),[3 4 5 1 2]);
-            dwi_sh      = reshape(dwi_sh(:,:,:,:,1:Nsh),[dims(1:3) NuniqueB*Nsh]);
+            dwi_Sl      = permute(reshape(dwi_Sl,[NuniqueB, Nsh, dims(1:3)]),[3 4 5 1 2]);
+            dwi_Sl      = reshape(dwi_Sl(:,:,:,:,1:Nsh),[dims(1:3) NuniqueB*Nsh]);
             bval_unique = bval_unique(bval_unique ~= 0);
         end
 
@@ -103,6 +128,40 @@ classdef preparationDWI
             incl = pi/2-elev;
             dirs = [azi incl];
         end
+
+        % get unique non-zero b-values for each little delta and big delta
+        function [bval_sorted,ldelta_sorted,BDELTA_sorted] = unique_shell(bval,ldelta,BDELTA)
+            bval_sorted     = [];
+            ldelta_sorted   = [];
+            BDELTA_sorted   = [];
+            
+            % find unique little delta
+            ldelta_unique   = unique(ldelta);
+            for klde = 1:numel(ldelta_unique)
+                
+                % for each little delta, find unique big delta
+                idx_ldel    = find(ldelta == ldelta_unique(klde));
+                BDELTA_unique = unique(BDELTA(idx_ldel));
+                for kBDE = 1:numel(BDELTA_unique)
+                
+                    % for each little delta and big delta, find unique b-values
+                    idx_BDEL= intersect(find(BDELTA == BDELTA_unique(kBDE)),idx_ldel);
+
+                    b_unique = unique(bval(idx_BDEL));
+                    b_unique = b_unique(b_unique>0);
+                    
+                    bval_sorted     = cat(2,bval_sorted,b_unique);
+                    ldelta_sorted   = cat(2,ldelta_sorted,ones(size(b_unique))*ldelta_unique(klde));
+                    BDELTA_sorted   = cat(2,BDELTA_sorted,ones(size(b_unique))*BDELTA_unique(kBDE));
+                end
+            
+            end
+            bval_sorted = bval_sorted(:);
+            ldelta_sorted = ldelta_sorted(:);
+            BDELTA_sorted = BDELTA_sorted(:);
+
+        end
+
 
     end
 

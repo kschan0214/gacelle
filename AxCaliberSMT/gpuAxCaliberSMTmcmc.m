@@ -40,45 +40,46 @@ classdef gpuAxCaliberSMTmcmc < handle
     
     methods (Access = public)
         function this = gpuAxCaliberSMTmcmc(b, delta, Delta, D0, Da, DeL, Dcsf)
-%GPUMCMCAXCALIBERSMT Axon size estimation using AxCaliber-SMT model and MCMC
-% smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf)
-%       output:
-%           - smt: object of a fitting class
-%
-%       input:
-%           - b: b-value [ms/um2]
-%           - delta: gradient duration [ms]
-%           - Delta: gradient seperation [ms]
-%           - D0: intra-cellular intrinsic diffusivity [um2/ms]
-%           - Da: intra-cellular axial diffusivity [um2/ms]
-%           - DeL: extra-cellular axial diffusivity [um2/ms]
-%           - Dcsf: CSF diffusivity [um2/ms]
-%
-%       usage:
-%           smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf);
-%           N_sample = 2e6;
-%           model = 'VanGelderen';
-%           N_interval = 100;
-%           [x_median, x] = smt.mcmc(S, N_sample, N_interval, 'median', 0.1);
-%
-%  Authors: 
-%  Hong-Hsi Lee (hlee84@mgh.harvard.edu)
-%  Copyright (c) 2022 Massachusetts General Hospital
+        % gpuAxCaliberSMTmcmc Axon size estimation using AxCaliber-SMT model and MCMC
+        % smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf)
+        %       output:
+        %           - smt: object of a fitting class
+        %
+        %       input:
+        %           - b: b-value [ms/um2]
+        %           - delta: gradient duration [ms]
+        %           - Delta: gradient seperation [ms]
+        %           - D0: intra-cellular intrinsic diffusivity [um2/ms]
+        %           - Da: intra-cellular axial diffusivity [um2/ms]
+        %           - DeL: extra-cellular axial diffusivity [um2/ms]
+        %           - Dcsf: CSF diffusivity [um2/ms]
+        %
+        %       usage:
+        %           smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf);
+        %           N_sample = 2e6;
+        %           model = 'VanGelderen';
+        %           N_interval = 100;
+        %           [x_median, x] = smt.mcmc(S, N_sample, N_interval, 'median', 0.1);
+        %
+        %  Authors: 
+        %  Kwok-Shing Chan (kchan2@mgh.harvard.edu)
+        %  Hong-Hsi Lee (hlee84@mgh.harvard.edu)
+        %  Copyright (c) 2022 Massachusetts General Hospital
             
             this.b      = gpuArray( single(b(:)) );
             this.delta  = gpuArray( single(delta(:)) );
             this.Delta  = gpuArray( single(Delta(:)) );
-            this.g      = gpuArray( single(sqrt(b./delta.^2./(Delta-delta/3))) );
+            this.g      = gpuArray( single(sqrt(b(:)./delta(:).^2./(Delta(:)-delta(:)/3))) );
             this.D0     = gpuArray( single(D0) );
             this.Da     = gpuArray( single(Da) );
 %             this.beta = sqrt(pi/4./b/Da);
 %             this.erf_a = erf(sqrt(b*Da));
             this.DeL    = gpuArray( single(DeL) );
             this.Dcsf   = gpuArray( single(Dcsf) );
-            this.Scsf   = gpuArray( single(exp(-b*Dcsf)) );
+            this.Scsf   = gpuArray( single(exp(-b(:)*Dcsf)) );
         end
 
-        function [out,r,f,fcsf,DeR,noise] = estimate(this, dwi, mask, bval, bvec, fitting)
+        function [out,r,f,fcsf,DeR,noise] = estimate(this, dwi, mask, bval, bvec, ldelta, BDELTA, fitting)
         % Perform AxCaliber model parameter estimation based on MCMC
         % Input data are expected in multi-dimensional image
         % 
@@ -102,9 +103,28 @@ classdef gpuAxCaliberSMTmcmc < handle
         % DeR       : radial diffusivity of extracellular water
         % noise     : noise level
         % 
+            
+            disp('========================================================');
+            disp('AxCaliberSMT with Markov Chain Monte Carlo (MCMC) solver');
+            disp('========================================================');
+            
+            disp('----------------')
+            disp('Data Information');
+            disp('----------------')
+            fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
+            fprintf('Gradient pulse duration (ms)   : [%s] \n',num2str(this.delta.',' %i'));
+            fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
+            disp('----------------')
+            disp('Fixed parameters');
+            disp('----------------')
+            disp(['Diffusivity intra-cellular intrinsic (um2/ms): ' num2str(this.D0,'%.2f')]);
+            disp(['Diffusivity intra-cellular axial (um2/ms)    : ' num2str(this.Da,'%.2f')]);
+            disp(['Diffusivity extra-cellular axial (um2/ms)    : ' num2str(this.DeL,'%.2f')]);
+            disp(['Diffusivity CSF (um2/ms)                     : ' num2str(this.Dcsf,'%.2f')]);
+            
 
             % get all fitting algorithm parameters 
-            fitting = this.check_set_default(fitting);
+            fitting = this.check_set_default(fitting,this.DeL);
 
             dims = size(dwi);
 
@@ -113,10 +133,18 @@ classdef gpuAxCaliberSMTmcmc < handle
                 bval = bval/1e3;    
             end
 
-            % compute spherical mean signal
-            obj         = preparationDWI;
-            [dwi,~]     = obj.Slm(dwi,bval,bvec,0);
-            % [dwi,bval_unique] = obj.Slm(dwi,bval,bvec,(fitting.lmax+2));
+            if dims(4) > numel(this.b) % full DWI data then compute SMT
+                % compute spherical mean signal
+                fprintf('\nComputing spherical mean signal...')
+                obj     = preparationDWI;
+                lmax    = 0;
+                [dwi]   = obj.get_Sl_all(dwi,bval,bvec,ldelta,BDELTA,lmax);
+                % [dwi,bval_unique] = obj.Slm(dwi,bval,bvec,(fitting.lmax+2));
+                disp('done.')
+                fprintf('\n');
+            elseif dims(4) < numel(this.b)
+                error('There are more b-shells in the class object than in the input data.');
+            end
 
             % vectorise data
             dwi         = reshape(dwi,prod(dims(1:3)),size(dwi,4));
@@ -124,87 +152,177 @@ classdef gpuAxCaliberSMTmcmc < handle
             dwi         = dwi(mask_idx,:).';
 
             % MCMC main
-            [x_m, x]    = this.mcmc(dwi, fitting.iteration, fitting.interval, fitting.method);
+            [x_m, x]    = this.mcmc(dwi, fitting.iteration, fitting.sampling, fitting.method, fitting.start, fitting.repetition, fitting.boundary);
 
             % prepare the output structure
-            r       = zeros(numel(mask),1); r(mask_idx)     = x_m(1,:); r       = reshape(r,    dims(1:3));
-            f       = zeros(numel(mask),1); f(mask_idx)     = x_m(2,:); f       = reshape(f,    dims(1:3));
-            fcsf    = zeros(numel(mask),1); fcsf(mask_idx)  = x_m(3,:); fcsf    = reshape(fcsf, dims(1:3));
-            DeR     = zeros(numel(mask),1); DeR(mask_idx)   = x_m(4,:); DeR     = reshape(DeR,  dims(1:3));
-            noise   = zeros(numel(mask),1); noise(mask_idx) = x_m(5,:); noise   = reshape(noise,dims(1:3));
+            r       = zeros(numel(mask),1,'single'); r(mask_idx)     = x_m(1,:); r       = reshape(r,    dims(1:3));
+            f       = zeros(numel(mask),1,'single'); f(mask_idx)     = x_m(2,:); f       = reshape(f,    dims(1:3));
+            fcsf    = zeros(numel(mask),1,'single'); fcsf(mask_idx)  = x_m(3,:); fcsf    = reshape(fcsf, dims(1:3));
+            DeR     = zeros(numel(mask),1,'single'); DeR(mask_idx)   = x_m(4,:); DeR     = reshape(DeR,  dims(1:3));
+            noise   = zeros(numel(mask),1,'single'); noise(mask_idx) = x_m(5,:); noise   = reshape(noise,dims(1:3));
 
-            r_dist      = zeros(numel(mask),size(x,3)); r_dist(mask_idx,:)      = x(1,:,:); r_dist      = reshape(r_dist, [dims(1:3), size(x,3)]);
-            f_dist      = zeros(numel(mask),size(x,3)); f_dist(mask_idx,:)      = x(1,:,:); f_dist      = reshape(f_dist, [dims(1:3), size(x,3)]);
-            fcsf_dist   = zeros(numel(mask),size(x,3)); fcsf_dist(mask_idx,:)   = x(1,:,:); fcsf_dist   = reshape(fcsf_dist, [dims(1:3), size(x,3)]);
-            DeR_dist    = zeros(numel(mask),size(x,3)); DeR_dist(mask_idx,:)    = x(1,:,:); DeR_dist    = reshape(DeR_dist, [dims(1:3), size(x,3)]);
-            noise_dist  = zeros(numel(mask),size(x,3)); noise_dist(mask_idx,:)  = x(1,:,:); noise_dist  = reshape(noise_dist, [dims(1:3), size(x,3)]);
+            % don't reshape the distributions to avoid memory issue
+            r_dist      = single(squeeze(x(1,:,:,:))); 
+            f_dist      = single(squeeze(x(2,:,:,:))); 
+            fcsf_dist   = single(squeeze(x(3,:,:,:))); 
+            DeR_dist    = single(squeeze(x(4,:,:,:))); 
+            noise_dist  = single(squeeze(x(5,:,:,:)));
+            % r_dist      = zeros(numel(mask),size(x,3),size(x,4),'single'); r_dist(mask_idx,:)      = x(1,:,:,:); r_dist      = reshape(r_dist,      [dims(1:3), size(x,3), size(x,4)]);
+            % f_dist      = zeros(numel(mask),size(x,3),size(x,4),'single'); f_dist(mask_idx,:)      = x(2,:,:,:); f_dist      = reshape(f_dist,      [dims(1:3), size(x,3), size(x,4)]);
+            % fcsf_dist   = zeros(numel(mask),size(x,3),size(x,4),'single'); fcsf_dist(mask_idx,:)   = x(3,:,:,:); fcsf_dist   = reshape(fcsf_dist,   [dims(1:3), size(x,3), size(x,4)]);
+            % DeR_dist    = zeros(numel(mask),size(x,3),size(x,4),'single'); DeR_dist(mask_idx,:)    = x(4,:,:,:); DeR_dist    = reshape(DeR_dist,    [dims(1:3), size(x,3), size(x,4)]);
+            % noise_dist  = zeros(numel(mask),size(x,3),size(x,4),'single'); noise_dist(mask_idx,:)  = x(5,:,:,:); noise_dist  = reshape(noise_dist,  [dims(1:3), size(x,3), size(x,4)]);
 
             out.r       = r;        out.f       = f;        out.fcsf        = fcsf;         out.DeR         = DeR;      out.noise       = noise;
             out.r_dist  = r_dist;   out.f_dist  = f_dist;   out.fcsf_dist   = fcsf_dist;    out.DeR_dist    = DeR_dist; out.noise_dist  = noise_dist;
-
+            
+            % save the estimation results if the output filename is provided
+            if ~isempty(fitting.output_filename)
+                [output_dir,~,~] = fileparts(fitting.output_filename);
+                if ~exist(output_dir,'dir')
+                    mkdir(output_dir);
+                end
+                save(fitting.output_filename,'out');
+                fprintf('Estimation output is saved in %s\n',fitting.output_filename);
+            end
         end
         
-        function [x_m, x] = mcmc(this, y, Np, N, method, varargin)
+        function [x_m, x] = mcmc(this, y, Np, N, method, start_method, repetition, varargin)
             % y         measurements, # measurements by # voxels
             % Np        # MCMC propagation
             % N         interval of final sampling
             % method    'mean' or 'median'
 
-            y   = gpuArray( single(y) );
-            Np  = gpuArray( single(Np) );
-            N   = gpuArray( single(N) );
-
             % choose the averaging method
             if isempty(method)
                 method = 'mean';
             end
+            if isempty(start_method)
+                start_method = 'default';
+            end
+
+            % display message
+            disp('----------------------------------------------------');
+            disp('Markov Chain Monte Carlo (MCMC) algorithm parameters');
+            disp('----------------------------------------------------');
+            disp(['No. of iterations : ', num2str(Np)]);
+            disp(['No. of repetitions: ', num2str(repetition)])
+            disp(['Sampling interval : ', num2str(N)]);
+            disp(['Method            : ', method]);
+            if ischar(start_method)
+                disp(['Starting points   : ', start_method ]);
+            end
+            fprintf('\n');
+            
+            % convert data into single datatype for better performance
+            y   = gpuArray( single(y) );
 
             % Nm: # measurements
             % Nv: # voxels
             [Nm, Nv] = size(y);
-%             this.bm2 = repmat(reshape(this.bm(1:15).^2,1,1,15), Nm, Nv, 1);
+            if nargin == 8
+                % get user defined estimation boundaries if provided
+                intervals = varargin{1};    
+            else
+                % otherwise uses default
+                intervals = [0.1 20         ;   % radius, um
+                               0 1          ;   % intra-cellular volume fraction
+                               0 1          ;   % isotropic volume fraction
+                            0.01 this.DeL   ;   % extra-cellular RD, um2/ms
+                            0.01 1         ];   % sigma/b0 = 1/SNR_b0
+            end
             
-            intervals = [0.1 20 ;   % radius, um
-                0    1          ;   % intra-cellular volume fraction
-                0    1          ;   % isotropic volume fraction
-                0.01 this.DeL   ;   % extra-cellular RD, um2/ms
-                0.01 1         ];   % sigma/b0 = 1/SNR_b0
-            
-            Xrange = [0.2619;   % dr    = 1.0474/2/2
-                0.05        ;   % df    = 0.1/2
-                0.05        ;   % dfiso = 0.1/2
-                0.0394      ;   % dDeR  = 0.1574/4
-                0.005       ];  % dsig  = 0.01/2
+            % Step size on each iteration
+            Xrange = [  0.2619      ;   % dr    = 1.0474/2/2
+                        0.05        ;   % df    = 0.1/2
+                        0.05        ;   % dfiso = 0.1/2
+                        0.0394      ;   % dDeR  = 0.1574/4
+                        0.005       ];  % dsig  = 0.01/2
             Xrange      = gpuArray(single(Xrange));
             intervals   = gpuArray(single(intervals));
             lb          = repmat(intervals(:,1),1,Nv);
             ub          = repmat(intervals(:,2),1,Nv);
             
-            xj = [3.2421; 0.3; 0.1; 0.4821; 1/20];
-            xj = gpuArray(single(repmat(xj, 1, Nv)));
+            % set starting points
+            if ischar(start_method)
+                switch lower(start_method)
+                    case 'likelihood'
+                        % using maximum likelihood method to estimate starting points
+                        disp('Estimate starting points based on likelihood ...')
+                        pool            = gcp('nocreate');
+                        isDeletepool    = false;
+                        N_sample        = 1e4;
+                        [x_train, S_train] = this.traindata(N_sample);
+                        if isempty(pool)
+                            Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                            pool    = parpool('Processes',Nworker);
+                            isDeletepool = true;
+                        end
+                        xj_init     = zeros(4,size(y,2));
+                        start = tic;
+                        parfor k = 1:size(y,2)
+                            xj_init(:,k) = this.likelihood(gather(y(:,k)), x_train, S_train);
+                        end
+                        ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
+                        fprintf('Starting points estimated. Elapsed time (hh:mm:ss): %s \n',string(ET));
+                        if isDeletepool
+                            delete(pool);
+                        end
+                        xj_init(5,:) = 1/20;
+                        xj_init      = gpuArray(single(xj_init));
+    
+                    case 'default'
+                        % use fixed points
+                        xj_init = [3.2421; 0.3; 0.1; 0.4821; 1/20];
+                        fprintf('Using default starting points for all voxels at [r,f,fcsf,DeR,sigma]: [%s]\n\n',replace(num2str(xj_init.',' %.2f'),' ',','));
+    
+                        xj_init = gpuArray(single(repmat(xj_init, 1, Nv)));
+                    
+                end
+            else
+                % user defined starting point
+                xj_init = start_method(:);
+                fprintf('Using user-defined starting points for all voxels at [r,f,fcsf,DeR,sigma]: [%s]\n\n',replace(num2str(xj_init.',' %.2f'),' ',','));
+    
+                xj_init = gpuArray(single(repmat(xj_init, 1, Nv)));
+            end
+            fprintf('Estimation lower bound [r,f,fcsf,DeR,sigma]: [%s]\n',replace(num2str(gather(intervals(:,1)).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [r,f,fcsf,DeR,sigma]: [%s]\n\n',replace(num2str(gather(intervals(:,2)).',' %.2f'),'  ',','));
+
             model = 'VanGelderen';
-            logP = @(X, Y) -sum( (this.FWD(X(1:4, :), model)-Y).^2, 1 )./(2*X(5,:).^2) + Nm/2*log(1./X(5,:).^2);
             
+            % logP is converted into external function for specific CUDA kernel 
+            % logP = @(X, Y) -sum( (this.FWD(X(1:4, :), model)-Y).^2, 1 )./(2*X(5,:).^2) + Nm/2*log(1./X(5,:).^2);
+            
+            disp('-------------------------');
+            disp('MCMC optimisation process');
+            disp('-------------------------');
             % initialize exponent of old probability
             Ns = floor( (Np - floor(Np/10)) / N ) + 1;
-            x  = zeros(5, Nv, Ns, 'like', xj);
-            Pj = logP(xj, y);
+            x  = zeros(5, Nv, Ns, repetition,'single');
+            % Pj = logP(xj, y);
+            Pj_init = arrayfun(@AxCaliberSMT_logP, sum( (this.FWD(xj_init(1:4, :), model)-y).^2, 1 ), xj_init(5,:), Nm);
+            
+            for ii = 1:repetition
+            fprintf('Repetition #%i/%i \n',ii,repetition)
+
+            Pj = Pj_init;
+            xj = xj_init;
+
             k = 0;
+            start = tic;
             for i = 1:Np
                 % 1. Sample the next parameter combination
                 xi = xj + Xrange.*randn(size(xj),'like',xj);
                 xi(xi<lb) = lb(xi<lb);
                 xi(xi>ub) = ub(xi>ub);
-                % for j = 1:5
-                %     xi(j,xi(j,:)<intervals(j,1)) = intervals(j,1);
-                %     xi(j,xi(j,:)>intervals(j,2)) = intervals(j,2);
-                % end
 
                 % 2. Metropolis sampling
                 % If the probability ratio of new to old > threshold,
                 % we take the new solution.
                 % 2.1 new probability
-                Pi          = logP(xi, y);
+                % Pi          = logP(xi, y);
+                Pi          = arrayfun(@AxCaliberSMT_logP, sum( (this.FWD(xi(1:4, :), model)-y).^2, 1 ), xi(5,:), Nm);
                 % 2.2 probability ratio of new to old
                 r           = min(exp(Pi-Pj), 1);
                 list        = r > rand(1,Nv,'like',xj);
@@ -217,18 +335,98 @@ classdef gpuAxCaliberSMTmcmc < handle
                 % 3.2 keep an interation every N iterations
                 if ( i > floor(Np/10)+1 ) && ( mod(i,N)==1 )
                     k = k+1;
-                    x(:,:,k) = xj;
+                    x(:,:,k,ii) = gather(xj);
+                end
+
+                % display message every 10000 iteration
+                if mod(i,1e4) == 0 || i == 1e3
+                    ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
+                    ERT = ET / (i/Np) - ET;
+                    fprintf('Iteration #%6d,    Elapsed time (hh:mm:ss):%s,     Estimated remaining time (hh:mm:ss):%s \n',i,string(ET),string(ERT));
                 end
             end
-            x = gather( x(:,:,1:k));
+            end
+            x =  x(:,:,1:k,:);
             
             % average over distribution
             switch method
                 case 'mean'
-                    x_m = squeeze(mean(x,3));
+                    x_m = squeeze(mean(mean(x,3),4));
                 case 'median'
-                    x_m = squeeze(median(x,3));
+                    x_m = squeeze(median(median(x,3),4));
             end
+
+            disp('The process is completed.')
+        end
+
+        % likelihood
+        function [x_train, S_train, intervals] = traindata(this, N_samples, varargin)
+            if nargin < 3
+                intervals = [0.1 4 ;   % radius, um
+                               0 1          ;   % intra-cellular volume fraction
+                               0 1          ;   % isotropic volume fraction
+                            0.2 this.DeL]  ;   % extra-cellular RD, um2/ms
+                            % 0.01 1         ];   % sigma/b0 = 1/SNR_b0
+            else
+                intervals = varargin{1};
+            end
+            
+            numBSample = numel(this.b);
+            numParam   = size(intervals,1) ;
+            
+            % batch size can be modified according to available hardware
+            batch_size  = 1e3;
+            reps        = ceil(N_samples/batch_size);
+            x_train     = zeros(numParam,batch_size,reps);
+            S_train     = zeros(numBSample,batch_size,reps);
+            for k = 1:reps
+                % generate random parameter guesses and construct batch for NN signal evaluation
+                pars = intervals(:,1) + diff(intervals,[],2).*rand(size(intervals,1),batch_size);
+
+                % NEXI Krger signal evaluation
+                Sl0 = zeros(numel(this.b),batch_size);
+                for j = 1:batch_size
+                    Sl0(:,j) = this.FWD(pars(:,j), 'VanGelderen');
+                end
+
+                % remaining signals (dot, soma)
+                x_train(:,:,k) = pars;
+                S_train(:,:,k) = Sl0;
+
+            end
+
+        end
+    
+        function [pars_best, sse_best] = likelihood(this, S0, x_train, S_train)
+            
+            lmax = 0;
+            wt = kron(ones(size(this.b)), 1./(2*(0:2:lmax)+1));
+            wt = wt(:);
+            nL = floor(lmax/2);
+            S0 = S0(1:numel(this.b)*(nL+1),:);
+            % batch size can be modified according to available hardware
+            [Nx, ~, reps] = size(x_train);
+            [~, Nv] = size(S0);
+            pars_best = zeros(Nx,Nv);
+            sse_best  = inf(1, Nv);
+            for k = 1:reps
+                pars = x_train(:,:,k);
+                S    = S_train(:,:,k);
+                for i = 1:Nv
+                    S0i = S0(:,i);
+
+                    % scale generated signals (fit S0) to input signal
+                    sse = sum(wt.*(S0i - (S0i'*S)./dot(S,S).*S).^2);
+
+                    % store best encountered parameter combination
+                    [sse_new,best_index] = min(sse);
+                    if sse_new<sse_best(i)
+                        sse_best(i)    = sse_new;
+                        pars_best(:,i) = pars(:,best_index);
+                    end
+                end
+            end
+
         end
 
         function s = FWD(this, pars, model)
@@ -547,20 +745,52 @@ classdef gpuAxCaliberSMTmcmc < handle
         end
 
         % check and set default fitting algorithm parameters
-        function fitting2 = check_set_default(fitting)
+        function fitting2 = check_set_default(fitting,DeL)
             fitting2 = fitting;
 
             % get fitting algorithm setting
             if ~isfield(fitting,'iteration')
                 fitting2.iteration = 2e5;
             end
-            if ~isfield(fitting,'interval')
-                fitting2.interval = 100;
+            if ~isfield(fitting,'sampling')
+                fitting2.sampling = 100;
             end
             if ~isfield(fitting,'method')
                 fitting2.method = 'mean';
             end
+            if ~isfield(fitting,'start')
+                fitting2.start = 'default';
+            end
+            if ~isfield(fitting,'repetition')
+                fitting2.repetition = 1;
+            end 
+            if ~isfield(fitting,'boundary')
+                fitting2.boundary = [ 0.1 20         ;   % radius, um
+                                        0 1          ;   % intra-cellular volume fraction
+                                        0 1          ;   % isotropic volume fraction
+                                     0.01 DeL        ;   % extra-cellular RD, um2/ms
+                                     0.01 1         ];   % sigma/b0 = 1/SNR_b0
+            end
+            if ~isfield(fitting,'output_filename')
+                fitting2.output_filename = [];
+            end
         end
+
+        % this utility function convert the MCMC posterior distribution into 4D/5D image
+        function img = distribution2image(dist,mask)
+            
+            dims = size(mask);
+
+            % find masked signal
+            mask_idx        = find(mask>0);
+            % reshape the input to an image         
+            img                 = zeros(numel(mask),size(dist,2),size(dist,3),'single'); 
+            img(mask_idx,:,:)   = dist; 
+            img                 = reshape(img,      [dims(1:3), size(dist,2), size(dist,3)]);
+            
+        end
+
+
     end
-end
+end     
 
