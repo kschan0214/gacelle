@@ -7,11 +7,13 @@ classdef preparationDWI
 
     methods
 
-        function [dwi] = get_Sl_all(this,dwi,bval,bvec,ldelta,BDELTA,lmax)
+        function [dwi,b_all] = get_Sl_all(this,dwi,bval,bvec,ldelta,BDELTA,lmax)
             % [bval_sorted,ldelta_sorted,BDELTA_sorted] = this.unique_shell(bval,ldelta,BDELTA);
             % dims    = size(dwi);
             % tmp     = size([dims(1:3) size(bval_sorted)]);
-            tmp = [];
+            dims = size(dwi);
+            tmp     = [];
+            b_all   = [];
             % find unique little delta
             ldelta_unique   = unique(ldelta);
             for kldet = 1:numel(ldelta_unique)
@@ -23,13 +25,15 @@ classdef preparationDWI
                     % for each little delta and big delta, find unique b-values
                     idx_BDEL= intersect(find(BDELTA == BDELTA_unique(kBDE)),idx_ldel);
                     
-                    bval_tmp    = bval(idx_BDEL);
-                    bvec_tmp    = bvec(:,idx_BDEL);
-                    [dwi_Sl,~]  = this.Sl(dwi(:,:,:,idx_BDEL),bval_tmp,bvec_tmp,lmax);
+                    bval_tmp            = bval(idx_BDEL);
+                    bvec_tmp            = bvec(:,idx_BDEL);
+                    [dwi_Sl,b_unique]   = this.Sl(dwi(:,:,:,idx_BDEL),bval_tmp,bvec_tmp,lmax);
+                    dwi_Sl              = reshape(dwi_Sl,[dims(1:3) size(dwi_Sl,4)/(lmax/2+1) lmax/2+1]);
+                    b_all = cat(2,b_all,b_unique);
                     tmp = cat(4,tmp,dwi_Sl);
                 end
             end
-            dwi = tmp;
+            dwi = reshape(tmp,[dims(1:3), size(tmp,4)*size(tmp,5)]);
         end
         
         % compute rotational invariant DWI images
@@ -51,7 +55,7 @@ classdef preparationDWI
             if size(bvec,1) == 3
                 bvec = bvec.';
             end
-            % use 2 higher order for computation
+            
             Nsh  = floor(lmax/2) + 1; 
             % get image size
             dims = size(dwi);

@@ -1,4 +1,4 @@
-%% s = logP = AxCaliberSMT_logP(residual_sos, noise, Nm)
+%% s = logP = MCMC_logP(residual_sos, noise, Nm)
 %
 % Input
 % --------------
@@ -15,7 +15,7 @@
 % Date modified:
 %
 %
-function logP = AxCaliberSMT_logP(residual_sos, noise, Nm)
+function logP = MCMC_logP(residual_sos, noise, Nm)
 
 logP = -residual_sos./(2*noise.^2) + Nm/2*log(1./noise.^2);
 

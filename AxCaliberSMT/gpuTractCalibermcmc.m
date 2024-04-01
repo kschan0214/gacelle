@@ -1,4 +1,4 @@
-classdef gpuAxCaliberSMTmcmc < handle
+classdef gpuTractCalibermcmc < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % AxCaliberSMT model parameter estimation based on MCMC
@@ -39,7 +39,7 @@ classdef gpuAxCaliberSMTmcmc < handle
     end
     
     methods (Access = public)
-        function this = gpuAxCaliberSMTmcmc(b, delta, Delta, D0, Da, DeL, Dcsf)
+        function this = gpuTractCalibermcmc(b, delta, Delta, D0, Da, DeL, Dcsf)
         % gpuAxCaliberSMTmcmc Axon size estimation using AxCaliber-SMT model and MCMC
         % smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf)
         %       output:
@@ -86,11 +86,9 @@ classdef gpuAxCaliberSMTmcmc < handle
         % Input
         % -----------
         % dwi       : 4D DWI, [x,y,z,dwi]
-        % mask      : 3D signal mask, [x,y,z]
-        % bval      : 1D bval in ms/um2, [1,dwi]
-        % bvec      : 2D b-table, [3,dwi]
-        % ldelta    : 1D gradient pulse duration in ms, [1,dwi]
-        % BDELTA    : 1D diffusion time in ms, [1,dwi]
+        % mask      : 3D signal mask
+        % bval      : bval in ms/um2
+        % bvec      : b-table
         % fitting   : fitting algorithm parameters
         %   .iteration  : number of MCMC iterations
         %   .interval   : interval of MCMC sampling
@@ -185,7 +183,7 @@ classdef gpuAxCaliberSMTmcmc < handle
                     mkdir(output_dir);
                 end
                 save(fitting.output_filename,'out');
-                fprintf('Estimation output is saved at %s\n',fitting.output_filename);
+                fprintf('Estimation output is saved in %s\n',fitting.output_filename);
             end
         end
         
@@ -303,7 +301,7 @@ classdef gpuAxCaliberSMTmcmc < handle
             Ns = floor( (Np - floor(Np/10)) / N ) + 1;
             x  = zeros(5, Nv, Ns, repetition,'single');
             % Pj = logP(xj, y);
-            Pj_init = arrayfun(@AxCaliberSMT_logP, sum( (this.FWD(xj_init(1:4, :), model)-y).^2, 1 ), xj_init(5,:), Nm);
+            Pj_init = arrayfun(@MCMC_logP, sum( (this.FWD(xj_init(1:4, :), model)-y).^2, 1 ), xj_init(5,:), Nm);
             
             for ii = 1:repetition
             fprintf('Repetition #%i/%i \n',ii,repetition)
@@ -324,7 +322,7 @@ classdef gpuAxCaliberSMTmcmc < handle
                 % we take the new solution.
                 % 2.1 new probability
                 % Pi          = logP(xi, y);
-                Pi          = arrayfun(@AxCaliberSMT_logP, sum( (this.FWD(xi(1:4, :), model)-y).^2, 1 ), xi(5,:), Nm);
+                Pi          = arrayfun(@MCMC_logP, sum( (this.FWD(xi(1:4, :), model)-y).^2, 1 ), xi(5,:), Nm);
                 % 2.2 probability ratio of new to old
                 r           = min(exp(Pi-Pj), 1);
                 list        = r > rand(1,Nv,'like',xj);
@@ -446,12 +444,14 @@ classdef gpuAxCaliberSMTmcmc < handle
                     % C = this.vg(r);
                     C = this.vg2(r);    % less memory efficient but faster
             end
-            % Sa = sqrt(pi./(4*(this.b*this.Da - C))) .* exp(-C) .* erf(sqrt(this.b*this.Da - C));
+            % S = exp(-C);
+            % Sa = S;
             % % 2. Extra-cellular signal
-            % Se = sqrt(pi./(4.*(this.DeL - DeR).*this.b)) .* exp(-this.b.*DeR) .* erf(sqrt(this.b .*(this.DeL - DeR)));
+            % Se = exp(-this.b.*DeR);
             % % Combined signal
             % s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
-            s = arrayfun(@AxCaliberSMT_signal_combine, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
+
+            s = arrayfun(@TractCaliber_signal_combine, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
         end
 
         function F = GaussSH(this, b, Da, Dr, lmax)

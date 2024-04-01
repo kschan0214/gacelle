@@ -1,8 +1,8 @@
 classdef gpuNEXI
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 8 Dec 2023 (v1.0.0)
-% Date modified:
+% Date created: 8 Dec 2023 (v0.1.0)
+% Date modified: 29 March 2024 (v0.2.0)
 
     properties (GetAccess = public, SetAccess = protected)
         b;
@@ -45,55 +45,165 @@ classdef gpuNEXI
         %  Dmitry Novikov (dmitry.novikov@nyulangone.org)
         %  Copyright (c) 2023 New York University
             
-            this.b = b(:);
-            this.Delta = Delta(:);
+            this.b      = b(:) ;
+            this.Delta  = Delta(:) ;
             if nargin > 2
-                this.Nav = varargin{1};
+                this.Nav = varargin{1} ;
             else
-                this.Nav = ones(size(b));
+                this.Nav =  ones(size(b)) ;
             end
-            this.Nav = this.Nav(:);
+            this.Nav = this.Nav(:) ;
         end
     
         % automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out, fa, Da, De, ra, p2] = estimate(this, dwi, mask, fitting, pars0)
-            gpuDevice([]);
-            gpu = gpuDevice;
+        function  [out, fa, Da, De, ra, p2] = estimate(this, dwi, mask, bval, bvec, ldelta, BDELTA, fitting, pars0)
+        % Perform NEXI model parameter estimation based on askAdam
+        % Input data are expected in multi-dimensional image
+        % 
+        % Input
+        % -----------
+        % dwi       : 4D DWI, [x,y,z,dwi]
+        % mask      : 3D signal mask, [x,y,z]
+        % bval      : 1D bval in ms/um2, [1,dwi]                (Optional, only needed if dwi is full acquisition)
+        % bvec      : 2D b-table, [3,dwi]                       (Optional, only needed if dwi is full acquisition)
+        % ldelta    : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
+        % BDELTA    : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
+        % fitting   : fitting algorithm parameters (see fit function)
+        % 
+        % Output
+        % -----------
+        % out       : output structure contains all MCMC results
+        % r         : Axon radius
+        % f         : Neurite volume fraction
+        % fcsf      : CSF volume fraction
+        % DeR       : radial diffusivity of extracellular water
+        % noise     : noise level
+        % 
+            
+            disp('========================');
+            disp('NEXI with askAdam solver');
+            disp('========================');
+
+            disp('----------------')
+            disp('Data Information');
+            disp('----------------')
+            fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
+            fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
+
+            % get all fitting algorithm parameters 
+            fitting = this.check_set_default(fitting);
 
             dims = size(dwi);
 
-            maxMemory = floor(gpu.TotalMemory / 1024^3)*1024^3;
+            % full DWI data then compute rotaionally invariant signal
+            if dims(4)/(fitting.lmax/2+1) > numel(this.b) 
+                % compute spherical mean signal
+                fprintf('\nComputing rotationally invariant signal...')
 
+                % if the inout little delta is one value then create a vector
+                if numel(ldelta) == 1
+                    ldelta = ones(bval) * ldelta;
+                end
 
-            memoryRequiredFixPerVoxel       = 40 * prod(dims);
-            memoryRequiredDynamicperVoxel   = 1.5e3 * prod(dims([1,2,4]));
+                obj     = preparationDWI;
+                lmax    = fitting.lmax;
+                [dwi]   = obj.get_Sl_all(dwi,bval,bvec,ldelta,BDELTA,lmax);
+                % [dwi,bval_unique] = obj.Slm(dwi,bval,bvec,(fitting.lmax+2));
 
-            maxSlice = floor((maxMemory - memoryRequiredFixPerVoxel)/memoryRequiredDynamicperVoxel);
-            NSegment = ceil(dims(3)/maxSlice);
+                disp('done.')
+                fprintf('\n');
+
+            elseif dims(4) < numel(this.b)
+                error('There are more b-shells in the class object than in the input data.');
+            end
+
+            % mask sure no nan or inf
+            Nvoxel_old              = numel(mask(mask>0));
+            mask_nonnaninf          = and(~isnan(dwi) , ~isinf(dwi));
+            dwi(mask_nonnaninf==0)  = 0;
+            dwi(mask_nonnaninf==0)  = 0;
+            mask_nonnaninf          = min(mask_nonnaninf,[],4);
+            mask                    = and(mask,mask_nonnaninf);
+            Nvoxel_new              = numel(mask(mask>0));
+            if Nvoxel_old ~= Nvoxel_new
+                disp('The mask is updated due to the presence of NaN/Inf. Please make use of the output mask in your subseqeunt analysis.');
+            end
+
+            % update matrix size
+            dims = size(dwi);
+
+            % if no pars input at all (not even empty) then use prior
+            if nargin < 9 
+                pars0 = [];
+            end
+            if and(fitting.isPrior,isempty(pars0))
+                pars0 = this.estimate_prior(dwi, mask, [], fitting.lmax);
+            end
+
+            % convert datatype to single
+            dwi     = single(dwi);
+            mask    = mask >0;
+            if ~isempty(pars0); pars0 = single(pars0); end
+
+            % determine if we need to divide the data to fit in GPU
+            gpuDevice([]);
+            [NSegment,maxSlice] = this.findOptimalDivide(mask);
 
             fprintf('Data is divided into %d segments\n',NSegment);
             
-            fa = zeros(dims(1:3));
-            Da = zeros(dims(1:3));
-            De = zeros(dims(1:3));
-            ra = zeros(dims(1:3));
-            p2 = zeros(dims(1:3));
+            fa = zeros(dims(1:3),'single');
+            Da = zeros(dims(1:3),'single');
+            De = zeros(dims(1:3),'single');
+            ra = zeros(dims(1:3),'single');
+            p2 = zeros(dims(1:3),'single');
             for ks = 1:NSegment
 
                 fprintf('Running #Segment = %d/%d \n',ks,NSegment);
                 disp   ('------------------------')
     
-                slice = 1+(ks-1)*dims(3)/NSegment : ks*dims(3)/NSegment;
+                if ks ~= NSegment
+                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
+                else
+                    slice = 1+(ks-1)*maxSlice : dims(3);
+                end
                 
                 dwi_tmp     = dwi(:,:,slice,:);
                 mask_tmp    = mask(:,:,slice);
-                pars0_tmp   = pars0(:,:,slice,:);
+                if ~isempty(pars0)
+                    pars0_tmp   = pars0(:,:,slice,:);
+                end
                 if fitting.lmax >0
-                    [out(ks), fa(:,:,slice), Da(:,:,slice), De(:,:,slice), ra(:,:,slice), p2(:,:,slice)]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+                    [out_tmp, fa(:,:,slice), Da(:,:,slice), De(:,:,slice), ra(:,:,slice), p2(:,:,slice)]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
                 else
-                    [out(ks), fa(:,:,slice), Da(:,:,slice), De(:,:,slice), ra(:,:,slice)]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+                    [out_tmp, fa(:,:,slice), Da(:,:,slice), De(:,:,slice), ra(:,:,slice)]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
                     p2 = [];
                 end
+
+                % reformat out structure
+                fn1 = fieldnames(out_tmp);
+                for kfn1 = 1:numel(fn1)
+                    fn2 = fieldnames(out_tmp.(fn1{kfn1}));
+                    for kfn2 = 1:numel(fn2)
+                        if isscalar(out_tmp.(fn1{kfn1}).(fn2{kfn2})) % scalar value
+                            out.(fn1{kfn1}).(fn2{kfn2})(ks) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+                        else
+                            % image result
+                            out.(fn1{kfn1}).(fn2{kfn2})(:,:,slice) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+                        end
+                            
+                    end
+                end
+            end
+            out.mask = mask;
+
+            % save the estimation results if the output filename is provided
+            if ~isempty(fitting.output_filename)
+                [output_dir,~,~] = fileparts(fitting.output_filename);
+                if ~exist(output_dir,'dir')
+                    mkdir(output_dir);
+                end
+                save(fitting.output_filename,'out');
+                fprintf('Estimation output is saved at %s\n',fitting.output_filename);
             end
 
         end
@@ -198,7 +308,7 @@ classdef gpuNEXI
             parameters = this.initialise_model(dims(2:end),pars0,ub,lb,fitting);   % all parameters are betwwen [0,1]
          
             l = 0:2:fitting.lmax;
-            w = zeros(size(dwi));
+            w = zeros(size(dwi),'single');
             for kl = 1:(fitting.lmax/2+1)
                 for kb = 1:numel(this.b)
                     w((kl-1)*numel(this.b)+kb,:,:,:) = this.Nav(kb) / (2*l(kl)+1);
@@ -212,6 +322,9 @@ classdef gpuNEXI
             w = dlarray(gpuArray(w).','CB');
 
             % display optimisation algorithm parameters
+            disp('----------------------------');
+            disp('AskAdam algorithm parameters');
+            disp('----------------------------');
             disp(['Maximum no. of iteration = ' num2str(fitting.Nepoch)]);
             disp(['Loss function            = ' fitting.lossFunction]);
             disp(['Loss tolerance           = ' num2str(fitting.tol)]);
@@ -371,13 +484,15 @@ classdef gpuNEXI
             parameters = this.rescale_parameters(parameters,lb,ub);
             
             % Forward model
-            R           = this.FWD(parameters,fitting);
+            % R           = this.FWD(parameters,fitting);
+            R           = this.FWD(parameters,fitting,mask(1,:,:,:));
             R(isinf(R)) = 0;
             R(isnan(R)) = 0;
 
             % Masking
-            R   = dlarray(R(mask>0).',     'CB');
-            dlR = dlarray(dlR(mask>0).',   'CB');
+            % R   = dlarray(R(mask>0).',     'CB');
+            R   = dlarray(R(:).',           'CB');
+            dlR = dlarray(dlR(mask>0).',    'CB');
 
             % Data fidelity term
             switch lower(fitting.lossFunction)
@@ -405,40 +520,133 @@ classdef gpuNEXI
         
         end
         
+        % using maximum likelihood method to estimate starting points
+        function pars0 = estimate_prior(this,dwi,mask, Nsample,lmax)
+        % Estimation starting points for NEXI using likehood method
+
+            start = tic;
+            
+            disp('Estimate starting points based on likelihood ...')
+
+            % manage pool
+            pool            = gcp('nocreate');
+            isDeletepool    = false;
+            if isempty(pool)
+                Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                pool    = parpool('Processes',Nworker);
+                isDeletepool = true;
+            end
+
+            if nargin < 4 || isempty(Nsample)
+                Nsample         = 1e4;
+            end
+            % create training data
+            [x_train, S_train] = this.traindata(Nsample,lmax);
+
+            % reshape input data,  put DWI dimension to 1st dim
+            dims    = size(dwi);
+            dwi     = permute(dwi,[4 1 2 3]);
+            dwi     = reshape(dwi,[dims(4), prod(dims(1:3))]);
+
+            % find masked voxels
+            ind         = find(mask(:));
+            if lmax == 0
+                Nparam = 4;
+            elseif lmax == 2
+                Nparam = 5;
+            end
+
+            pars0_mask  = zeros(Nparam,length(ind));
+            parfor kvol = 1:length(ind)
+                pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
+            end
+            pars0           = zeros(Nparam,size(dwi,2));
+            pars0(:,ind)    = pars0_mask;
+
+            % reshape estimation into image
+            pars0           = permute(reshape(pars0,[size(pars0,1) dims(1:3)]),[2 3 4 1]);
+
+            % Correction for CSF
+            idx             = this.b < 4;
+            D0              = this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:));
+            D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
+            D0(isnan(D0))   = 0;
+            D0(isinf(D0))   = 0;
+            D0(D0<0)        = 0;
+            mask_CSF        = medfilt3(D0)>1;
+            
+            % ratio to modulate pars0 estimattion
+            pars0_csf = [0.01,1,1,0.01,0.01];
+            for k = 1:size(pars0,4)
+                tmp                 = pars0(:,:,:,k);
+                tmp(mask_CSF==1)    = tmp(mask_CSF==1).*pars0_csf(k);
+                pars0(:,:,:,k)      = tmp;
+            end
+
+            ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
+            fprintf('Starting points estimated. Elapsed time (hh:mm:ss): %s \n',string(ET));
+            if isDeletepool
+                delete(pool);
+            end
+
+        end
+
         % NEXI signal
         % copmpute the forward model
-        function [s] = FWD(this, pars, fitting)
+        function [s] = FWD(this, pars, fitting,mask)
         % Forward model to generate NEXI signal
+            if nargin < 4
                 fa   = pars.fa;
                 Da   = pars.Da;
                 De   = pars.De;
                 ra   = pars.ra;
+            else
+                % mask out voxels to reduce memory
+                fa   = pars.fa(mask(1,:,:,:)).';
+                Da   = pars.Da(mask(1,:,:,:)).';
+                De   = pars.De(mask(1,:,:,:)).';
+                ra   = pars.ra(mask(1,:,:,:)).';
+            end
                 
-                % Forward model
-                % Sl0
-                s = this.Sl0(fa, Da, De, ra);
-                
-                % Sl2
-                if fitting.lmax == 2
+            % Forward model
+            % Sl0
+            s = this.Sl0(fa, Da, De, ra);
+            
+            % Sl2
+            if fitting.lmax == 2
+                if nargin < 4
                     p2 = pars.p2;
-                    s = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
+                else
+                    p2 = pars.p2(mask(1,:,:,:)).';
                 end
 
-                % make sure s cannot be greater than 1
-                s = min(s,1);
+                s = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
+            end
+
+            % make sure s cannot be greater than 1
+            s = min(s,1);
                 
         end
         
         % 0th order rotational invariant
         function S = Sl0(this, fa, Da, De, ra)
-            Da = this.b.*Da;
-            De = this.b.*De;
-            ra = this.Delta.*ra;
+
+            if isgpuarray(fa)
+                bval    = gpuArray(single(this.b));
+                DELTA   = gpuArray(single(this.Delta));
+            else
+                bval = this.b;
+                DELTA   = this.Delta;
+            end
+
+            Da = bval.*Da;
+            De = bval.*De;
+            ra = DELTA.*ra;
             re = ra.*fa./(1-fa);
             
             % Trapezoidal's rule replacement
             Nx  = 14;    % NRMSE<0.05% for Nx=14
-            x   = zeros([ones(1,ndims(fa)), Nx]); x(:) = linspace(0,1,Nx);
+            x   = zeros([ones(1,ndims(fa)), Nx],'like',bval); x(:) = linspace(0,1,Nx);
             S   = trapz(x(:),this.M(x, fa, Da, De, ra, re),ndims(x));
             % myfun = @(x) this.M(x, fa, Da, De, ra, re);
             % S = integral(myfun, 0, 1, 'AbsTol', 1e-14, 'ArrayValued', true);
@@ -446,14 +654,23 @@ classdef gpuNEXI
         end
         % 2nd order rotational invariant
         function S = Sl2(this, fa, Da, De, ra, p2)
-            Da = this.b.*Da;
-            De = this.b.*De;
-            ra = this.Delta.*ra;
+
+            if isgpuarray(fa)
+                bval    = gpuArray(single(this.b));
+                DELTA   = gpuArray(single(this.Delta));
+            else
+                bval = this.b;
+                DELTA   = this.Delta;
+            end
+
+            Da = bval.*Da;
+            De = bval.*De;
+            ra = DELTA.*ra;
             re = ra.*fa./(1-fa);
             
             % Trapezoidal's rule replacement
             Nx  = 14;    % NRMSE<0.5% for Nx=14
-            x   = zeros([ones(1,ndims(fa)), Nx]); x(:) = linspace(0,1,Nx);
+            x   = zeros([ones(1,ndims(fa)), Nx],'like',bval); x(:) = linspace(0,1,Nx);
             S   = trapz(x(:),this.M(x, fa, Da, De, ra, re).*(3*x.^2-1)/2,ndims(x));
             S   = p2.*abs(S);
 
@@ -657,6 +874,12 @@ classdef gpuNEXI
             if ~isfield(fitting,'lossFunction')
                 fitting2.lossFunction = 'L1';
             end
+            if ~isfield(fitting,'output_filename')
+                fitting2.output_filename = [];
+            end
+            if ~isfield(fitting,'isPrior')
+                fitting2.isPrior = true;
+            end
 
         end
     
@@ -717,6 +940,43 @@ classdef gpuNEXI
             div = -( Dx/voxel_size(1) + Dy/voxel_size(2) + Dz/voxel_size(3) );
 
         end
+    
+        function [NSegment,maxSlice] = findOptimalDivide(mask)
+
+            dims = size(mask);
+
+            % GPU info
+            gpu         = gpuDevice;    
+            maxMemory   = floor(gpu.TotalMemory / 1024^3)*1024^3 / (1024^2);        % Mb
+
+            % memoryRequiredFixPerVoxel       = 40 * prod(dims);
+            % memoryRequiredDynamicperVoxel   = 1.5e3 * prod(dims([1,2,4]));
+
+            % get these number based on mdl fit
+            memoryFixPerVoxel       = 0.0013;
+            memoryDynamicPerVoxel   = 0.05;
+
+            % find max. memory required
+            memoryRequiredFix       = memoryFixPerVoxel * prod(dims(1:3)) ;         % Mb
+            memoryRequiredDynamic   = memoryDynamicPerVoxel * numel(mask(mask>0));  % Mb
+
+            if maxMemory > (memoryRequiredFix + memoryRequiredDynamic)
+                % if everything fit in GPU
+                maxSlice = dims(3);
+                NSegment = 1;
+            else
+                % if not then divide the data
+                 NvolSliceMax= 0;
+                for k = 1:dims(3)
+                    tmp             = mask(:,:,k);
+                    NvolSliceMax    = max(NvolSliceMax,numel(tmp(tmp>0)));
+                end
+                maxMemoryPerSlice = memoryDynamicPerVoxel * NvolSliceMax;
+                maxSlice = floor((maxMemory - memoryRequiredFix)/maxMemoryPerSlice);
+                NSegment = ceil(dims(3)/maxSlice);
+            end
+        end
+    
     end
 
 end
