@@ -21,9 +21,9 @@ classdef gpuJointR1R2starMapping
     methods
         %% Constructor
         function obj = gpuJointR1R2starMapping(te,tr,fa)
-            obj.te = double(te(:));
-            obj.tr = double(tr(:));
-            obj.fa = double(fa(:));
+            obj.te = single(te(:));
+            obj.tr = single(tr(:));
+            obj.fa = single(fa(:));
 
         end
 

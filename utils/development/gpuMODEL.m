@@ -1,9 +1,9 @@
-classdef gpuNEXI
+classdef gpuMODEL
+% This is the skeleton script for new model with askAdam solver
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 8 Dec 2023 (v0.1.0)
-% Date modified: 29 March 2024 (v0.2.0)
-% Date modified: 4 April 2024 (v0.3.0)
+% Date created: 3 April 2024
+% Date modified: 
 
     properties
         % default model parameters and estimation boundary
@@ -17,13 +17,12 @@ classdef gpuNEXI
         Delta;  
         Nav;
         askadamObj;
-        utilityDWIObj;
     end
     
     methods
 
         % constructuor
-        function this = gpuNEXI(b, Delta, varargin)
+        function this = gpuMODEL(b, Delta, varargin)
         % NEXI Exchange rate estimation using NEXI model
         % obj = gpuNEXI(b, Delta, Nav)
         %
@@ -55,9 +54,7 @@ classdef gpuNEXI
         %  Dmitry Novikov (dmitry.novikov@nyulangone.org)
         %  Copyright (c) 2023 New York University
             
-            this.askadamObj     = askadam();
-            this.utilityDWIObj  = DWIutility();
-
+            this.askadamObj = askadam();
             this.b      = b(:) ;
             this.Delta  = Delta(:) ;
             if nargin > 2
@@ -332,9 +329,11 @@ classdef gpuNEXI
             % rescale network parameter to true values
             parameters = this.askadamObj.rescale_parameters(parameters,fitting.lb,fitting.ub,fitting.model_params);
             
-            mask        = this.utilityDWIObj.permute_dwi_dimension(mask);
-            data        = this.utilityDWIObj.permute_dwi_dimension(data);
-            parameters  = this.utilityDWIObj.permute_dwi_dimension(parameters);
+            mask    = permute(mask,[4 1 2 3]);
+            data    = permute(data,[4 1 2 3]);
+            for k = 1:numel(fitting.ub)
+                parameters.(fitting.model_params{k}) = permute(parameters.(fitting.model_params{k}),[4 1 2 3]);
+            end
 
             % Forward model
             % R           = this.FWD(parameters,fitting);
@@ -368,7 +367,9 @@ classdef gpuNEXI
             % compute loss
             loss = loss_fidelity + loss_reg;
 
-            parameters  = this.utilityDWIObj.unpermute_dwi_dimension(parameters);
+            for k = 1:numel(fitting.ub)
+                parameters.(fitting.model_params{k}) = permute(parameters.(fitting.model_params{k}),[2 3 4 1]);
+            end
             
             % Calculate gradients with respect to the learnable parameters.
             gradients = dlgradient(loss,parameters);
@@ -414,7 +415,8 @@ classdef gpuNEXI
                     extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
                 end
 
-                [dwi]   = this.utilityDWIObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
+                obj     = preparationDWI;
+                [dwi]   = obj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
 
                 fprintf('done.\n');
 
@@ -700,6 +702,7 @@ classdef gpuNEXI
             end
 
         end
+
 
     end
 

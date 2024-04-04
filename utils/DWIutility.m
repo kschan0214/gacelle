@@ -1,4 +1,4 @@
-classdef preparationDWI
+classdef DWIutility
 
     properties (GetAccess = public, SetAccess = protected)
         % b;
@@ -166,7 +166,29 @@ classdef preparationDWI
 
         end
 
+        % permute the 4th dimension of input data to 1st dimension
+        function data = permute_dwi_dimension(data)
+            if isstruct(data)
+                fn = fieldnames(data);
+                for k = 1:numel(fn)   
+                    data.(fn{k}) = permute(data.(fn{k}),[4 1 2 3]);
+                end
+            else
+                data = permute(data,[4 1 2 3]);
+            end
+        end
 
+        % permute the 1st dimension of input data to 4th dimension (i.e. undo permute_dwi_dimension)
+        function data = unpermute_dwi_dimension(data)
+            if isstruct(data)
+                fn = fieldnames(data);
+                for k = 1:numel(fn)   
+                    data.(fn{k}) = permute(data.(fn{k}),[2 3 4 1]);
+                end
+            else
+                data = permute(data,[2 3 4 1]);
+            end
+        end
     end
 
 end

@@ -36,7 +36,7 @@ DeL_fixed   = 1.7;
 Dcsf        = 3;
 
 % get unique b-values for each little delta and big delta
-[bval_sorted,ldelta_sorted,BDELTA_sorted] = preparationDWI.unique_shell(bval,ldelta,BDELTA);
+[bval_sorted,ldelta_sorted,BDELTA_sorted] = DWIutility.unique_shell(bval,ldelta,BDELTA);
 
 %% Usage #1: Basic default setting (same as Hong-Hsi's original implementation)
 fitting             = [];
@@ -78,7 +78,7 @@ r_dist = smt_gpu.distribution2image(out.r_dist,mask);
 %% Usgae #3: If you perfer to use the spherical mean signal as the input it is also possible
 % This might be useful if you already have the SMT signal computed and don't want to laod the entire DWI into memory
 % You may use whatever method here, just make sure the DWI order in the 4-th dimension  must match the bval/ldelta/BDELTA order used in Line #77)
-obj     = preparationDWI;
+obj     = DWIutility;
 lmax    = 0;
 dwi_smt = obj.get_Sl_all(dwi,bval,bvec,ldelta,BDELTA,lmax);
 
@@ -93,7 +93,7 @@ smt_gpu                   = gpuAxCaliberSMTmcmc(bval_sorted, ldelta_sorted, BDEL
 [~,r,f,fcsf,DeR,noise]    = smt_gpu.estimate(dwi_smt, mask, bval, bvec, ldelta, BDELTA, fitting);
 reset(g)
 
-%% Usgae #5: You might also define the starting points yourself
+%% Usgae #4: You might also define the starting points yourself
 fitting                 = [];
 fitting.iteration       = 2e4;
 fitting.sampling        = 100;
