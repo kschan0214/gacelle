@@ -189,6 +189,23 @@ classdef DWIutility
                 data = permute(data,[2 3 4 1]);
             end
         end
+    
+        % vectorise 4D image to 2D with the same last dimention
+        function [data, mask_idx] = vectorise_4Dto2D(data,mask)
+
+            dims = size(data,[1 2 3]);
+
+            if nargin < 2
+                mask = ones(dims);
+            end
+
+            % vectorise data
+            data        = reshape(data,prod(dims),size(data,4));
+            mask_idx    = find(mask>0);
+            data        = data(mask_idx,:);
+
+        end
+    
     end
 
 end

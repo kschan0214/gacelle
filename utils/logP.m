@@ -15,8 +15,8 @@
 % Date modified:
 %
 %
-function logP = MCMC_logP(residual_sos, noise, Nm)
+function lp = logP(residual_sos, noise, Nm)
 
-logP = -residual_sos./(2*noise.^2) + Nm/2*log(1./noise.^2);
+lp = -residual_sos./(2*noise.^2) + Nm/2*log(1./noise.^2);
 
 end

@@ -130,7 +130,7 @@ classdef gpuNEXI
             % convert datatype to single
             dwi     = single(dwi);
             mask    = mask >0;
-            if ~isempty(pars0); pars0 = single(pars0); end
+            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
 
             % determine if we need to divide the data to fit in GPU
             g = gpuDevice; reset(g);
@@ -160,7 +160,7 @@ classdef gpuNEXI
                 % divide the data
                 dwi_tmp     = dwi(:,:,slice,:);
                 mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); pars0_tmp = pars0(:,:,slice,:);
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0_tmp.(this.model_params{km}) = pars0.(this.model_params{km})(:,:,slice); end
                 else;               pars0_tmp = [];                 end
 
                 % run fitting
@@ -262,7 +262,7 @@ classdef gpuNEXI
                 % no initial starting points
                 pars0 = [];
             else
-                pars0 = single(pars0);
+                for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end
             end
 
             % get all fitting algorithm parameters 
@@ -464,11 +464,11 @@ classdef gpuNEXI
             parfor kvol = 1:length(ind)
                 pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
             end
-            pars0           = zeros(Nparam,size(dwi,2));
-            pars0(:,ind)    = pars0_mask;
+            pars           = zeros(Nparam,size(dwi,2));
+            pars(:,ind)    = pars0_mask;
 
             % reshape estimation into image
-            pars0           = permute(reshape(pars0,[size(pars0,1) dims(1:3)]),[2 3 4 1]);
+            pars           = permute(reshape(pars,[size(pars,1) dims(1:3)]),[2 3 4 1]);
 
             % Correction for CSF
             idx             = this.b < 4;
@@ -481,16 +481,20 @@ classdef gpuNEXI
             
             % ratio to modulate pars0 estimattion
             pars0_csf = [0.01,1,1,0.01,0.01];
-            for k = 1:size(pars0,4)
-                tmp                 = pars0(:,:,:,k);
+            for k = 1:size(pars,4)
+                tmp                 = pars(:,:,:,k);
                 tmp(mask_CSF==1)    = tmp(mask_CSF==1).*pars0_csf(k);
-                pars0(:,:,:,k)      = tmp;
+                pars(:,:,:,k)      = tmp;
             end
 
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
             fprintf('Starting points estimated. Elapsed time (hh:mm:ss): %s \n',string(ET));
             if isDeletepool
                 delete(pool);
+            end
+
+            for km = 1:size(pars,4)
+                pars0.(this.model_params{km}) = pars(:,:,:,km); ...
             end
 
         end

@@ -74,7 +74,7 @@ classdef gpuJointR1R2starMapping
             % get matrix size
             dims = size(data);
 
-            if fitting.isNormData; [scaleFactor, data] = MWIutility.image_normalisation_ND(data,mask);
+            if fitting.isNormData; [scaleFactor, data] = MRIutility.image_normalisation_ND(data,mask);
             else;                   scaleFactor = 1; end
 
             % check prior input
@@ -85,8 +85,8 @@ classdef gpuJointR1R2starMapping
             % convert datatype to single
             data    = single(data);
             mask    = mask >0;
-            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
-            
+            if ~isempty(pars0); pars0 = single(pars0); end
+
             % determine if we need to divide the data to fit in GPU
             g = gpuDevice; reset(g);
             memoryFixPerVoxel       = 0.0013/3;   % get this number based on mdl fit
@@ -113,7 +113,7 @@ classdef gpuJointR1R2starMapping
                 % divide the data
                 data_tmp    = data(:,:,slice,:,:);
                 mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0_tmp.(this.model_params{km}) = pars0.(this.model_params{km})(:,:,slice); end
+                if ~isempty(pars0); pars0_tmp = pars0(:,:,slice,:);
                 else;               pars0_tmp = [];                 end
                 fieldname = fieldnames(extradata);
                 for kfield = 1:numel(fieldname)
@@ -217,12 +217,12 @@ classdef gpuJointR1R2starMapping
                 % no initial starting points
                 pars0 = [];
             else
-                for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end
+                pars0 = single(pars0);
             end
 
             % get all fitting algorithm parameters 
             fitting         = this.check_set_default(fitting);
-            fitting.Nsample = numel(mask(mask ~= 0)) / prod(dims(4:end)); 
+            fitting.Nsample = numel(mask(mask ~= 0)) / dims(4); 
 
             % determine how many model parameters
             fitting.model_params = this.model_params;
@@ -231,7 +231,7 @@ classdef gpuJointR1R2starMapping
             if isempty( fitting.ub); fitting.ub = this.ub; end
             if isempty( fitting.lb); fitting.lb = this.lb; end
             % more customisation on the upper bound here
-            if ~isempty(pars0); tmp = pars0.M0;
+            if ~isempty(pars0); tmp = pars0(:,:,:,1);
             else;               tmp = max(max(data,[],4),5,[],5)*20;  end % not ideal but it is what it is
             rho_max         = prctile(tmp(mask(:,:,:,1,1)),99);
             fitting.ub(1)   = rho_max; % input dependent value
@@ -349,10 +349,7 @@ classdef gpuJointR1R2starMapping
             r2s0   = medfilt3(r2s0);
 
             % always follow the order specified in the beginning of the file
-            pars0.(this.model_params{1}) = m00; 
-            pars0.(this.model_params{2}) = R10;
-            pars0.(this.model_params{3}) = r2s0;
-            % pars0 = cat(4, m00, R10, r2s0);
+            pars0 = cat(4, m00, R10, r2s0);
 
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
             fprintf('Starting points estimated. Elapsed time (hh:mm:ss): %s \n',string(ET));
@@ -414,7 +411,7 @@ classdef gpuJointR1R2starMapping
             if ~isempty(extradata)
                 disp('B1map input               : True');
 
-                if ~isfield(extradata,'b1map')
+                if isfield(extradata,'b1map')
                     error('Cannot find B1 map in extradata structure. Please specify B1 map to ''extradata.b1map = b1map'' or set extradata to empty: ''extradata = []''');
                 end
 
@@ -425,6 +422,8 @@ classdef gpuJointR1R2starMapping
                 disp('B1map input              : False');
                 extradata.b1map = ones(size(mask));
             end
+
+
 
             disp('Input data is valid.')
         end

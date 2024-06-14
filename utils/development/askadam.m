@@ -152,15 +152,15 @@ classdef askadam < handle
             randomness      = fitting.randomness;
             model_params    = fitting.model_params;
 
-            for k = 1:numel(ub)
+            for k = 1:numel(model_params)
                 % random initialisation
                 tmp = rand(img_size,'single') ;     % values between [0,1]
                 % if starting points are provided
                 if ~isempty(pars0)
-                    tmp =  (1-randomness)* this.rescale01(pars0(:,:,:,k), lb(k), ub(k)) + randomness*tmp;     % values between [0,1]
+                    tmp =  (1-randomness)* this.rescale01(pars0.(model_params{k}), lb(k), ub(k)) + randomness*tmp;     % values between [0,1]
                 end
                 % put it into dlarray
-                parameters.(model_params{k}) = gpuArray( dlarray(tmp ));
+                parameters.(model_params{k}) = gpuArray( dlarray( tmp ));
             end
 
 
@@ -211,7 +211,7 @@ classdef askadam < handle
 
             % get fitting algorithm setting
             if ~isfield(fitting,'Nepoch')
-                fitting2.numEpochs = 4000;
+                fitting2.Nepoch = 4000;
             end
             if ~isfield(fitting,'initialLearnRate')
                 fitting2.initialLearnRate = 0.01;
