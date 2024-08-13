@@ -15,12 +15,12 @@
 % Date modified: 14 June 2024
 %
 %
-function s = AxCaliberSMT_signal_combine(C, f, fcsf, DeR, b,Da,DeL,Scsf)
+function s = AxCaliberSMT_signal_combine_deprecated(C, f, fcsf, DeR, b,Da,DeL,Scsf)
 
 Sa = sqrt(pi./(4*(b*Da - C))) .* exp(-C) .* erf(sqrt(b*Da - C));
 Se = sqrt(pi./(4.*(DeL - DeR).*b)) .* exp(-b.*DeR) .* erf(sqrt(b .*(DeL - DeR)));
 
-s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*Scsf;
-% s = f.*Sa + (1-f-fcsf).*Se + fcsf.*Scsf;    % 20240614: matching original code
+% s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*Scsf;
+s = f.*Sa + (1-f-fcsf).*Se + fcsf.*Scsf;    % 20240614: matching original code
 
 end

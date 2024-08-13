@@ -27,7 +27,7 @@ classdef askadam < handle
         % ------
         % out                   : structure contains optimisation result
         %
-            dims = size(data);
+            dims = size(mask,1:3);
 
             parameters = this.initialise_model(dims(1:3),pars0,fitting.ub,fitting.lb,fitting);
 
@@ -153,11 +153,16 @@ classdef askadam < handle
             model_params    = fitting.model_params;
 
             for k = 1:numel(model_params)
-                % random initialisation
-                tmp = rand(img_size,'single') ;     % values between [0,1]
+               
                 % if starting points are provided
                 if ~isempty(pars0)
+                    % random initialisation
+                    tmp =   rand(size(pars0.(model_params{k})),'single') ;     % values between [0,1]
                     tmp =  (1-randomness)* this.rescale01(pars0.(model_params{k}), lb(k), ub(k)) + randomness*tmp;     % values between [0,1]
+                else
+                     % random initialisation
+                    tmp = rand(img_size,'single') ;     % values between [0,1]
+
                 end
                 % put it into dlarray
                 parameters.(model_params{k}) = gpuArray( dlarray( tmp ));
@@ -170,6 +175,14 @@ classdef askadam < handle
         function parameters = rescale_parameters(this,parameters,lb,ub,model_params)
             for k = 1:numel(ub)
                 parameters.(model_params{k}) = this.unscale01(parameters.(model_params{k}), lb(k), ub(k));
+            end
+
+        end
+
+        % rescale the network parameters between the defined lower/upper bounds
+        function parameters = scale_parameters(this,parameters,lb,ub,model_params)
+            for k = 1:numel(ub)
+                parameters.(model_params{k}) = this.rescale01(parameters.(model_params{k}), lb(k), ub(k));
             end
 
         end
@@ -374,7 +387,7 @@ classdef askadam < handle
             % memoryFixPerVoxel       = 0.0013;
             % memoryDynamicPerVoxel   = 0.05;
 
-            dims = size(mask);
+            dims = size(mask,1:3);
 
             % GPU info
             gpu         = gpuDevice;    
@@ -421,7 +434,7 @@ classdef askadam < handle
                         out.(fn1{kfn1}).(fn2{kfn2})(ksegment) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
                     else
                         % image result
-                        out.(fn1{kfn1}).(fn2{kfn2})(:,:,slice) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+                        out.(fn1{kfn1}).(fn2{kfn2})(:,:,slice,:,:) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
                     end
                         
                 end

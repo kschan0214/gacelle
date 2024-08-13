@@ -1,14 +1,13 @@
-classdef gpuAxCaliberSMTmcmc < handle
+classdef gpuAxCaliberSMTmcmc_deprecated < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % AxCaliberSMT model parameter estimation based on MCMC
 % Date created: 22 March 2024 
 % Date modified: 14 June 2024
-% Date modified: 12 August 2024
 
     properties
         % default model parameters and estimation boundary
-        % Axon diameter[um], neurite fraction (f=fa/(fa+fe)), CSF fraction, hindered diffusion diffusivity [um2/ms], noise
+        % Axon diameter[um], neurite fraction, CSF fraction, hindered diffusion diffusivity [um2/ms], noise
         model_params    = {'a';                   'f';'fcsf';                'DeR';'noise'};
         ub              = [ 20;                     1;     1;                    3;    0.1];
         lb              = [0.1;                     0;     0;                 0.01;   0.01];
@@ -51,7 +50,7 @@ classdef gpuAxCaliberSMTmcmc < handle
     end
     
     methods (Access = public)
-        function this = gpuAxCaliberSMTmcmc(b, delta, Delta, D0, Da, DeL, Dcsf)
+        function this = gpuAxCaliberSMTmcmc_deprecated(b, delta, Delta, D0, Da, DeL, Dcsf)
         % gpuAxCaliberSMTmcmc Axon size estimation using AxCaliber-SMT model and MCMC
         % smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf)
         %       output:
@@ -118,7 +117,7 @@ classdef gpuAxCaliberSMTmcmc < handle
         end
 
         % Perform AxCaliber model parameter estimation based on MCMC across the whole dataset
-        function [out] = estimate(this, dwi, mask, extradata, fitting)
+        function [out,a,f,fcsf,DeR,noise] = estimate(this, dwi, mask, extradata, fitting)
         % Input data are expected in multi-dimensional image
         % 
         % Input
@@ -161,12 +160,12 @@ classdef gpuAxCaliberSMTmcmc < handle
             [x_m, x_dist] = this.fit(dwi, fitting);
 
             % export results to organise output structure
-            out = mcmc.res2out(x_m,x_dist,this.model_params,mask);
+            out = mcmc_deprecated.res2out(x_m,x_dist,this.model_params,mask);
             % also export them as variables
-            % for k = 1:length(this.model_params); eval([this.model_params{k} ' = out.expected.' this.model_params{k} ';']); end
+            for k = 1:length(this.model_params); eval([this.model_params{k} ' = out.expected.' this.model_params{k} ';']); end
             
             % save the estimation results if the output filename is provided
-            mcmc.save_mcmc_output(fitting.output_filename,out)
+            mcmc_deprecated.save_mcmc_output(fitting.output_filename,out)
 
         end
         
@@ -184,7 +183,7 @@ classdef gpuAxCaliberSMTmcmc < handle
         %
    
             % Step 0: display basic messages
-            mcmc.display_basic_algorithm_parameters(fitting);
+            mcmc_deprecated.display_basic_algorithm_parameters(fitting);
             % additional message(s)
             if ischar(fitting.start); disp(['Starting points   : ', fitting.start ]); end; fprintf('\n');
             
@@ -197,11 +196,7 @@ classdef gpuAxCaliberSMTmcmc < handle
 
             % Step 2: parameter estimation
             model = 'VanGelderen';  % extra parameter for FWD model
-            if strcmpi(fitting.algorithm,'mh')
-                [xExpected,xPosterior] = mcmc.metropilis_hastings(y,x0,xStepsize,fitting,@this.FWD,model);
-            else
-                [xExpected,xPosterior] = mcmc.goodman_weare(y,x0,fitting,@this.FWD,model);
-            end
+            [xExpected,xPosterior] = mcmc_deprecated.metropilis_hastings(y,x0,xStepsize,fitting,@this.FWD,model);
             
         end
 
@@ -224,7 +219,7 @@ classdef gpuAxCaliberSMTmcmc < handle
                     C = this.vg2(r);    % less memory efficient but faster
             end
 
-            s = arrayfun(@AxCaliberSMT_signal_combine, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
+            s = arrayfun(@AxCaliberSMT_signal_combine_deprecated, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
         end
 
         function s = neuman(this, r)
@@ -409,7 +404,7 @@ classdef gpuAxCaliberSMTmcmc < handle
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(this,fitting)
             % get basic fitting setting check
-            fitting2 = mcmc.check_set_default_basic(fitting);
+            fitting2 = mcmc_deprecated.check_set_default_basic(fitting);
 
             % get fitting algorithm setting
             if ~isfield(fitting,'start')

@@ -1,4 +1,4 @@
-classdef mcmc < handle
+classdef mcmc_deprecated < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % 
@@ -22,14 +22,9 @@ classdef mcmc < handle
             % Nv: # voxels
             [Nm, Nv]    = size(y);
             % Ns: # samples in posterior distribution
-            Ns          = numel([floor(fitting.iteration*fitting.burnin)+1:fitting.thinning:fitting.iteration]);  %floor( (fitting.iteration - floor(fitting.iteration*fitting.burnin)) / fitting.thinning );
+            Ns          = numel([floor(fitting.iteration*fitting.burnin)+1:fitting.sampling:fitting.iteration]);  %floor( (fitting.iteration - floor(fitting.iteration*fitting.burnin)) / fitting.sampling );
             % Nvar: # estimation parameters
             Nvar        = size(x0,1);
-            if fitting.burnin < 1
-                Nburnin     = floor(fitting.iteration*fitting.burnin);
-            else
-                Nburnin     = fitting.burnin;
-            end
 
             % setup boundary variables
             boundary    = gpuArray(single(fitting.boundary));
@@ -82,7 +77,7 @@ classdef mcmc < handle
                 % 3. Maintain the independence between iterations
                 % 3.1 discard the first burnin*100% iterations
                 % 3.2 keep an iteration every N iterations
-                if ( k > Nburnin ) && mod(k-1, fitting.thinning) == 0 %( mod(k, fitting.thinning)==1 )
+                if ( k > floor(fitting.iteration*fitting.burnin) ) && mod(k-1, fitting.sampling) == 0 %( mod(k, fitting.sampling)==1 )
                     counter = counter+1;
                     xPosterior(:,:,counter,ii) = gather(xOld);
                 end
@@ -122,14 +117,9 @@ classdef mcmc < handle
             % Nv: # voxels
             [Nm, Nv] = size(y);
             % Ns: # samples in posterior distribution
-            Ns          = numel([floor(fitting.iteration*fitting.burnin)+1:fitting.thinning:fitting.iteration]);
+            Ns          = numel([floor(fitting.iteration*fitting.burnin)+1:fitting.sampling:fitting.iteration]);
             % Nvar: # estimation parameters
             Nvar        = size(x0,1);
-             if fitting.burnin < 1
-                Nburnin     = floor(fitting.iteration*fitting.burnin);
-            else
-                Nburnin     = fitting.burnin;
-            end
         
             Nwalker   = fitting.Nwalker;
             StepSize  = fitting.StepSize;
@@ -189,13 +179,13 @@ classdef mcmc < handle
                 % 3. Maintain the independence between iterations
                 % 3.1 discard the first burnin*100% iterations
                 % 3.2 keep an iteration every N iterations
-                if ( k > Nburnin ) && mod(k-1, fitting.thinning) == 0 
+                if ( k > floor(fitting.iteration*fitting.burnin) ) && mod(k-1, fitting.sampling) == 0 
                     counter = counter+1;
                     xPosterior(:,:,:,counter,ii) = gather(xOld);
                 end
         
                 % display message at 1000 ietration and every 2000 iterations
-                if mod(k,1e3) == 0 || k == 1e2
+                if mod(k,2e3) == 0 || k == 1e3
                     ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
                     ERT = ET / (k/fitting.iteration) - ET;
                     fprintf('Iteration #%6d,    Elapsed time (hh:mm:ss):%s,     Estimated remaining time (hh:mm:ss):%s \n',k,string(ET),string(ERT));
@@ -236,7 +226,7 @@ classdef mcmc < handle
         % fitting       : structure contains fitting algorithm parameters
         %   .iteration  : no. of maximum MCMC iterations,   default = 200k
         %   .repetition : no. of MCMC repetitions,          default = 1
-        %   .thinning   : MCMC thinning interval,           default = every 100 iterations
+        %   .sampling   : MCMC sampling interval,           default = every 100 iterations
         %   .burning    : MCMC burn-in ratio,               default = 10%
         %   .method     : method to compute expected valur from posterior distribution, 'mean' (default) | 'median'
         %   .algorithm  : MCMC algorithm 'MH': Metropolis-Hastings; 'GW': Goodman-Weare, 'MH' (default) | 'GW' 
@@ -248,8 +238,8 @@ classdef mcmc < handle
             if ~isfield(fitting,'iteration')
                 fitting2.iteration = 2e5;
             end
-            if ~isfield(fitting,'thinning')
-                fitting2.thinning = 20;    % thinning, sampled every 100 interval
+            if ~isfield(fitting,'sampling')
+                fitting2.sampling = 100;    % thinning, sampled every 100 interval
             end
             if ~isfield(fitting,'method')
                 fitting2.method = 'mean';
@@ -286,7 +276,7 @@ classdef mcmc < handle
             disp(['Algorithm         : ', algorithm]);
             disp(['No. of iterations : ', num2str(fitting.iteration)]);
             disp(['No. of repetitions: ', num2str(fitting.repetition)])
-            disp(['Thinning          : ', num2str(fitting.thinning)]);
+            disp(['Sampling interval : ', num2str(fitting.sampling)]);
             disp(['Method            : ', fitting.method ]);
             if strcmpi( fitting.algorithm, 'gw'); disp(['Step size         : ', num2str(fitting.StepSize) ]); end
             if strcmpi( fitting.algorithm, 'gw'); disp(['No. of walkers    : ', num2str(fitting.Nwalker) ]); end
