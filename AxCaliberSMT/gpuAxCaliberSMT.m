@@ -2,7 +2,20 @@ classdef gpuAxCaliberSMT
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 1 Apr 2024 
-% Date modified: 
+% Date modified: 15 August 2024
+
+    properties
+        % default model parameters and estimation boundary
+        % a     : Axon diameter[um], 
+        % f     : neurite fraction (f=fa/(fa+fe)), 
+        % fcsf  : CSF fraction
+        % DeR   : hindered diffusion diffusivity [um2/ms]
+        model_params    = {'a';                   'f';'fcsf';                'DeR'};
+        ub              = [ 20;                     1;     1;                    3];
+        lb              = [0.1;                     0;     0;                 0.01];
+        startpoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895];
+
+    end
 
     properties (GetAccess = public, SetAccess = protected)
         b;
@@ -39,86 +52,50 @@ classdef gpuAxCaliberSMT
 
         % constructuor
         function this = gpuAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf, varargin)
-        % NEXI Exchange rate estimation using NEXI model
-        % obj = gpuNEXI(b, Delta, Nav)
+        % gpuAxCaliberSMT Axon size estimation using AxCaliber-SMT model and askadam
+        % smt = gpuAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf)
+        %       output:
+        %           - smt: object of a fitting class
         %
-        % Input
-        % ----------
-        % b         : b-value [ms/um2]
-        % delta     : gradient duration [ms]
-        % Delta     : gradient seperation [ms]
-        % D0        : intra-cellular intrinsic diffusivity [um2/ms]
-        % Da        : intra-cellular axial diffusivity [um2/ms]
-        % DeL       : extra-cellular axial diffusivity [um2/ms]
-        % Dcsf      : CSF diffusivity [um2/ms]
+        %       input:
+        %           - b: b-value [ms/um2]
+        %           - delta: gradient duration [ms]
+        %           - Delta: gradient seperation [ms]
+        %           - D0: intra-cellular intrinsic diffusivity [um2/ms]
+        %           - Da: intra-cellular axial diffusivity [um2/ms]
+        %           - DeL: extra-cellular axial diffusivity [um2/ms]
+        %           - Dcsf: CSF diffusivity [um2/ms]
+        %           - varargin: number of averages (e.g. # gradient directions)
         %
-        % Output
-        % ----------
-        % obj       : object of a fitting class
-        %
-        % Usage
-        % ----------
-        % obj                   = NEXI(b, Delta, Nav);
-        % [out, fa, Da, De, r]  = obj.fit(S, mask, fitting,);
-        % Sfit                  = smt.FWD([fa, Da, De, r]);
-        % [x_train, S_train]    = obj.traindata(1e4);
-        % pars0                 = smt.likelihood(S, x_train, S_train);
-        % [out, fa, Da, De, r]  = smt.fit(S, mask, fitting, pars0);
-        %
-        % Author:
-        %  Kwok-Shing Chan (kchan2@mgh.harvard.edu) 
+        %  Authors: 
+        %  Kwok-Shing Chan (kchan2@mgh.harvard.edu)
         %  Hong-Hsi Lee (hlee84@mgh.harvard.edu)
-        %  Copyright (c) 2023 Massachusetts General Hospital
-        %
+        %  Copyright (c) 2024 Massachusetts General Hospital
             
-            this.b      = b(:) ;
-            this.delta  = delta(:) ;
-            this.Delta  = Delta(:) ;
-            this.g      = sqrt(b(:)./delta(:).^2./(Delta(:)-delta(:)/3)) ;
-            this.D0     = D0 ;
-            this.Da     = Da ;
-%             this.beta = sqrt(pi/4./b/Da);
-%             this.erf_a = erf(sqrt(b*Da));
-            this.DeL    = DeL;
-            this.Dcsf   = Dcsf;
-            this.Scsf   = exp(-b(:)*Dcsf) ;
+            this.b      = single(b(:)) ;
+            this.delta  = single(delta(:)) ;
+            this.Delta  = single(Delta(:)) ;
+            this.g      = single(sqrt(b(:)./delta(:).^2./(Delta(:)-delta(:)/3))) ;
+            this.D0     = single(D0) ;
+            this.Da     = single(Da) ;
+
+            this.DeL    = single(DeL);
+            this.Dcsf   = single(Dcsf);
+            this.Scsf   = single( exp(-b(:)*Dcsf)) ;
 
             if nargin > 7
-                this.Nav = varargin{1} ;
+                this.Nav = single(varargin{1}) ;
             else
-                this.Nav =  ones(size(b)) ;
+                this.Nav =  ones(size(b),'single') ;
             end
             this.Nav = this.Nav(:) ;
+
+            this.ub(4) = single(DeL);
         end
     
-        % automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        % function  [out, fa, Da, De, ra, p2] = estimate(this, dwi, mask, bval, bvec, ldelta, BDELTA, fitting, pars0)
-        function  [out, r, f, fcsf, DeR] = estimate(this, dwi, mask, extradata, fitting, pars0)
-        % Perform NEXI model parameter estimation based on askAdam
-        % Input data are expected in multi-dimensional image
-        % 
-        % Input
-        % -----------
-        % dwi       : 4D DWI, [x,y,z,dwi]
-        % mask      : 3D signal mask, [x,y,z]
-        % extradata : Optional additional data
-        %   .bval       : 1D bval in ms/um2, [1,dwi]                (Optional, only needed if dwi is full acquisition)
-        %   .bvec       : 2D b-table, [3,dwi]                       (Optional, only needed if dwi is full acquisition)
-        %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
-        %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
-        %   .sigma      : 3D noise map, [x,y,z]                     (Optional, only needed for NEXIrice model)
-        % fitting   : fitting algorithm parameters (see fit function)
-        % 
-        % Output
-        % -----------
-        % out       : output structure contains all MCMC results
-        % r         : Axon radius
-        % f         : Neurite volume fraction
-        % fcsf      : CSF volume fraction
-        % DeR       : radial diffusivity of extracellular water
-        % noise     : noise level
-        % 
-            
+        % display some info about the input data and model parameters
+        function display_data_model_info(this)
+
             disp('================================');
             disp('AxCaliberSMT with askAdam solver');
             disp('================================');
@@ -137,73 +114,69 @@ classdef gpuAxCaliberSMT
             disp(['Diffusivity extra-cellular axial (um2/ms)    : ' num2str(this.DeL,'%.2f')]);
             disp(['Diffusivity CSF (um2/ms)                     : ' num2str(this.Dcsf,'%.2f')]);
 
+            fprintf('\n')
+
+        end
+
+        %% higher-level data fitting functions
+
+        % Perform AxCaliber model parameter estimation based on askAdam across the whole dataset
+        % This is a wrapper of the 'fit' function.
+        % The main purpose of this function is to handle memory issue and ensure the input data is correct for 'fit'
+        function  [out] = estimate(this, dwi, mask, extradata, fitting, pars0)
+        % Input data are expected in multi-dimensional image
+        % 
+        % Input
+        % -----------
+        % dwi       : 4D DWI, [x,y,z,dwi]
+        % mask      : 3D signal mask, [x,y,z]
+        % extradata : Optional additional data
+        %   .bval       : 1D bval in ms/um2, [1,dwi]                (Optional, only needed if dwi is full acquisition)
+        %   .bvec       : 2D b-table, [3,dwi]                       (Optional, only needed if dwi is full acquisition)
+        %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
+        %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
+        % fitting   : fitting algorithm parameters (see fit function)
+        % 
+        % Output
+        % -----------
+        % out       : output structure contains all parameter estimation results
+        % 
+            
+            % display basic info
+            this.display_data_model_info;
+
             % get all fitting algorithm parameters 
             fitting = this.check_set_default(fitting);
 
-            dims = size(dwi);
+            % get matrix size
+            dims = size(dwi,1:3);
 
-            % % get all fitting algorithm parameters 
-            % fitting = this.check_set_default(fitting,this.DeL);
-            % 
-            % dims = size(dwi);
+            %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
+            % compute rotationally invariant signal if needed
+            dwi = this.prepare_dwi_data(dwi,extradata,0);
 
-            if dims(4) > numel(this.b) % full DWI data then compute SMT
-
-                % scale b-values if needed
-                if max(extradata.bval) > 1e3
-                    extradata.bval = extradata.bval/1e3;    
-                end
-
-                % compute spherical mean signal
-                fprintf('\nComputing spherical mean signal...')
-                obj     = preparationDWI;
-                lmax    = 0;
-                [dwi]   = obj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
-                % [dwi,bval_unique] = obj.Slm(dwi,bval,bvec,(fitting.lmax+2));
-                disp('done.')
-                fprintf('\n');
-            elseif dims(4) < numel(this.b)
-                error('There are more b-shells in the class object than in the input data.');
-            end
-
-            % mask sure no nan or inf
-            Nvoxel_old              = numel(mask(mask>0));
-            mask_nonnaninf          = and(~isnan(dwi) , ~isinf(dwi));
-            dwi(mask_nonnaninf==0)  = 0;
-            dwi(mask_nonnaninf==0)  = 0;
-            mask_nonnaninf          = min(mask_nonnaninf,[],4);
-            mask                    = and(mask,mask_nonnaninf);
-            Nvoxel_new              = numel(mask(mask>0));
-            if Nvoxel_old ~= Nvoxel_new
-                disp('The mask is updated due to the presence of NaN/Inf. Please make use of the output mask in your subseqeunt analysis.');
-            end
-
-            % update matrix size
-            dims = size(dwi);
+            % mask sure no nan or inf in data
+            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
 
             % if no pars input at all (not even empty) then use prior
-            if nargin < 6
-                pars0 = [];
-            end
-            if and(fitting.isPrior,isempty(pars0))
-                pars0 = this.estimate_prior(dwi, mask);
-            end
-
-            % convert datatype to single
+            if nargin < 6; pars0 = []; end
+            
+            % convert datatype to single or logical
             dwi     = single(dwi);
             mask    = mask >0;
-            if ~isempty(pars0); pars0 = single(pars0); end
+            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
 
+            %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
+
+            %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
             % determine if we need to divide the data to fit in GPU
-            gpuDevice([]);
-            [NSegment,maxSlice] = this.findOptimalDivide(mask);
-
-            fprintf('Data is divided into %d segments\n',NSegment);
+            gpool = gpuDevice;  reset(gpool);
+            memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
+            memoryDynamicPerVoxel   = 0.01;     % get this number based on mdl fit
+            [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
             
-            r       = zeros(dims(1:3),'single');
-            f       = zeros(dims(1:3),'single');
-            fcsf    = zeros(dims(1:3),'single');
-            DeR     = zeros(dims(1:3),'single');
+            % parameter estimation
+            out = [];
             for ks = 1:NSegment
 
                 fprintf('Running #Segment = %d/%d \n',ks,NSegment);
@@ -217,47 +190,30 @@ classdef gpuAxCaliberSMT
                 
                 dwi_tmp     = dwi(:,:,slice,:);
                 mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0)
-                    pars0_tmp   = pars0(:,:,slice,:);
-                end
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0_tmp.(this.model_params{km}) = pars0.(this.model_params{km})(:,:,slice); end
+                else;                                                    pars0_tmp = [];                 end
+                
+                [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
 
-                [out_tmp, r(:,:,slice), f(:,:,slice), fcsf(:,:,slice), DeR(:,:,slice)]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+                % restore 'out' structure from segment
+                out = askadam.restore_segment_structure(out,out_tmp,slice,ks);
 
-                % reformat out structure
-                fn1 = fieldnames(out_tmp);
-                for kfn1 = 1:numel(fn1)
-                    fn2 = fieldnames(out_tmp.(fn1{kfn1}));
-                    for kfn2 = 1:numel(fn2)
-                        if isscalar(out_tmp.(fn1{kfn1}).(fn2{kfn2})) % scalar value
-                            out.(fn1{kfn1}).(fn2{kfn2})(ks) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
-                        else
-                            % image result
-                            out.(fn1{kfn1}).(fn2{kfn2})(:,:,slice) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
-                        end
-                            
-                    end
-                end
             end
             out.mask = mask;
+            %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
-            if ~isempty(fitting.output_filename)
-                [output_dir,~,~] = fileparts(fitting.output_filename);
-                if ~exist(output_dir,'dir')
-                    mkdir(output_dir);
-                end
-                save(fitting.output_filename,'out');
-                fprintf('Estimation output is saved at %s\n',fitting.output_filename);
-            end
+            askadam.save_askadam_output(fitting.output_filename,out)
 
         end
 
         % Data fitting function
-        function [out, r, f, fcsf, DeR] = fit(this,dwi,mask,fitting,pars0)
+        % This is a wapper of the askadam class 'fit' function
+        function [out] = fit(this,dwi,mask,fitting,pars0)
         %
         % Input
         % -----------
-        % dwi       : S0 normalised 4D dwi images, [x,y,slice,diffusion], 4th dimension corresponding to [Sl0_b1,Sl0_b2,Sl2_b1,Sl2_b2, etc.]; the order of bval must match the order in the constructor gpuNEXI
+        % dwi       : S0 normalised 4D dwi images, [x,y,slice,diffusion], 4th dimension corresponding to [Sl0_b1,Sl0_b2 etc.]; the order of bval must match the order in the constructor 
         % mask      : 3D signal mask, [x,y,slice]
         % fitting   : fitting algorithm parameters
         %   .Nepoch             : no. of maximum iterations, default = 4000
@@ -272,279 +228,133 @@ classdef gpuAxCaliberSMT
         %   .lmax               : Order of rotational invariant, 0|2, default = 0
         %   .lossFunction       : loss for data fidelity term, 'L1'|'L2'|'MSE', default = 'L1'
         %   .display            : online display the fitting process on figure, true|false, defualt = false
-        % pars0     : 4D parameter starting points of fitting, [x,y,slice,param], 4th dimension corresponding to fitting  parameters with order [fa,Da,De,ra,p2] (optional)
+        % pars0     : structure variable of starting points of fitting (optional)
+        %       .f          : Intraneurite volume fraction (= fa / (fa+fe))
+        %       .a          : Axon diameter (mm)
+        %       .DeR        : Radial extraneurite diffusivity (um2/ms)
+        %       .fcsf       : CSF volume fraction
         % 
         % Output
         % -----------
         % out       : output structure
         %   .final      : final results
-        %       .fa         : Intraneurite volume fraction
-        %       .Da         : Intraneurite diffusivity (um2/ms)
-        %       .De         : Extraneurite diffusivity (um2/ms)
-        %       .ra         : exchange rate from intra- to extra-neurite compartment
+        %       .f          : Intraneurite volume fraction (= fa / (fa+fe))
+        %       .a          : Axon diameter (mm)
+        %       .DeR        : Radial extraneurite diffusivity (um2/ms)
+        %       .fcsf       : CSF volume fraction
         %       .loss       : final loss metric
         %   .min        : results with the minimum loss metric across all iterations
-        %       .fa         : Intraneurite volume fraction
-        %       .Da         : Intraneurite diffusivity (um2/ms)
-        %       .De         : Extraneurite diffusivity (um2/ms)
-        %       .ra         : exchange rate from intra- to extra-neurite compartment
+        %       .f          : Intraneurite volume fraction (= fa / (fa+fe))
+        %       .a          : Axon diameter (mm)
+        %       .DeR        : Radial extraneurite diffusivity (um2/ms)
+        %       .fcsf       : CSF volume fraction
         %       .loss       : loss metric      
-        % fa        : final Intraneurite volume fraction
-        % Da        : final Intraneurite diffusivity (um2/ms)
-        % De        : final Extraneurite diffusivity (um2/ms)
-        % ra        : final exchange rate from intra- to extra-neurite compartment
         %
-        % Description: askAdam Image-based NEXI model fitting
+        % Description: askAdam Image-based AxCaliberSMT model fitting
         %
         % Kwok-Shing Chan @ MGH
         % kchan2@mgh.harvard.edu
         % Date created: 8 Dec 2023
         % Date modified:
         %
-        %
             
             % check GPU
-            gpuDevice;
+            gpool = gpuDevice;
             
             % check image size
-            dwi     = permute(dwi,[4 1 2 3]);
-            dims    = size(dwi);
+            dims = size(dwi,1:3);
 
-            if nargin < 3 || isempty(mask)
-                % if no mask input then fit everthing
-                mask = ones(dims);
+            %%%%%%%%%%%%%%%%%%%% Step 1. Validate and parse input %%%%%%%%%%%%%%%%%%%%
+            if nargin < 3 || isempty(mask); mask = ones(dims,'logical'); end % if no mask input then fit everthing
+            if nargin < 4; fitting = struct(); end
+            % set initial tarting points
+            if nargin < 5; pars0 = []; % no initial starting points
             else
-                % assume mask is 3D
-                mask = permute(repmat(mask,[1 1 1 dims(1)]),[4 1 2 3]);
-            end
-            numMaskVox = numel(mask(mask ~= 0)) / dims(1);
-
-            if nargin < 4
-                fitting = struct();
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
             end
 
             % get all fitting algorithm parameters 
-            fitting = this.check_set_default(fitting);
+            fitting                 = this.check_set_default(fitting);
+            fitting.model_params    = this.model_params;
+            % set fitting boundary if no input from user
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
 
-            % put data input gpuArray
-            mask = gpuArray(logical(mask));  
-            dwi  = gpuArray(single(dwi));
+            %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
+
+            %%%%%%%%%%%%%%%%%%%% 2. Setting up all necessary data, run askadam and get all output %%%%%%%%%%%%%%%%%%%%
+            % 2.1 setup fitting weights
+            w = this.compute_optimisation_weights(mask,fitting.lossFunction,0); % This is a customised funtion
+
+            % 2.2 estimate prior if neede
+            if and(fitting.isPrior,isempty(pars0)); pars0 = this.estimate_prior(dwi, mask); end
+
+            dwi    = askadam.vectorise_NDto2D(dwi,mask).';
+            if ~isempty(w); w = askadam.vectorise_NDto2D(w,mask).'; end
+
+            % 2.3 askAdam optimisation main
+            askadamObj  = askadam(); model = fitting.model;
+            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, model);
+
+            %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
+
+            disp('The process is completed.')
             
-            % set fitting boundary
-            ub  = [20,   1, 1, this.DeL];
-            lb  = [0.1,eps,eps,    0.01];
-            
-            % set initial tarting points
-            if nargin < 5
-                % no initial starting points
-                pars0 = [];
-            else
-                pars0 = permute(pars0,[4 1 2 3]);
-                pars0 = single(pars0);
+            % clear GPU
+            reset(gpool)
+
+        end
+
+        %% Data preparation
+
+        % compute rotationally invariant DWI signal if necessary
+        function dwi = prepare_dwi_data(this,dwi,extradata,lmax)
+            % full DWI data then compute rotaionally invariant signal
+            if size(dwi,4)/(lmax/2+1) > numel(this.b) 
+                % compute spherical mean signal
+                fprintf('Computing rotationally invariant signal...')
+
+                % if the inout little delta is one value then create a vector
+                if numel(extradata.ldelta) == 1
+                    extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
+                end
+                DWIutilityObj = DWIutility();
+                [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
+
+                fprintf('done.\n');
+
+            elseif size(dwi,4) < numel(this.b)
+                error('There are more b-shells in the class object than available in the input data. Please check your input data.');
             end
-            parameters = this.initialise_model(dims(2:end),pars0,ub,lb,fitting);   % all parameters are betwwen [0,1]
-         
-            w = zeros(size(dwi),'single');
-            for kb = 1:numel(this.b)
-                w(kb,:,:,:) = this.Nav(kb) ;
+        end
+
+        % compute weights for optimisation
+        function w = compute_optimisation_weights(this,mask,lossFunction,lmax)
+        % 
+        % Output
+        % ------
+        % w         : N-D signal masked wegiths
+        %
+            dims = size(mask,1:3);
+
+            % lmax dependent weights
+            l = 0:2:lmax;
+            w = zeros([dims numel(this.b)*numel(l)],'single');
+            for kl = 1:(lmax/2+1)
+                for kb = 1:numel(this.b)
+                    w(:,:,:,(kl-1)*numel(this.b)+kb) = this.Nav(kb) / (2*l(kl)+1);
+                end
             end
-            if strcmpi(fitting.lossFunction,'l1')
+            % if L1 then take square root
+            if strcmpi(lossFunction,'l1')
                 w = sqrt(w);
             end
             w = w ./ max(w(:));
-            w = w(mask>0);
-            w = dlarray(gpuArray(w).','CB');
-
-            % display optimisation algorithm parameters
-            disp('----------------------------');
-            disp('AskAdam algorithm parameters');
-            disp('----------------------------');
-            disp(['Maximum no. of iteration = ' num2str(fitting.Nepoch)]);
-            disp(['Loss function            = ' fitting.lossFunction]);
-            disp(['Loss tolerance           = ' num2str(fitting.tol)]);
-            disp(['Convergence tolerance    = ' num2str(fitting.convergenceValue)]);
-            disp(['Initial learning rate    = ' num2str(fitting.initialLearnRate)]);
-            disp(['Learning rate decay rate = ' num2str( fitting.decayRate)]);
-            if fitting.lambda > 0 
-                disp(['Regularisation parameter = ' num2str(fitting.lambda)]);
-                disp(['Regularisation Map       = ' fitting.regmap]);
-                disp(['Total variation mode     = ' fitting.TVmode]);
-            end
             
-            % clear cache before running everthing
-            accfun = dlaccelerate(@this.modelGradients);
-            clearCache(accfun)
-
-            % optimisation process
-            averageGrad     = [];
-            averageSqGrad   = [];
-            
-            if fitting.isdisplay
-                figure
-                C = colororder;
-                lineLoss = animatedline('Color',C(2,:));
-                ylim([0 inf])
-                xlabel("Iteration")
-                ylabel("Loss")
-                grid on
-                
-            end
-            start = tic;
-
-            minLoss                 = inf; 
-            minLossFidelity         = 0; 
-            minLossRegularisation   = 0;
-            convergenceCurr         = 1+fitting.convergenceValue;
-            convergenceBuffer       = ones(fitting.convergenceWindow,1);
-            A                       = [(1:fitting.convergenceWindow).', ones(fitting.convergenceWindow,1)]; % A matrix to derive convergence
-            % optimisation
-            for epoch = 1:fitting.Nepoch
-                
-                % make sure the parameters are [0,1]
-                parameters = this.set_boundary(parameters);
-
-                % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                [gradients,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,dwi,mask,w,ub,lb,numMaskVox,fitting);
-            
-                % Update learning rate.
-                learningRate = fitting.initialLearnRate / (1+ fitting.decayRate*epoch);
-                
-                % get loss and compute convergence value
-                loss                = double(gather(extractdata(loss)));
-                convergenceBuffer   = [convergenceBuffer(2:end);loss];
-                mc                  = A\convergenceBuffer;
-                convergenceCurr     = -mc(1);
-
-                % store also the results with minimal loss
-                if minLoss > loss
-                    minLoss                 = loss;
-                    minLossFidelity         = loss_fidelity;
-                    minLossRegularisation   = loss_reg;
-                    parameters_minLoss      = parameters;
-                end
-                % check if the optimisation should be stopped
-                if convergenceCurr < fitting.convergenceValue && epoch >= fitting.convergenceWindow
-                    fprintf('Convergence is less than the tolerance %e \n',fitting.convergenceValue);
-                    break
-                end
-                if loss < fitting.tol
-                    fprintf('Loss is less than the tolerance %e \n',fitting.tol);
-                    break
-                end
-
-                % Update the network parameters using the adamupdate function.
-                [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
-                    averageSqGrad,epoch,learningRate);
-                
-                
-                if fitting.isdisplay
-                    
-                    addpoints(lineLoss,epoch, loss);
-                
-                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                    title("Epoch: " + epoch + ", Elapsed: " + string(D) + ", Loss: " + loss)
-                    drawnow
-                end
-                if mod(epoch,100) == 0 || epoch == 1
-                    % display some info
-                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                    fprintf('Iteration #%4d,     Loss = %f,      Convergence = %e,     Elapsed:%s \n',epoch,loss,convergenceCurr,string(D));
-                end
-                
-            end
-            fprintf('Final loss         =  %e\n',double(loss));
-            fprintf('Final convergence  =  %e\n',double(convergenceCurr));
-            fprintf('Final #iterations  =  %d\n',epoch);
-            
-            % make sure the final results stay within boundary
-            parameters = this.set_boundary(parameters);
-            
-            % rescale the network parameters
-            parameters  = this.rescale_parameters(parameters,lb,ub);
-            r       = single(gather(extractdata(parameters.r    .* mask(1,:,:,:)))); r      = reshape(r, [dims(2:end) 1]);
-            f       = single(gather(extractdata(parameters.f    .* mask(1,:,:,:)))); f      = reshape(f, [dims(2:end) 1]);
-            fcsf    = single(gather(extractdata(parameters.fcsf .* mask(1,:,:,:)))); fcsf   = reshape(fcsf, [dims(2:end) 1]);
-            DeR     = single(gather(extractdata(parameters.DeR  .* mask(1,:,:,:)))); DeR    = reshape(DeR, [dims(2:end) 1]);
-            
-            % result at final iteration
-            out.final.r     = r;
-            out.final.f     = f;
-            out.final.fcsf  = fcsf;
-            out.final.DeR   = DeR;
-            out.final.loss  = loss;
-            out.final.loss_fidelity = double(gather(extractdata(loss_fidelity)));
-            if fitting.lambda == 0
-                out.final.loss_reg      = 0;
-            else
-                out.final.loss_reg      = double(gather(extractdata(loss_reg)));
-            end
-            
-            % result at minimum loss
-            parameters_minLoss      = this.rescale_parameters(parameters_minLoss,lb,ub);
-            out.min.r       = single(gather(extractdata(parameters_minLoss.r    .* mask(1,:,:,:))));   out.min.r    = reshape(out.min.r, [dims(2:end) 1]);
-            out.min.f       = single(gather(extractdata(parameters_minLoss.f    .* mask(1,:,:,:))));   out.min.f    = reshape(out.min.f, [dims(2:end) 1]);
-            out.min.fcsf    = single(gather(extractdata(parameters_minLoss.fcsf .* mask(1,:,:,:))));   out.min.fcsf = reshape(out.min.fcsf, [dims(2:end) 1]);
-            out.min.DeR     = single(gather(extractdata(parameters_minLoss.DeR  .* mask(1,:,:,:))));   out.min.DeR  = reshape(out.min.DeR, [dims(2:end) 1]);
-            out.min.loss            = minLoss;
-            out.min.loss_fidelity   = double(gather(extractdata(minLossFidelity)));
-            if fitting.lambda == 0
-                out.min.loss_reg      = 0;
-            else
-                out.min.loss_reg      = double(gather(extractdata(minLossRegularisation)));
-            end
-            
-            disp('The processing is completed.')
-            
-            % clear GPU
-            if gpuDeviceCount > 0
-                gpuDevice([]);
-            end
-
         end
 
-        % compute the gradient and loss of forward modelling
-        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(this, parameters, dlR, mask, weights, ub,lb, numMaskVox, fitting)
+        %%%%% Prior estimation related functions %%%%%
 
-            % rescale network parameter to true values
-            parameters = this.rescale_parameters(parameters,lb,ub);
-            
-            % Forward model
-            % R           = this.FWD(parameters,fitting);
-            R           = this.FWD(parameters,fitting.model,mask(1,:,:,:));
-            R(isinf(R)) = 0;
-            R(isnan(R)) = 0;
-
-            % Masking
-            % R   = dlarray(R(mask>0).',     'CB');
-            R   = dlarray(R(:).',           'CB');
-            dlR = dlarray(dlR(mask>0).',    'CB');
-
-            % Data fidelity term
-            switch lower(fitting.lossFunction)
-                case 'l1'
-                    loss_fidelity = l1loss(R, dlR, weights);
-                case 'l2'
-                    loss_fidelity = l2loss(R, dlR, weights);
-                case 'mse'
-                    loss_fidelity = mse(R, dlR);
-            end
-            
-            % regularisation term
-            if fitting.lambda > 0
-                cost        = this.reg_TV(squeeze(parameters.(fitting.regmap)),squeeze(mask(1,:,:,:)),fitting.TVmode,fitting.voxelSize);
-                loss_reg    = sum(abs(cost),"all")/numMaskVox *fitting.lambda;
-            else
-                loss_reg = 0;
-            end
-            
-            % compute loss
-            loss = loss_fidelity + loss_reg;
-            
-            % Calculate gradients with respect to the learnable parameters.
-            gradients = dlgradient(loss,parameters);
-        
-        end
-        
         % using maximum likelihood method to estimate starting points
         function pars0 = estimate_prior(this,dwi,mask, Nsample)
         % Estimation starting points for NEXI using likehood method
@@ -584,27 +394,28 @@ classdef gpuAxCaliberSMT
             parfor kvol = 1:length(ind)
                 pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train);
             end
-            pars0           = zeros(Nparam,size(dwi,2),'single');
-            pars0(:,ind)    = pars0_mask;
+            pars           = zeros(Nparam,size(dwi,2),'single');
+            pars(:,ind)    = pars0_mask;
 
             % reshape estimation into image
-            pars0           = permute(reshape(pars0,[size(pars0,1) dims(1:3)]),[2 3 4 1]);
+            pars           = permute(reshape(pars,[size(pars,1) dims(1:3)]),[2 3 4 1]);
 
             % Correction for CSF
-            idx                 = bval < 4;
+            bval_thres          = max(min(unique(bval)),1.1);
+            idx                 = bval < bval_thres;
             Dint                = bval(idx)\-log(dwi(cat(1,idx,false(size(idx))),:));
             Dint                = permute(reshape(Dint,[size(Dint,1) dims(1:3)]),[2 3 4 1]);
             Dint(isnan(Dint))   = 0;
             Dint(isinf(Dint))   = 0;
             Dint(Dint<0)        = 0;
-            mask_CSF            = medfilt3(Dint)>1;
+            mask_CSF            = Dint>1.5;
             
             % ratio to modulate pars0 estimattion
-            pars0_csf = [0.01,1,1,0.01];
-            for k = 1:size(pars0,4)
-                tmp                 = pars0(:,:,:,k);
+            pars0_csf = [0.01,0.001,1,0.01];
+            for k = 1:size(pars,4)
+                tmp                 = pars(:,:,:,k);
                 tmp(mask_CSF==1)    = tmp(mask_CSF==1).*pars0_csf(k);
-                pars0(:,:,:,k)      = tmp;
+                pars(:,:,:,k)       = tmp;
             end
 
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
@@ -613,87 +424,16 @@ classdef gpuAxCaliberSMT
                 delete(pool);
             end
 
-        end
-
-        % NEXI signal
-        % copmpute the forward model
-        function [s] = FWD(this, pars, model, mask)
-        % Forward model to generate NEXI signal
-            if nargin < 4
-                r       = pars.r;
-                f       = pars.f;
-                fcsf    = pars.fcsf;
-                DeR     = pars.DeR;
-            else
-                % mask out voxels to reduce memory
-                r       = pars.r(mask(1,:,:,:)).';
-                f       = pars.f(mask(1,:,:,:)).';
-                fcsf    = pars.fcsf(mask(1,:,:,:)).';
-                DeR     = pars.DeR(mask(1,:,:,:)).';
+            for km = 1:size(pars,4)
+                pars0.(this.model_params{km}) = pars(:,:,:,km); ...
             end
-                
-            % Forward model
-            % 1. Intra-cellular signal
-            switch model
-                case 'Neuman'
-                    C = this.neuman(r);
-                case 'VanGelderen'
-                    % C = this.vg(r);
-                    C = this.vg2(r);    % less memory efficient but faster
-            end
-            Sa = sqrt(pi./(4*(this.b*this.Da - C))) .* exp(-C) .* erf(sqrt(this.b*this.Da - C));
-            % 2. Extra-cellular signal
-            dDe = (this.DeL - DeR); dDe = max(dDe,0); %dDe(dDe<0) = 0;
-            Se = sqrt(pi./(4.*(dDe).*this.b)) .* exp(-this.b.*DeR) .* erf(sqrt(this.b .*(dDe)));
-            % Combined signal
-            s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
-            % s = arrayfun(@AxCaliberSMT_signal_combine, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
 
-            % make sure s cannot be greater than 1
-            s = min(s,1);
-                
-        end
-        
-        function s = vg2(this,r)
-            k           = 15;
-            bm2_tmp     = gpuArray( this.bm2(1:k) );
-            bm2_tmp     = permute(bm2_tmp(:),[2 3 1]);
-
-            % s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part1,r,bm2_tmp,this.delta,this.Delta,this.D0);
-            % s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part2,sum(s,3),r,this.D0,this.g);
-
-            td          = r.^2/this.D0;
-            bardelta    = this.delta./td ;
-            barDelta    = this.Delta./td ;
-            bm2bardelta = bm2_tmp.*bardelta;
-            bm2barDelta = bm2_tmp.*barDelta;
-            s = (2/(bm2_tmp.^3.*(bm2_tmp-1))).*(-2 ...
-                        + 2*bm2bardelta ...
-                        + 2*exp(-bm2bardelta) ...
-                        + 2*exp(-bm2barDelta) ...
-                        - exp(-bm2barDelta-bm2bardelta)...
-                        - exp(-bm2barDelta+bm2bardelta));
-            s = sum(s,3).*this.D0.*this.g.^2.*td.^3;
-            
         end
 
-        function s = neuman(this, r)
-            s = (7/48)*this.g.^2.*this.delta*r.^4/this.D0;
-        end
-
-        % Total variation regularisation
-        function cost = reg_TV(this,img,mask,TVmode,voxelSize)
-            % voxel_size = [1 1 1];
-            % Vr      = 1./sqrt(abs(mask.*this.gradient_operator(img,voxel_size)).^2+eps);
-            cost = sum(abs(mask.*this.gradient_operator(img,voxelSize,TVmode)),4);
-
-            % cost    = this.divergence_operator(mask.*(Vr.*(mask.*this.gradient_operator(img,voxel_size))),voxel_size);
-        end
-        
-         % likelihood
+        % generate training data for likelihood
         function [x_train, S_train, intervals] = traindata(this, N_samples, varargin)
             if nargin < 3
-                intervals = [0.1 4 ;   % radius, um
+                intervals = [  1 6 ;   % diameter, um
                                0 1          ;   % intra-cellular volume fraction
                                0 1          ;   % isotropic volume fraction
                             0.2 gather(this.DeL)]  ;   % extra-cellular RD, um2/ms
@@ -716,23 +456,12 @@ classdef gpuAxCaliberSMT
                 % generate random parameter guesses and construct batch for NN signal evaluation
                 pars = intervals(:,1) + diff(intervals,[],2).*rand(size(intervals,1),batch_size);
 
-                params.r    = pars(1,:);
+                params.a    = pars(1,:);
                 params.f    = pars(2,:);
                 params.fcsf = pars(3,:);
                 params.DeR  = pars(4,:);
 
-                Sl0 = this.FWD(params, model);
-
-                % % NEXI Krger signal evaluation
-                % Sl0 = zeros(numel(this.b),batch_size);
-                % for j = 1:batch_size
-                %     params.r    = pars(1,j);
-                %     params.f    = pars(2,j);
-                %     params.fcsf = pars(3,j);
-                %     params.DeR  = pars(4,j);
-                % 
-                %     Sl0(:,j) = this.FWD(params, model);
-                % end
+                Sl0 = this.FWD(params, [], model);
 
                 % remaining signals (dot, soma)
                 x_train(:,:,k) = pars;
@@ -741,7 +470,8 @@ classdef gpuAxCaliberSMT
             end
 
         end
-    
+        
+        % likelihood
         function [pars_best, sse_best] = likelihood(this, S0, x_train, S_train)
             
             lmax = 0;
@@ -774,188 +504,95 @@ classdef gpuAxCaliberSMT
 
         end
     
+        %%  Signal related functions
+        % copmpute the forward model
+        function s = FWD(this, pars, mask, model)
+        % Forward model to generate AxCaliberSMT signal
+            if isempty(mask)
+                r       = pars.a/2;
+                f       = pars.f;
+                fcsf    = pars.fcsf;
+                DeR     = pars.DeR;
+            else
+                % mask out voxels to reduce memory
+                r       = askadam.row_vector(pars.a(mask))/2;
+                f       = askadam.row_vector(pars.f(mask));
+                fcsf    = askadam.row_vector(pars.fcsf(mask));
+                DeR     = askadam.row_vector(pars.DeR(mask));
+            end
+                
+            % Forward model
+            % 1. Intra-cellular signal
+            switch model
+                case 'Neuman'
+                    C = this.neuman(r);
+                case 'VanGelderen'
+                    C = this.vg2(r);    % less memory efficient but faster
+            end
+            Sa = sqrt(pi./(4*(this.b*this.Da - C))) .* exp(-C) .* erf(sqrt(this.b*this.Da - C));
+            % 2. Extra-cellular signal
+            dDe = (this.DeL - DeR); dDe = max(dDe,0); %dDe(dDe<0) = 0;
+            Se = sqrt(pi./(4.*(dDe).*this.b)) .* exp(-this.b.*DeR) .* erf(sqrt(this.b .*(dDe)));
+            % Combined signal
+            s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
+            % s = arrayfun(@AxCaliberSMT_signal_combine, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
+
+            % make sure s cannot be greater than 1
+            s = min(s,1);
+                
+        end
+        
+        % compute signal attenuation associated with axon size
+        function s = vg2(this,r)
+            k           = 10;
+            bm2_tmp     = this.bm2(1:k); if isgpuarray(r); bm2_tmp = gpuArray(single(bm2_tmp)); end
+            bm2_tmp     = permute(bm2_tmp(:),[2 3 1]);
+
+            % s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part1,r,bm2_tmp,this.delta,this.Delta,this.D0);
+            % s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part2,sum(s,3),r,this.D0,this.g);
+
+            td          = r.^2/this.D0;
+            bardelta    = this.delta./td ;
+            barDelta    = this.Delta./td ;
+            bm2bardelta = bm2_tmp.*bardelta;
+            bm2barDelta = bm2_tmp.*barDelta;
+            s = (2/(bm2_tmp.^3.*(bm2_tmp-1))).*(-2 ...
+                        + 2*bm2bardelta ...
+                        + 2*exp(-bm2bardelta) ...
+                        + 2*exp(-bm2barDelta) ...
+                        - exp(-bm2barDelta-bm2bardelta)...
+                        - exp(-bm2barDelta+bm2bardelta));
+            s = sum(s,3).*this.D0.*this.g.^2.*td.^3;
+            
+        end
+
+        function s = neuman(this, r)
+            s = (7/48)*this.g.^2.*this.delta*r.^4/this.D0;
+        end
+
     end
 
     methods(Static)
 
-        % initialise network parameters
-        function parameters = initialise_model(img_size,pars0,ub,lb,fitting)
-            
-            % get relevant parameters
-            randomness = fitting.randomness;
+        %% Utility
 
-            % initialise model parameters randomly
-            % 1st dimension preserves for DWI data points 
-            r0      = rand([1 img_size],'single') ;     % values between [0,1]
-            f0      = rand([1 img_size],'single') ;     % values between [0,1]
-            fcsf0   = rand([1 img_size],'single') ;     % values between [0,1]
-            DeR0    = rand([1 img_size],'single') ;     % values between [0,1]
-            
-            % if initial points are provided
-            if ~isempty(pars0)
-                % For noise propagation add a bit randomness to avoid trapped at initial points
-                % randomness = 1/3; % 1: totally random; 0: use entirely the prior
-                r0      =  (1-randomness)*((pars0(1,:,:,:) - lb(1)) /(ub(1)-lb(1))) + randomness*r0;     % values between [0,1]
-                f0      =  (1-randomness)*((pars0(2,:,:,:) - lb(2)) /(ub(2)-lb(2))) + randomness*f0;     % values between [0,1]
-                fcsf0   =  (1-randomness)*((pars0(3,:,:,:) - lb(3)) /(ub(3)-lb(3))) + randomness*fcsf0;     % values between [0,1]
-                DeR0    =  (1-randomness)*((pars0(4,:,:,:) - lb(4)) /(ub(4)-lb(4))) + randomness*DeR0;     % values between [0,1]
-
-            end
-            parameters.r    = gpuArray( dlarray(r0));
-            parameters.f    = gpuArray( dlarray(f0));
-            parameters.fcsf = gpuArray( dlarray(fcsf0));
-            parameters.DeR  = gpuArray( dlarray(DeR0));
-
-        end
-        
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting)
-            fitting2 = fitting;
+            % get basic fitting setting check
+            fitting2 = askadam.check_set_default_basic(fitting);
 
-            % get fitting algorithm setting
-            if ~isfield(fitting,'Nepoch')
-                fitting2.numEpochs = 4000;
-            end
-            if ~isfield(fitting,'initialLearnRate')
-                fitting2.initialLearnRate = 0.01;
-            end
-            if ~isfield(fitting,'decayRate')
-                fitting2.decayRate = 0.0005;
-            end
-            if ~isfield(fitting,'tol')
-                fitting2.tol = 1e-3;
-            end
-            if ~isfield(fitting,'lambda')
-                fitting2.lambda = 0;
-            end
-            if ~isfield(fitting,'TVmode')
-                fitting2.TVmode = '2D';
-            end
-            if ~-isfield(fitting,'regmap')
-                fitting2.regmap = 'r';
-            end
-            if ~isfield(fitting,'voxelSize')
-                fitting2.voxelSize = [2,2,2];
-            end
-            if ~isfield(fitting,'isdisplay')
-                fitting2.isdisplay = 0;
-            end
-            if ~isfield(fitting,'randomness')
-                fitting2.randomness = 0;
-            end
-            if ~isfield(fitting,'lmax')
-                fitting2.lmax = 0;
-            end
-            if ~isfield(fitting,'convergenceValue')
-                fitting2.convergenceValue = 1e-8;
-            end
-            if ~isfield(fitting,'convergenceWindow')
-                fitting2.convergenceWindow = 20;
-            end
-            if ~isfield(fitting,'lossFunction')
-                fitting2.lossFunction = 'L1';
-            end
-            if ~isfield(fitting,'output_filename')
-                fitting2.output_filename = [];
-            end
-            if ~isfield(fitting,'isPrior')
-                fitting2.isPrior = true;
-            end
+            % get customised fitting setting check
             if ~isfield(fitting,'model')
                 fitting2.model = 'VanGelderen';
             end
-
-        end
-    
-        % make sure all network parameters stay between 0 and 1
-        function parameters = set_boundary(parameters)
-
-            field = fieldnames(parameters);
-            for k = 1:numel(field)
-                parameters.(field{k})   = max(parameters.(field{k}),0); % Lower bound     
-                parameters.(field{k})   = min(parameters.(field{k}),1); % upper bound
-
+            if ~isfield(fitting,'regmap')
+                fitting2.regmap = {'a'};
             end
 
-        end
-        
-        % rescale the network parameters between the defined lower/upper bounds
-        function parameters = rescale_parameters(parameters,lb,ub)
-            parameters.r    = parameters.r      * (ub(1)-lb(1)) + lb(1);
-            parameters.f    = parameters.f      * (ub(2)-lb(2)) + lb(2);
-            parameters.fcsf = parameters.fcsf   * (ub(3)-lb(3)) + lb(3);
-            parameters.DeR  = parameters.DeR    * (ub(4)-lb(4)) + lb(4);
-
-        end
-
-        function G = gradient_operator(img,voxel_size,TVmode)
-            Dx = circshift(img,-1,1) - img;
-            Dy = circshift(img,-1,2) - img;
-            switch TVmode
-                case '2D'
-                    G = cat(4,Dx/voxel_size(1),Dy/voxel_size(2));
-                case '3D'
-                    Dz = circshift(img,-1,3) - img;
-                    G = cat(4,Dx/voxel_size(1),Dy/voxel_size(2),Dz/voxel_size(3));
+            if ~iscell(fitting2.regmap)
+                fitting2.regmap = cellstr(fitting2.regmap);
             end
-            
-        end
 
-        function div = divergence_operator(G,voxel_size)
-
-            G_x = G(:,:,:,1);
-            G_y = G(:,:,:,2);
-            G_z = G(:,:,:,3);
-            
-            [Mx, My, Mz] = size(G_x);
-            
-            Dx = [G_x(1:end-1,:,:); zeros(1,My,Mz)]...
-                - [zeros(1,My,Mz); G_x(1:end-1,:,:)];
-            
-            Dy = [G_y(:,1:end-1,:), zeros(Mx,1,Mz)]...
-                - [zeros(Mx,1,Mz), G_y(:,1:end-1,:)];
-            
-            Dz = cat(3, G_z(:,:,1:end-1), zeros(Mx,My,1))...
-                - cat(3, zeros(Mx,My,1), G_z(:,:,1:end-1));
-            
-            div = -( Dx/voxel_size(1) + Dy/voxel_size(2) + Dz/voxel_size(3) );
-
-        end
-    
-        function [NSegment,maxSlice] = findOptimalDivide(mask)
-
-            dims = size(mask);
-
-            % GPU info
-            gpu         = gpuDevice;    
-            maxMemory   = floor(gpu.TotalMemory / 1024^3)*1024^3 / (1024^2);        % Mb
-
-            % memoryRequiredFixPerVoxel       = 40 * prod(dims);
-            % memoryRequiredDynamicperVoxel   = 1.5e3 * prod(dims([1,2,4]));
-
-            % get these number based on mdl fit
-            memoryFixPerVoxel       = 0.0013;
-            memoryDynamicPerVoxel   = 0.05;
-
-            % find max. memory required
-            memoryRequiredFix       = memoryFixPerVoxel * prod(dims(1:3)) ;         % Mb
-            memoryRequiredDynamic   = memoryDynamicPerVoxel * numel(mask(mask>0));  % Mb
-
-            if maxMemory > (memoryRequiredFix + memoryRequiredDynamic)
-                % if everything fit in GPU
-                maxSlice = dims(3);
-                NSegment = 1;
-            else
-                % if not then divide the data
-                 NvolSliceMax= 0;
-                for k = 1:dims(3)
-                    tmp             = mask(:,:,k);
-                    NvolSliceMax    = max(NvolSliceMax,numel(tmp(tmp>0)));
-                end
-                maxMemoryPerSlice = memoryDynamicPerVoxel * NvolSliceMax;
-                maxSlice = floor((maxMemory - memoryRequiredFix)/maxMemoryPerSlice);
-                NSegment = ceil(dims(3)/maxSlice);
-            end
         end
     
     end

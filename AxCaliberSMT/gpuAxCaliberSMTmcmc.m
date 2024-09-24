@@ -32,6 +32,7 @@ classdef gpuAxCaliberSMTmcmc < handle
         Dcsf;
         D0;
         Scsf;
+        Nav;
         
 %         bm2;
     end
@@ -51,7 +52,7 @@ classdef gpuAxCaliberSMTmcmc < handle
     end
     
     methods (Access = public)
-        function this = gpuAxCaliberSMTmcmc(b, delta, Delta, D0, Da, DeL, Dcsf)
+        function this = gpuAxCaliberSMTmcmc(b, delta, Delta, D0, Da, DeL, Dcsf, varargin)
         % gpuAxCaliberSMTmcmc Axon size estimation using AxCaliber-SMT model and MCMC
         % smt = gpumcmcAxCaliberSMT(b, delta, Delta, D0, Da, DeL, Dcsf)
         %       output:
@@ -90,6 +91,13 @@ classdef gpuAxCaliberSMTmcmc < handle
             this.Dcsf   = gpuArray( single(Dcsf) );
             this.Scsf   = gpuArray( single(exp(-b(:)*Dcsf)) );
 
+            if nargin > 7
+                this.Nav = single(varargin{1}) ;
+            else
+                this.Nav =  ones(size(b),'single') ;
+            end
+            this.Nav = this.Nav(:) ;
+
             this.ub(4) = single(DeL);
         end
 
@@ -118,7 +126,9 @@ classdef gpuAxCaliberSMTmcmc < handle
         end
 
         % Perform AxCaliber model parameter estimation based on MCMC across the whole dataset
-        function [out] = estimate(this, dwi, mask, extradata, fitting)
+        % This is a wrapper of the 'fit' function.
+        % The main purpose of this function is to handle memory issue and ensure the input data is correct for 'fit'
+        function [out] = estimate(this, dwi, mask, extradata, fitting, pars0)
         % Input data are expected in multi-dimensional image
         % 
         % Input
@@ -132,17 +142,15 @@ classdef gpuAxCaliberSMTmcmc < handle
         %   .BDELTA : 1D diffusion time in ms, [1,dwi]
         % fitting   : fitting algorithm parameters
         %   .iteration  : number of MCMC iterations
-        %   .interval   : interval of MCMC sampling
-        %   .method     : method to compute the parameters, 'mean' (default)|'median'
+        %   .thinning   : interval of MCMC sampling
+        %   .metric     : method to compute the parameters, 'mean' (default)|'median'
+        % pars0     : (Optional) initial starting points for model parameters
         % 
         % Output
         % -----------
         % out       : output structure contains all MCMC results
-        % a         : Axon diameter
-        % f         : Neurite volume fraction
-        % fcsf      : CSF volume fraction
-        % DeR       : radial diffusivity of extracellular water
-        % noise     : noise level
+        %
+        % TODO: add GPU memory manager
         % 
             
             % display basic info
@@ -151,27 +159,34 @@ classdef gpuAxCaliberSMTmcmc < handle
             % get all fitting algorithm parameters 
             fitting = this.check_set_default(fitting);
 
+            %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             dwi = this.prepare_dwi_data(dwi,extradata);
 
-            % vectorise data, 1st dim: b-vavlue; 2nd dim: voxels
-            dwi = DWIutility.vectorise_4Dto2D(dwi,mask).';
-            
-            % MCMC main
-            [x_m, x_dist] = this.fit(dwi, fitting);
+            % mask sure no nan or inf in data
+            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
 
-            % export results to organise output structure
-            out = mcmc.res2out(x_m,x_dist,this.model_params,mask);
-            % also export them as variables
-            % for k = 1:length(this.model_params); eval([this.model_params{k} ' = out.expected.' this.model_params{k} ';']); end
-            
+            % if no pars input at all (not even empty) then use prior
+            if nargin < 6; pars0 = []; end
+
+            % convert datatype to single or logical
+            dwi     = single(dwi);
+            mask    = mask >0;
+            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+
+            %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
+
+            % MCMC main
+            out      = this.fit(dwi, mask, fitting, pars0);
+            out.mask = mask;
+
             % save the estimation results if the output filename is provided
             mcmc.save_mcmc_output(fitting.output_filename,out)
 
         end
         
         % Perform parameter estimation using MCMC solver
-        function [xExpected,xPosterior] = fit(this, y, fitting)
+        function [out] = fit(this, dwi, mask, fitting, pars0)
         % Input
         % -----
         % y         : measurements, 1st dim: b-value; 2nd dim: voxels
@@ -183,37 +198,86 @@ classdef gpuAxCaliberSMTmcmc < handle
         % xPosterior: posterior distribution of MCMC
         %
    
-            % Step 0: display basic messages
-            mcmc.display_basic_algorithm_parameters(fitting);
+            % check GPU
+            gpool = gpuDevice;
+
+            % check image size
+            dims = size(dwi,1:3);
+
+            %%%%%%%%%%%%%%%%%%%% Step 1. Validate and parse input %%%%%%%%%%%%%%%%%%%%
+            if nargin < 3 || isempty(mask); mask = ones(dims,'logical'); end % if no mask input then fit everthing
+            if nargin < 4; fitting = struct(); end
+            % set initial tarting points
+            if nargin < 5; pars0 = []; % no user input initial starting points
+            else
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+            end
+
+            % get all fitting algorithm parameters 
+            fitting                 = this.check_set_default(fitting);
+            fitting.model_params    = this.model_params;
+            % set fitting boundary if no input from user
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
+            fitting.xStepSize = this.step;
+
+            %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
+
+            %%%%%%%%%%%%%%%%%%%% 2. Setting up all necessary data, run askadam and get all output %%%%%%%%%%%%%%%%%%%%
+            % 2.1 setup fitting weights
+            w = this.compute_optimisation_weights(mask,0); % This is a customised funtion
+
             % additional message(s)
             if ischar(fitting.start); disp(['Starting points   : ', fitting.start ]); end; fprintf('\n');
-            
-            % Step 1: prepare input data
             % set starting points
-            x0 = gpuArray(single(this.determine_x0(y,fitting)));
+            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
 
-            % Step size on each iteration
-            xStepsize =  gpuArray(single(this.step));
+            mcmcObj = mcmc(); model = fitting.model;
+            out     = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, model);
 
-            % Step 2: parameter estimation
-            model = 'VanGelderen';  % extra parameter for FWD model
-            if strcmpi(fitting.algorithm,'mh')
-                [xExpected,xPosterior] = mcmc.metropilis_hastings(y,x0,xStepsize,fitting,@this.FWD,model);
-            else
-                [xExpected,xPosterior] = mcmc.goodman_weare(y,x0,fitting,@this.FWD,model);
+            % clear GPU
+            reset(gpool)
+            
+        end
+
+        % compute weights for optimisation
+        function w = compute_optimisation_weights(this,mask,lmax)
+        % 
+        % Output
+        % ------
+        % w         : N-D signal masked wegiths
+        %
+            dims = size(mask,1:3);
+
+            % lmax dependent weights
+            l = 0:2:lmax;
+            w = zeros([dims numel(this.b)*numel(l)],'single');
+            for kl = 1:(lmax/2+1)
+                for kb = 1:numel(this.b)
+                    w(:,:,:,(kl-1)*numel(this.b)+kb) = this.Nav(kb) / (2*l(kl)+1);
+                end
             end
+            w = w ./ max(w(:));
             
         end
 
 %% Signal generation
         
         % FWD signal model
-        function s = FWD(this, pars, model)
-            r    = pars(1,:,:)/2;
-            f    = pars(2,:,:);
-            fcsf = pars(3,:,:);
-            DeR  = pars(4,:,:);
-            
+        function s = FWD(this, pars,  model)
+            % make sure the first dimension is 1
+            if size(pars.a,1) ~= 1
+                r       = shiftdim(pars.a/2,-1);
+                f       = shiftdim(pars.f,-1);
+                fcsf    = shiftdim(pars.fcsf,-1);
+                DeR     = shiftdim(pars.DeR,-1);
+            else
+                r       = pars.a/2;
+                f       = pars.f;
+                fcsf    = pars.fcsf;
+                DeR     = pars.DeR;
+            end
+            % 
             % Forward model
             % 1. Intra-cellular signal
             switch model
@@ -245,94 +309,146 @@ classdef gpuAxCaliberSMTmcmc < handle
 %% Starting point estimation
 
         % determine how the starting points will be set up
-        function x0 = determine_x0(this,y,fitting) 
-
-            % Nv: # voxels
-            [~, Nv] = size(y);
+        function x0 = determine_x0(this,y,mask,fitting) 
 
             if ischar(fitting.start)
                 switch lower(fitting.start)
                     case 'likelihood'
                         % using maximum likelihood method to estimate starting points
-                        x0 = this.estimate_prior(y);
+                        x0 = this.estimate_prior(y,mask);
     
                     case 'default'
                         % use fixed points
-                        fprintf('Using default starting points for all voxels at [a,f,fcsf,DeR,noise]: [%s]\n\n',replace(num2str(this.startpoint.',' %.2f'),' ',','));
-    
-                        x0 = repmat(this.startpoint, 1, Nv);
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n\n',mcmc.cell2str(this.model_params),replace(num2str(this.startpoint.',' %.2f'),' ',','));
+                        fitting.start = this.startpoint;
+                        x0 = mcmc.initialise_start(size(mask,1:3),fitting);
+                        % x0 = repmat(this.startpoint, 1, Nv);
                     
                 end
             else
                 % user defined starting point
                 x0 = fitting.start(:);
-                fprintf('Using user-defined starting points for all voxels at [a,f,fcsf,DeR,noise]: [%s]\n\n',replace(num2str(x0.',' %.2f'),' ',','));
-    
-                x0 = repmat(x0, 1, Nv);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n\n',mcmc.cell2str(this.model_params),replace(num2str(x0.',' %.2f'),' ',','));
+                x0 = mcmc.initialise_start(dims,fitting);
+                % x0 = repmat(x0, 1, Nv);
             end
-            fprintf('Estimation lower bound [a,f,fcsf,DeR,noise]: [%s]\n',      replace(num2str(fitting.boundary(:,1).',' %.2f'),' ',','));
-            fprintf('Estimation upper bound [a,f,fcsf,DeR,noise]: [%s]\n',      replace(num2str(fitting.boundary(:,2).',' %.2f'),'  ',','));
-            fprintf('MCMC step size [a,f,fcsf,DeR,noise]: [%s]\n\n',            replace(num2str(this.step.',' %.2f'),'  ',','));
-
+            fprintf('Estimation lower bound [%s]: [%s]\n',      mcmc.cell2str(this.model_params),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      mcmc.cell2str(this.model_params),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            if strcmpi(fitting.algorithm,'mh')
+                fprintf('MCMC step size [%s]: [%s]\n\n',        mcmc.cell2str(this.model_params),replace(num2str(this.step.',' %.2f'),'  ',','));
+            end
         end
 
         % using maximum likelihood method to estimate starting points
-        function pars0 = estimate_prior(this,y)
-            % using maximum likelihood method to estimate starting points
-            disp('Estimate starting points based on likelihood ...')
-            pool                = gcp('nocreate');
-            isDeletepool        = false;
-            N_sample            = 1e4;
-            [x_train, S_train]  = this.traindata(N_sample);
-            if isempty(pool)
-                Nworker         = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                pool            = parpool('Processes',Nworker);
-                isDeletepool    = true;
-            end
-            pars0 = zeros(numel(this.model_params)-1,size(y,2));
+        function pars0 = estimate_prior(this,dwi,mask, Nsample)
+        % Estimation starting points for NEXI using likehood method
+
+            bval = gather(this.b);
+
             start = tic;
-            % loop all voxels
-            parfor k = 1:size(y,2)
-                pars0(:,k) = this.likelihood(y(:,k), x_train, S_train);
+            
+            disp('Estimate starting points based on likelihood ...')
+
+            % manage pool
+            pool            = gcp('nocreate');
+            isDeletepool    = false;
+            if isempty(pool)
+                Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                pool    = parpool('Processes',Nworker);
+                isDeletepool = true;
             end
+
+            if nargin < 4 || isempty(Nsample)
+                Nsample         = 1e4;
+            end
+            % create training data
+            [x_train, S_train] = this.traindata(Nsample);
+
+            % reshape input data,  put DWI dimension to 1st dim
+            dims    = size(dwi);
+            dwi     = permute(dwi,[4 1 2 3]);
+            dwi     = reshape(dwi,[dims(4), prod(dims(1:3))]);
+
+            % find masked voxels
+            ind         = find(mask(:));
+
+            Nparam = 4;
+
+            pars0_mask  = zeros(Nparam,length(ind),'single');
+            parfor kvol = 1:length(ind)
+                pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train);
+            end
+            pars           = zeros(Nparam,size(dwi,2),'single');
+            pars(:,ind)    = pars0_mask;
+
+            % reshape estimation into image
+            pars           = permute(reshape(pars,[size(pars,1) dims(1:3)]),[2 3 4 1]);
+
+            % Correction for CSF
+            bval_thres          = max(min(unique(bval)),1.1);
+            idx                 = bval < bval_thres;
+            Dint                = bval(idx)\-log(dwi(cat(1,idx,false(size(idx))),:));
+            Dint                = permute(reshape(Dint,[size(Dint,1) dims(1:3)]),[2 3 4 1]);
+            Dint(isnan(Dint))   = 0;
+            Dint(isinf(Dint))   = 0;
+            Dint(Dint<0)        = 0;
+            mask_CSF            = Dint>1.5;
+            
+            % ratio to modulate pars0 estimattion
+            pars0_csf = [0.01,0.001,1,0.01];
+            for k = 1:size(pars,4)
+                tmp                 = pars(:,:,:,k);
+                tmp(mask_CSF==1)    = tmp(mask_CSF==1).*pars0_csf(k);
+                pars(:,:,:,k)       = tmp;
+            end
+
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
             fprintf('Starting points estimated. Elapsed time (hh:mm:ss): %s \n',string(ET));
             if isDeletepool
                 delete(pool);
             end
-            pars0(5,:) = this.startpoint(end);
+
+            for km = 1:size(pars,4)
+                pars0.(this.model_params{km}) = pars(:,:,:,km); 
+            end
+
+            % noise
+            pars0.(this.model_params{end}) = single(ones(size(mask)) * this.startpoint(end));
 
         end
 
-        % likelihood
+        % generate training data for likelihood
         function [x_train, S_train, intervals] = traindata(this, N_samples, varargin)
             if nargin < 3
-                intervals = [0.1 4 ;   % radius, um
+                intervals = [  1 6 ;   % diameter, um
                                0 1          ;   % intra-cellular volume fraction
                                0 1          ;   % isotropic volume fraction
-                            0.2 this.DeL]  ;   % extra-cellular RD, um2/ms
+                            0.2 gather(this.DeL)]  ;   % extra-cellular RD, um2/ms
                             % 0.01 1         ];   % sigma/b0 = 1/SNR_b0
             else
                 intervals = varargin{1};
             end
+
+            model = 'VanGelderen';
             
-            numBSample = numel(this.b);
+            numBSample = numel(gather(this.b));
             numParam   = size(intervals,1) ;
             
             % batch size can be modified according to available hardware
             batch_size  = 1e3;
             reps        = ceil(N_samples/batch_size);
-            x_train     = zeros(numParam,batch_size,reps);
-            S_train     = zeros(numBSample,batch_size,reps);
+            x_train     = zeros(numParam,batch_size,reps,'single');
+            S_train     = zeros(numBSample,batch_size,reps,'single');
             for k = 1:reps
                 % generate random parameter guesses and construct batch for NN signal evaluation
                 pars = intervals(:,1) + diff(intervals,[],2).*rand(size(intervals,1),batch_size);
 
-                % NEXI Krger signal evaluation
-                Sl0 = zeros(numel(this.b),batch_size);
-                for j = 1:batch_size
-                    Sl0(:,j) = this.FWD(pars(:,j), 'VanGelderen');
-                end
+                params.a    = pars(1,:);
+                params.f    = pars(2,:);
+                params.fcsf = pars(3,:);
+                params.DeR  = pars(4,:);
+
+                Sl0 = this.FWD(params, [],model);
 
                 % remaining signals (dot, soma)
                 x_train(:,:,k) = pars;
@@ -415,10 +531,13 @@ classdef gpuAxCaliberSMTmcmc < handle
             if ~isfield(fitting,'start')
                 fitting2.start = 'default';
             end
-            if ~isfield(fitting,'boundary')
-                % otherwise uses default
-                fitting2.boundary   = cat(2, this.lb(:),this.ub(:));
+            if ~isfield(fitting,'model')
+                fitting2.start = 'vangelderen';
             end
+            % if ~isfield(fitting,'boundary')
+            %     % otherwise uses default
+            %     fitting2.boundary   = cat(2, this.lb(:),this.ub(:));
+            % end
             if isfield(fitting,'step')
                 if numel(fitting.step) == numel(this.step)
                     % update step size in the constructor

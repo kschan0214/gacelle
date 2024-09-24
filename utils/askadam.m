@@ -5,34 +5,148 @@ classdef askadam < handle
 % This is the class of all askadam realted functions
 %
 % Date created: 4 April 2024 
-% Date modified:
+% Date modified: 21 August 2024
+%
     properties (GetAccess = public, SetAccess = protected)
 
     end
 
     methods
 
+        % function out = fit(this, data, mask, weights, pars0, fitting, FWDfunc, varargin)
+        % % Input
+        % % ----------
+        % % data          : N-D measureemnt data, First 3 dims reserve for spatial info
+        % % mask          : M-D signal mask (M=[1,3])
+        % % weights       : N-D weights for optimisaiton, same dim as 'data'
+        % % pars0         : Structure variable containing all parameters to be estimated
+        % % fitting       : Structure variable containing all fitting algorithm setting
+        % % FWDfunc       : function handle of forward model
+        % % varargin      : contains additional input requires for FWDfunc
+        % % 
+        % 
+        %     % get data dimension
+        %     dims = size(mask,1:3);
+        % 
+        %     % % initiate starting points arrays
+        %     % parameters = this.initialise_parameter(dims,pars0,fitting);
+        % 
+        %     % put data into gpuArray and mask out data to reduce memory load
+        %     % mask    = gpuArray(logical(mask)); 
+        %     data    = this.vectorise_NDto2D(data,mask).';
+        %     if ~isempty(weights); weights = this.vectorise_NDto2D(weights,mask).'; end
+        % 
+        % 
+        %     % estimation 
+        %     out = this.optimisation( data, mask, weights, parameters, fitting, FWDfunc, varargin{:});
+        % 
+        % end
+
+        function [gradients,loss,loss_fidelity,loss_reg] = modelGradient(this, parameters, data, mask, weights, fitting, FWDfunc, varargin)
+        % Input
+        % ----------
+        % parameters    : Structure variable containing all parameters to be estimated
+        % data          : N-D measureemnt data
+        % mask          : M-D signal mask (M=[1,3])
+        % weights       : N-D weights for optimisaiton
+        % fitting       : Structure variable containing all fitting algorithm setting
+        % FWDfunc       : function handle of forward model
+        % varargin      : contains additional input requires for FWDfunc
+        % 
+        % Output
+        % ------
+        % gradients     : Adam gradient
+        % loss          : total loss
+        % loss_fidelity : loss associated with data fidelity (consistancy)
+        % loss_reg      : loss associated with (TV) regularisation
+
+            % Forward signal simulation
+            signal_FWD = FWDfunc(this.rescale_parameters(parameters,fitting.lb,fitting.ub,fitting.model_params),mask,varargin{:});
+            % ensure numerical output
+            signal_FWD(isinf(signal_FWD)) = 0; 
+            signal_FWD(isnan(signal_FWD)) = 0;
+
+            % Masking
+            signal_FWD = dlarray(signal_FWD(:).', 'CB');
+
+            % Data fidelity term
+            switch lower(fitting.lossFunction)
+                case 'l1'
+                    loss_fidelity = l1loss(signal_FWD, data, weights);
+                case 'l2'
+                    loss_fidelity = l2loss(signal_FWD, data, weights);
+                case 'huber'
+                    loss_fidelity = huber(signal_FWD, data, weights);
+                case 'mse'
+                    loss_fidelity = mse(signal_FWD, data);
+            end
+
+            % regularisation term
+            loss_reg = 0;
+            if fitting.lambda{1} > 0
+                for kreg = 1:numel(fitting.lambda)
+                    Nsample     = numel(mask(mask ~= 0));
+
+                    cost        = this.reg_TV(squeeze(parameters.(fitting.regmap{kreg})),mask,fitting.TVmode,fitting.voxelSize);
+                    loss_reg    = sum(abs(cost),"all")/Nsample *fitting.lambda{kreg} + loss_reg;
+                end
+            end
+            
+            % compute loss
+            loss = loss_fidelity + loss_reg;
+            
+            % Calculate gradients with respect to the learnable parameters.
+            gradients = dlgradient(loss,parameters);
+
+        end
+
         % askAdam optimisation loop
-        function out = optimisation(this, pars0, ModelGradientFunc, data,mask,weights, fitting,varargin)
+        function out = optimisation(this, data, mask, weights, parameters, fitting, FWDfunc, varargin)
         % Input
         % -----
-        % ModelGradientFunc     : function handle for gradient descent
+        % data                  : N-D (imaging) data
+        % mask                  : (1-3)D signal mask applied on FWDfunc, NOTE this mask does NOT apply on data
+        % weights               : N-D wieghts, same dimension as 'data' (optional)
+        % parameters            : structure variable containing starting points of all model parameters to be estimated (optional)
         % fitting               : structure contains fitting algorithm parameters
-        % pars0                 : (optional) initial starting points of model parameters
-        % data                  : N-D imaging data
-        % mask                  : 2/3D signal mask
-        % varargin              : other input for ModelGradientFunc (same order as ModelGradientFunc)
+        %   .model_params       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star'};
+        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'model_params', e.g. [0.5, 0];
+        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'model_params', e.g. [2, 1];
+        %   .isdisplay          : boolean, display optimisation process in graphic plot
+        %   .convergenceValue   : tolerance in loss gradient to stop the optimisation
+        %   .convergenceWindow  : # of elements in which 'convergenceValue' is computed
+        %   .iteration          : maximum # of optimisation iterations
+        %   .initialLearnRate   : initial learn rate of Adam optimiser
+        %   .tol                : tolerance in loss
+        %   .lambda             : regularisation parameter(s)
+        %   .regmap             : model parameter(s) in which regularisation is applied
+        %   .lossFunction       : loss function, 'L1'|'L2'|'huber'|'mse'
+        % FWDfunc               : function handle for forward signal generation
+        % varargin              : additional input for FWDfunc other than 'parameter' and 'mask' (same order as FWDfunc)
         %
         % Output
         % ------
         % out                   : structure contains optimisation result
         %
+
             dims = size(mask,1:3);
 
-            parameters = this.initialise_model(dims(1:3),pars0,fitting.ub,fitting.lb,fitting);
+            % check and set fitting default
+            fitting = this.check_set_default_basic(fitting);
+            
+            % put data into gpuArray
+            mask    = gpuArray(logical(mask)); 
+            data    = gpuArray(single(data));
+            if ~isempty(weights); weights = gpuArray(single(weights)); else; weights = ones(size(data),'like',data); end
+            % vectorise input data
+            data    = dlarray(data(:).',    'CB');
+            weights = dlarray(weights(:).', 'CB');
+
+            % initiate starting points arrays
+            parameters = this.initialise_parameter(dims,parameters,fitting);
 
             % clear cache before running everthing
-            accfun = dlaccelerate(ModelGradientFunc);
+            accfun = dlaccelerate(@this.modelGradient);
             clearCache(accfun)
 
             % optimisation process
@@ -58,84 +172,107 @@ classdef askadam < handle
             convergenceBuffer       = ones(fitting.convergenceWindow,1);
             A                       = [(1:fitting.convergenceWindow).', ones(fitting.convergenceWindow,1)]; % A matrix to derive convergence
             % optimisation
-            for epoch = 1:fitting.Nepoch
-                
+            % if Nepoch == 0 then just compute loss
+            if fitting.iteration == 0
+                epoch = 0;
                 % make sure the parameters are [0,1]
-                parameters = this.set_boundary(parameters);
+                parameters = this.set_boundary01(parameters);
 
                 % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                [gradients,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,data,mask,weights,fitting,varargin{:});
-            
-                % Update learning rate.
-                learningRate = fitting.initialLearnRate / (1+ fitting.decayRate*epoch);
-                
+                [~,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
+
                 % get loss and compute convergence value
                 loss                = double(gather(extractdata(loss)));
-                convergenceBuffer   = [convergenceBuffer(2:end);loss];
-                mc                  = A\convergenceBuffer;
-                convergenceCurr     = -mc(1);
 
-                % store also the results with minimal loss
-                if minLoss > loss
-                    minLoss                 = loss;
-                    minLossFidelity         = loss_fidelity;
-                    minLossRegularisation   = loss_reg;
-                    parameters_minLoss      = parameters;
-                end
-                % check if the optimisation should be stopped
-                if convergenceCurr < fitting.convergenceValue && epoch >= fitting.convergenceWindow
-                    fprintf('Convergence is less than the tolerance %e \n',fitting.convergenceValue);
-                    break
-                end
-                if loss < fitting.tol
-                    fprintf('Loss is less than the tolerance %e \n',fitting.tol);
-                    break
-                end
+                minLoss                 = loss;
+                minLossFidelity         = loss_fidelity;
+                minLossRegularisation   = loss_reg;
+                parameters_minLoss      = parameters;
+            else
+                % else run optimisation
 
-                % Update the network parameters using the adamupdate function.
-                [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
-                    averageSqGrad,epoch,learningRate);
-                
-                
-                if fitting.isdisplay
+                % display optimisation algorithm parameters
+                this.display_basic_fitting_parameters(fitting);
+
+                for epoch = 1:fitting.iteration
                     
-                    addpoints(lineLoss,epoch, loss);
+                    % make sure the parameters are [0,1]
+                    parameters = this.set_boundary01(parameters);
+    
+                    % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
+                    [gradients,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
                 
-                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                    title("Epoch: " + epoch + ", Elapsed: " + string(D) + ", Loss: " + loss)
-                    drawnow
+                    % Update learning rate.
+                    learningRate = fitting.initialLearnRate / (1+ fitting.decayRate*epoch);
+                    
+                    % get loss and compute convergence value
+                    loss                = double(gather(extractdata(loss)));
+                    convergenceBuffer   = [convergenceBuffer(2:end);loss];
+                    mc                  = A\convergenceBuffer;
+                    convergenceCurr     = -mc(1);
+    
+                    % store also the results with minimal loss
+                    if minLoss > loss
+                        minLoss                 = loss;
+                        minLossFidelity         = loss_fidelity;
+                        minLossRegularisation   = loss_reg;
+                        parameters_minLoss      = parameters;
+                    end
+                    % check if the optimisation should be stopped
+                    if convergenceCurr < fitting.convergenceValue && epoch >= fitting.convergenceWindow
+                        fprintf('Convergence is less than the tolerance %e \n',fitting.convergenceValue);
+                        break
+                    end
+                    if loss < fitting.tol
+                        fprintf('Loss is less than the tolerance %e \n',fitting.tol);
+                        break
+                    end
+    
+                    % Update the network parameters using the adamupdate function.
+                    [parameters,averageGrad,averageSqGrad] = adamupdate(parameters,gradients,averageGrad, ...
+                        averageSqGrad,epoch,learningRate);
+                    
+                    
+                    if fitting.isdisplay
+                        
+                        addpoints(lineLoss,epoch, loss);
+                    
+                        D = duration(0,0,toc(start),'Format','hh:mm:ss');
+                        title("Epoch: " + epoch + ", Elapsed: " + string(D) + ", Loss: " + loss)
+                        drawnow
+                    end
+                    if mod(epoch,100) == 0 || epoch == 1
+                        % display some info
+                        D = duration(0,0,toc(start),'Format','hh:mm:ss');
+                        fprintf('Iteration #%4d,     Loss = %f,      Convergence = %e,     Elapsed:%s \n',epoch,loss,convergenceCurr,string(D));
+                    end
+                    
                 end
-                if mod(epoch,100) == 0 || epoch == 1
-                    % display some info
-                    D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                    fprintf('Iteration #%4d,     Loss = %f,      Convergence = %e,     Elapsed:%s \n',epoch,loss,convergenceCurr,string(D));
-                end
-                
             end
             fprintf('Final loss         =  %e\n',double(loss));
             fprintf('Final convergence  =  %e\n',double(convergenceCurr));
             fprintf('Final #iterations  =  %d\n',epoch);
 
             % make sure the final results stay within boundary
-            parameters = this.set_boundary(parameters);
+            parameters = this.set_boundary01(parameters);
             
             % rescale the network parameters
             parameters          = this.rescale_parameters(parameters,           fitting.lb,fitting.ub,fitting.model_params);
             parameters_minLoss  = this.rescale_parameters(parameters_minLoss,   fitting.lb,fitting.ub,fitting.model_params);
             for k = 1:numel(fitting.model_params)
                 % final iteration result
-                tmp = single(gather(extractdata(parameters.(fitting.model_params{k}) .* mask(:,:,:,1)))); 
+                tmp = single(gather(extractdata(parameters.(fitting.model_params{k}) .* mask))); 
                 out.final.(fitting.model_params{k}) = tmp;
 
                 % minimum loss result
-                tmp = single(gather(extractdata(parameters_minLoss.(fitting.model_params{k}) .* mask(:,:,:,1)))); 
+                tmp = single(gather(extractdata(parameters_minLoss.(fitting.model_params{k}) .* mask))); 
                 out.min.(fitting.model_params{k}) = tmp;
             end
             out.final.loss          = loss;
             out.final.loss_fidelity = double(gather(extractdata(loss_fidelity)));
             out.min.loss            = minLoss;
             out.min.loss_fidelity   = double(gather(extractdata(minLossFidelity)));
-            if fitting.lambda == 0
+            if fitting.lambda{1} == 0
                 out.final.loss_reg  = 0;
                 out.min.loss_reg    = 0;
             else
@@ -146,11 +283,13 @@ classdef askadam < handle
         end
 
         % initialise network parameters
-        function parameters = initialise_model(this,img_size,pars0,ub,lb,fitting)
+        function parameters = initialise_parameter(this,img_size,pars0,fitting)
             
             % get relevant parameters
             randomness      = fitting.randomness;
             model_params    = fitting.model_params;
+            ub              = fitting.ub;
+            lb              = fitting.lb;
 
             for k = 1:numel(model_params)
                
@@ -206,7 +345,7 @@ classdef askadam < handle
         % Input
         % -----
         % fitting               : structure contains fitting algorithm parameters
-        %   .Nepoch             : no. of maximum iterations, default = 4000
+        %   .iteration          : no. of maximum iterations, default = 4000
         %   .initialLearnRate   : initial gradient step size, defaulr = 0.01
         %   .decayRate          : decay rate of gradient step size; learningRate = initialLearnRate / (1+decayRate*epoch), default = 0.0005
         %   .convergenceValue   : convergence tolerance, based on the slope of last 'convergenceWindow' data points on loss, default = 1e-8
@@ -223,20 +362,24 @@ classdef askadam < handle
             fitting2 = fitting;
 
             % get fitting algorithm setting
-            if ~isfield(fitting,'Nepoch')
-                fitting2.Nepoch = 4000;
+            if ~isfield(fitting,'Nepoch') || ~isfield(fitting,'iteration') % legacy
+                fitting2.iteration = 4000;
+            end
+            if isfield(fitting,'Nepoch') % legacy
+                fitting2.iteration  = fitting.Nepoch;
+                fitting2            = rmfield(fitting2,'Nepoch');
             end
             if ~isfield(fitting,'initialLearnRate')
                 fitting2.initialLearnRate = 0.01;
             end
             if ~isfield(fitting,'decayRate')
-                fitting2.decayRate = 0.0005;
+                fitting2.decayRate = 0;
             end
             if ~isfield(fitting,'tol')
                 fitting2.tol = 1e-3;
             end
             if ~isfield(fitting,'lambda')
-                fitting2.lambda = 0;
+                fitting2.lambda = {0};
             end
             if ~isfield(fitting,'TVmode')
                 fitting2.TVmode = '2D';
@@ -272,10 +415,14 @@ classdef askadam < handle
                 fitting2.lb = [];
             end
 
+            if ~iscell(fitting2.lambda)
+                fitting2.lambda = num2cell(fitting2.lambda);
+            end
+
         end
 
         % make sure all network parameters stay between 0 and 1
-        function parameters = set_boundary(parameters)
+        function parameters = set_boundary01(parameters)
 
             field = fieldnames(parameters);
             for k = 1:numel(field)
@@ -327,16 +474,16 @@ classdef askadam < handle
             disp('----------------------------');
             disp('AskAdam algorithm parameters');
             disp('----------------------------');
-            disp(['Maximum no. of iteration = ' num2str(fitting.Nepoch)]);
+            disp(['Maximum no. of iteration = ' num2str(fitting.iteration)]);
             disp(['Loss function            = ' fitting.lossFunction]);
             disp(['Loss tolerance           = ' num2str(fitting.tol)]);
             disp(['Convergence tolerance    = ' num2str(fitting.convergenceValue)]);
             disp(['Initial learning rate    = ' num2str(fitting.initialLearnRate)]);
             disp(['Learning rate decay rate = ' num2str( fitting.decayRate)]);
-            if fitting.lambda > 0 
-                disp(['Regularisation parameter = ' num2str(fitting.lambda)]);
-                disp(['Regularisation Map       = ' fitting.regmap]);
-                disp(['Total variation mode     = ' fitting.TVmode]);
+            if fitting.lambda{1} > 0 
+                disp(['Regularisation parameter(s) = ' cell2num2str(fitting.lambda)]);
+                disp(['Regularisation Map(s)       = ' cell2str(fitting.regmap)]);
+                disp(['Total variation mode        = ' fitting.TVmode]);
             end
         end
 
@@ -344,11 +491,32 @@ classdef askadam < handle
         function img_norm = rescale01(img, lb, ub)
             img_norm = (img - lb) /(ub - lb);
         end
+        
         % undo rescale input between 0 and 1 given lower and upper bounds
         function img = unscale01(img_norm, lb, ub)
             img = (img_norm * (ub - lb)) + lb;
         end
 
+        % vectorise N-D image to 2D with the 1st dimension=spataial dimension and 2nd dimension=combine from 4th and onwards 
+        function [data, mask_idx] = vectorise_NDto2D(data,mask)
+
+            dims = size(data,[1 2 3]);
+
+            if nargin < 2
+                mask = ones(dims);
+            end
+
+             % vectorise data
+            data        = reshape(data,prod(dims),prod(size(data,4:ndims(data))));
+            mask_idx    = find(mask>0);
+            data        = data(mask_idx,:);
+
+            if ~isreal(data)
+                data = cat(2,real(data),imag(data));
+            end
+
+        end
+        
         % make sure data does not contain any NaN/Inf and update mask
         function [data,mask] = remove_img_naninf(data,mask)
         % Input
@@ -376,7 +544,7 @@ classdef askadam < handle
             end
         end
 
-        % determine how the dataset will be divided based on vailable memory in GPU
+        % TODO: determine how the dataset will be divided based on vailable memory in GPU
         function [NSegment,maxSlice] = find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel)
         % Input
         % -----
@@ -458,6 +626,10 @@ classdef askadam < handle
                 save(output_filename,'out');
                 fprintf('Estimation output is saved at %s\n',output_filename);
             end
+        end
+
+        function vector = row_vector(vector)
+            vector = reshape(vector, 1, []); 
         end
 
     end

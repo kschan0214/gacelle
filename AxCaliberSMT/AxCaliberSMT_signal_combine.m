@@ -17,7 +17,7 @@
 %
 function s = AxCaliberSMT_signal_combine(C, f, fcsf, DeR, b,Da,DeL,Scsf)
 
-Sa = sqrt(pi./(4*(b*Da - C))) .* exp(-C) .* erf(sqrt(b*Da - C));
+Sa = sqrt(pi./(4*(b.*Da - C))) .* exp(-C) .* erf(sqrt(b.*Da - C));
 Se = sqrt(pi./(4.*(DeL - DeR).*b)) .* exp(-b.*DeR) .* erf(sqrt(b .*(DeL - DeR)));
 
 s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*Scsf;

@@ -7,7 +7,7 @@
 % kchan2@mgh.harvard.edu
 %
 % Date created: 25 March 2024 
-% Date modified:
+% Date modified: 15 August 2024
 %
 %% add paths
 addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/askadam')); % this path should be accessible to the group
@@ -30,25 +30,31 @@ BDELTA  = readmatrix(fullfile(data_dir,'sub-010.diffusionTime'),'FileType','text
 %% Algorithm parameters
 bval        = bval/1e3; % s/mm2 to ms/um2
 % fix parameters
-D0          = 2;
+D0          = 1.7;
 Da_fixed    = 1.7;
 DeL_fixed   = 1.7;
 Dcsf        = 3;
 
 % get unique b-values for each little delta and big delta
-[bval_sorted,ldelta_sorted,BDELTA_sorted] = preparationDWI.unique_shell(bval,ldelta,BDELTA);
+[bval_sorted,ldelta_sorted,BDELTA_sorted] = DWIutility.unique_shell(bval,ldelta,BDELTA);
 
-%% Usage #1: Basic default setting (same as Hong-Hsi's original implementation)
+obj     = DWIutility;
+lmax    = 0;
+dwi_smt = obj.get_Sl_all(dwi,bval,bvec,ldelta,BDELTA,lmax);
+
+%% Usage #1: Basic default setting 
 fitting                     = [];
 fitting.Nepoch              = 4000;
 fitting.initialLearnRate    = 0.001;
-fitting.decayRate           = 0.0001;
+fitting.decayRate           = 0;
 fitting.convergenceValue    = 1e-8;
 fitting.tol                 = 1e-3;
 fitting.display             = false;
-fitting.lambda              = 0.0003;
+fitting.lambda              = 0.0001;
 fitting.TVmode              = '3D';
 fitting.voxelSize           = [2,2,2];
+fitting.regmap              = 'a';
+fitting.isPrior             = 1;
 
 extractdata.bval    = bval;
 extractdata.bvec    = bvec;
@@ -58,8 +64,31 @@ extractdata.BDELTA  = BDELTA;
 % intiate MCMC object
 smt_gpu                     = gpuAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
 % MCMC estimation
-[out,r,f,fcsf,DeR]    = smt_gpu.estimate(dwi, mask, extractdata, fitting);
+[out]    = smt_gpu.estimate(dwi, mask, extractdata, fitting);
 
+%% Usage #1: Basic default setting 
+fitting                     = [];
+fitting.Nepoch              = 4000;
+fitting.initialLearnRate    = 0.001;
+fitting.decayRate           = 0;
+fitting.convergenceValue    = 1e-8;
+fitting.tol                 = 1e-3;
+fitting.display             = false;
+fitting.regmap              = {'a','f'};
+fitting.lambda              = {0.001, 0.001};
+fitting.TVmode              = '3D';
+fitting.voxelSize           = [2,2,2];
+fitting.isPrior             = 1;
 
+extractdata = [];
 
+% reproducibility
+seed = 892396;
+rng(seed);
+pars0 = smt_gpu.estimate_prior(dwi_smt,mask);
+
+% intiate MCMC object
+smt_gpu                     = gpuAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
+% MCMC estimation
+[out]    = smt_gpu.estimate(dwi_smt, mask, extractdata, fitting, pars0);
 

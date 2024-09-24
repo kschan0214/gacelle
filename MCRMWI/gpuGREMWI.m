@@ -2,7 +2,7 @@ classdef gpuGREMWI
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 22 July 2024
-% Date modified: 
+% Date modified: 22 September 2024
 
     properties (Constant)
             gyro = 42.57747892;
@@ -197,15 +197,7 @@ classdef gpuGREMWI
             this.display_data_model_info;
 
             % get all fitting algorithm parameters 
-            fitting = this.check_set_default(fitting);
-            if isreal(data)
-                fitting.isComplex = false;
-            else
-                fitting.isComplex = true;
-            end
-
-            % determine fitting parameters
-            this = this.updateProperty(fitting);
+            fitting = this.check_set_default(fitting,data);
 
             % make sure input data are valid
             [extraData,mask] = this.validate_data(data,extraData,mask,fitting);
@@ -225,8 +217,8 @@ classdef gpuGREMWI
 
             % determine if we need to divide the data to fit in GPU
             g = gpuDevice; reset(g);
-            memoryFixPerVoxel       = 0.0013;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.005;     % get this number based on mdl fit
+            memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
+            memoryDynamicPerVoxel   = 0.0001;     % get this number based on mdl fit
             [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
@@ -246,7 +238,8 @@ classdef gpuGREMWI
                 % divide the data
                 dwi_tmp     = data(:,:,slice,:);
                 mask_tmp    = mask(:,:,slice);
-                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = single(extraData.(fields{kfield})(:,:,slice,:,:)); end
+                fields      = fieldnames(extraData); 
+                for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = single(extraData.(fields{kfield})(:,:,slice,:,:)); end
 
                 % run fitting
                 [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp);
@@ -310,133 +303,64 @@ classdef gpuGREMWI
         %
             
             % check GPU
-            g = gpuDevice;
+            gpool = gpuDevice;
             
             % get image size
             dims = size(data,1:3);
 
             %%%%%%%%%%%%%%%%%%%% 1. Validate and parse input %%%%%%%%%%%%%%%%%%%%
-            if nargin < 3 || isempty(mask)
-                % if no mask input then fit everthing
-                mask = ones(dims);
-            end
-
-            if nargin < 4
-                fitting = struct();
-            end
-
-            % set initial starting points
-            pars0 = this.estimate_prior(data);
+            if nargin < 3 || isempty(mask); mask = ones(dims,'logical'); end % if no mask input then fit everthing
+            if nargin < 4; fitting = struct(); end
 
             % get all fitting algorithm parameters 
-            fitting                 = this.check_set_default(fitting);
+            fitting                 = this.check_set_default(fitting,data);
             fitting.model_params    = this.model_params;
             fitting.Nsample         = numel(mask(mask ~= 0)); 
-
             % set fitting boundary if no input from user
             if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.model_params)); end
             if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.model_params)); end
+            
+            % set initial starting points
+            pars0 = this.estimate_prior(data);
             
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
             %%%%%%%%%%%%%%%%%%%% 2. Setting up all necessary data, run askadam and get all output %%%%%%%%%%%%%%%%%%%%
             % 2.1 setup fitting weights
-            w = this.compute_optimisation_weights(data,fitting,mask); % This is a customised funtion
-            w = dlarray(gpuArray(single(w)).','CB');
+            w = this.compute_optimisation_weights(data,fitting); % This is a customised funtion
 
-            % put data input gpuArray
-            if fitting.isComplex
-                % data = gpuArray(single(cat(4,real(data),imag(data))));
-                data = gpuArray(single(cat(1,this.vectorise_NDto2D(real(data),mask).',this.vectorise_NDto2D(imag(data),mask).')));
-            else
-                % data = gpuArray(single(data));
-                data = gpuArray(single(this.vectorise_NDto2D(data,mask).'));
-            end
-            mask = gpuArray(logical(mask));
-            fields = fieldnames(extraData); for kfield = 1:numel(fields); extraData.(fields{kfield}) = dlarray(gpuArray( single( this.vectorise_NDto2D(extraData.(fields{kfield}),mask).'))); end
-            % fields = fieldnames(pars0);     for kfield = 1:numel(fields); pars0.(fields{kfield}) = dlarray(gpuArray( single( this.vectorise_NDto2D(pars0.(fields{kfield}),mask).'))); end
+            % split data into real and imaginary parts for complex-valued data
+            if fitting.isComplex; data = cat(5,real(data),imag(data)); end
 
             % 2.2 display optimisation algorithm parameters
-            askadam.display_basic_fitting_parameters(fitting);
             this.display_algorithm_info(fitting)
+
+            % 3. askAdam optimisation main
+            % mask out data to reduce memory load
+            data = askadam.vectorise_NDto2D(data,mask).';
+            if ~isempty(w); w = askadam.vectorise_NDto2D(w,mask).'; end
+            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( askadam.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
             
-            % 2.3 askAdam optimisation main
-            askadamObj = askadam();
-            out = askadamObj.optimisation(pars0, @this.modelGradients, data, mask, w, fitting, extraData);
+            disp('##############################################')
+            disp('Runnning optimisation on all voxels...')
+            askadamObj  = askadam();
+            out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
             disp('The process is completed.')
             
             % clear GPU
-            reset(g)
+            reset(gpool)
             
         end
 
-        % compute the gradient and loss of forward modelling
-        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(this, parameters, data, mask, weights, fitting, extraData)
-        % Designed your model gradient function here
-        %
-        % For the first 6 input (this -> fitting), you MUST following the same order as above, any newly introduced variables needed to be put after fitting
-        %
-        % Input
-        % -----
-        % parameters    : structure contains all model parameters
-        % data          : N-D measured data
-        % mask          : N-D signal mask, same size as data
-        % weights       : 1D signal weights (already masked)
-        % fitting       : fitting algorithm parameters
-        % 
-            % rescale network parameter to true values
-            askadamObj = askadam();
-            % parameters = askadamObj.rescale_parameters(parameters,fitting.lb,fitting.ub,fitting.model_params);
-
-            % Masking
-            % 1st dimension: TE [real;imag]
-            % data = this.vectorise_NDto2D(data,mask).';
-            
-            % Forward model
-            [Rreal, Rimag] = this.FWD(askadamObj.rescale_parameters(parameters,fitting.lb,fitting.ub,fitting.model_params),fitting,extraData,mask);
-            % [Rreal, Rimag] = this.FWD(parameters,fitting,extraData,mask);
-            R = cat(1,Rreal,Rimag); R(isinf(R)) = 0; R(isnan(R)) = 0;
-
-            % Masking
-            R       = dlarray(R(:).',       'CB');
-            data    = dlarray(data(:).',    'CB');
-
-            % Data fidelity term
-            switch lower(fitting.lossFunction)
-                case 'l1'
-                    loss_fidelity = l1loss(R, data, weights);
-                case 'l2'
-                    loss_fidelity = l2loss(R, data, weights);
-                case 'mse'
-                    loss_fidelity = mse(R, data);
-            end
-            
-            % regularisation term
-            if fitting.lambda > 0
-                cost        = askadam.reg_TV(squeeze(parameters.(fitting.regmap)),mask,fitting.TVmode,fitting.voxelSize);
-                loss_reg    = sum(abs(cost),"all")/fitting.Nsample *fitting.lambda;
-            else
-                loss_reg = 0;
-            end
-            
-            % compute loss
-            loss = loss_fidelity + loss_reg;
-            
-            % Calculate gradients with respect to the learnable parameters.
-            % parameters = askadamObj.scale_parameters(parameters,fitting.lb,fitting.ub,fitting.model_params);
-            gradients = dlgradient(loss,parameters);
-        
-        end
-        
         % compute weights for optimisation
-        function w = compute_optimisation_weights(this,data,fitting,mask)
+        function w = compute_optimisation_weights(this,data,fitting)
         % 
         % Output
         % ------
-        % w         : 1D signal masked wegiths that matches the arrangement in masked data later on
+        % w         : ND signal masked wegiths that matches the arrangement in masked data later on
         %
             if fitting.isWeighted
                 switch lower(fitting.weightMethod)
@@ -453,12 +377,11 @@ classdef gpuGREMWI
             end
 
             w(w>1) = 1; w(w<0) = 0;
-            w = this.vectorise_NDto2D(w,mask).';
-
+            
+            % separate real/imaginary parts into 6th dim
             if fitting.isComplex
-                w = repmat(w,2,1);
+                w = repmat(w,1,1,1,1,2);
             end
-            w = w(:);
         end
 
         %% Prior estimation related functions
@@ -522,28 +445,18 @@ classdef gpuGREMWI
         %% Signal related functions
 
         % compute the forward model
-        function [Sreal, Simag] = FWD(this, pars, fitting, extraData, mask)
+        function [s] = FWD(this, pars, mask, fitting, extraData)
         % Forward model to generate GRE-MWI signal
             if nargin < 5
                 S0   = pars.S0;
                 mwf  = pars.MWF;
-                if fitting.DIMWI.isFitIWF
-                    iwf  = pars.IWF;
-                else
-                    iwf = extraData.IWF;
-                end
+                if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
                 r2sMW   = pars.R2sMW;
                 r2sIW   = pars.R2sIW;
     
-                if fitting.DIMWI.isFitR2sEW
-                    r2sEW  = pars.R2sEW;
-                end
-                if fitting.DIMWI.isFitFreqMW
-                    freqMW  = pars.freqMW;
-                end
-                if fitting.DIMWI.isFitFreqIW
-                    freqIW  = pars.freqIW;
-                end
+                if fitting.DIMWI.isFitR2sEW;    r2sEW   = pars.R2sEW;   end
+                if fitting.DIMWI.isFitFreqMW;   freqMW  = pars.freqMW;  end
+                if fitting.DIMWI.isFitFreqIW;   freqIW  = pars.freqIW;  end
                 % external effects
                 if ~fitting.isComplex % magnitude fitting
                     freqBKG = 0;                          
@@ -562,32 +475,22 @@ classdef gpuGREMWI
             else
                 
                 % mask out voxels to reduce memory
-                S0   = pars.S0(mask).';
-                mwf  = pars.MWF(mask).';
-                if fitting.DIMWI.isFitIWF
-                    iwf  = pars.IWF(mask).';
-                else
-                    iwf = extraData.IWF;
-                end
-                r2sMW   = pars.R2sMW(mask).';
-                r2sIW   = pars.R2sIW(mask).';
+                S0   = askadam.row_vector( pars.S0(mask) );
+                mwf  = askadam.row_vector( pars.MWF(mask));
+                if fitting.DIMWI.isFitIWF;      iwf = askadam.row_vector( pars.IWF(mask)); else; iwf = extraData.IWF; end
+                r2sMW   = askadam.row_vector( pars.R2sMW(mask));
+                r2sIW   = askadam.row_vector( pars.R2sIW(mask));
 
-                if fitting.DIMWI.isFitR2sEW
-                    r2sEW  = pars.R2sEW(mask).';
-                end
-                if fitting.DIMWI.isFitFreqMW
-                    freqMW  = pars.freqMW(mask).';
-                end
-                if fitting.DIMWI.isFitFreqIW
-                    freqIW  = pars.freqIW(mask).';
-                end
+                if fitting.DIMWI.isFitR2sEW;    r2sEW   = askadam.row_vector( pars.R2sEW(mask));  end
+                if fitting.DIMWI.isFitFreqMW;   freqMW  = askadam.row_vector( pars.freqMW(mask)); end
+                if fitting.DIMWI.isFitFreqIW;   freqIW  = askadam.row_vector( pars.freqIW(mask)); end
                 % external effects
                 if ~fitting.isComplex % magnitude fitting
                     freqBKG = 0;                          
                     pini    = 0;
                 else    % other fittings
-                    freqBKG = pars.dfreqBKG(mask).' + extraData.freqBKG; 
-                    pini    = pars.dpini(mask).' + extraData.pini;
+                    freqBKG = askadam.row_vector( pars.dfreqBKG(mask)) + extraData.freqBKG; 
+                    pini    = askadam.row_vector( pars.dpini(mask)) + extraData.pini;
                 end
 
                 extraData.ff    = permute(extraData.ff.',[3 1 2]);
@@ -653,7 +556,8 @@ classdef gpuGREMWI
                 Simag = sum((   S0MW .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
                                 S0IW .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
                                 S0EW .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,5);
-
+                
+                s = cat(5,Sreal,Simag);
             else
                 % voxel-based operation
                 Sreal = sum((   S0MW .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
@@ -665,8 +569,9 @@ classdef gpuGREMWI
                                 S0EW .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,3);
 
                 if ~fitting.isComplex
-                    Sreal = sqrt(Sreal.^2 + Simag.^2);
-                    Simag = 0;
+                    s = sqrt(Sreal.^2 + Simag.^2);
+                else
+                    s = cat(1,Sreal,Simag);
                 end
             end
 
@@ -686,22 +591,6 @@ classdef gpuGREMWI
             if ~fitting.DIMWI.isFitIWF && ~isfield(extraData,'IWF')
                 error('Field IWF is missing in exraData structure variable for DIMWI model');
             end
-            if (~fitting.DIMWI.isFitFreqMW || ~fitting.DIMWI.isFitFreqIW || ~fitting.DIMWI.isFitR2sEW) && ~isfield(extraData,'theta')
-                error('Field theta is missing in exraData structure variable for DIMWI model');
-            end
-            
-            if ~isfield(extraData,'ff') || (fitting.DIMWI.isFitFreqMW && fitting.DIMWI.isFitFreqIW && fitting.DIMWI.isFitR2sEW) 
-                extraData.ff = ones(dims);
-            else
-                % normalise fibre fraction
-                extraData.ff                        = bsxfun(@rdivide,extraData.ff,sum(extraData.ff,4));
-                mask = and(mask,min(~isnan(extraData.ff),[],4));
-                extraData.ff(isnan(extraData.ff))   = 0;
-
-            end
-            if ~isfield(extraData,'theta') || (fitting.DIMWI.isFitFreqMW && fitting.DIMWI.isFitFreqIW && fitting.DIMWI.isFitR2sEW) 
-                extraData.theta = zeros(dims);
-            end
             if ~isfield(extraData,'freqBKG')
                 extraData.freqBKG = zeros(dims);
                 if fitting.isComplex
@@ -713,15 +602,40 @@ classdef gpuGREMWI
                 extraData.pini = angle( data(:,:,:,1) ./ exp(1i* 2*pi*extraData.freqBKG * (this.B0*this.gyro) .* permute(this.te(1),[2 3 4 1])));
             end
 
-            if size(extraData.theta,4) ~= size(extraData.ff,4)
-                error('The last dimention of the theta map does not match the last dimension of the fibre fraction map');
-            end
-
             fields = fieldnames(extraData); for kfield = 1:numel(fields); extraData.(fields{kfield}) = single( extraData.(fields{kfield})); end
             
             % thresholding based on single compartment R2*
             [R2s0,~]    = this.R2star_trapezoidal(abs(data),this.te);
             mask        = and(mask,R2s0>this.thres_R2star);
+
+            % DIMWI
+            if ~fitting.DIMWI.isFitFreqMW || ~fitting.DIMWI.isFitFreqIW || ~fitting.DIMWI.isFitR2sEW
+                % fibre fraction
+                if isfield(extraData,'ff')
+                    extraData.ff                        = bsxfun(@rdivide,extraData.ff,sum(extraData.ff,4));
+                    mask                                = and(mask,min(~isnan(extraData.ff),[],4));
+                    extraData.ff(isnan(extraData.ff))   = 0;
+                else
+                    error('Fibre fraction map is required for DIMWI!');
+                end
+                % fibre orientation
+                if ~isfield(extraData,'theta')
+                    if ~isfield(extraData,'fo')
+                        error('Fibre orientation map is required for DIMWI!');
+                    else
+                        fo    = double(extraData.fo); % fibre orientation w.r.t. B0
+                        theta = zeros(size(extraData.ff));
+                        for kfo = 1:size(fo,5)
+                            theta(:,:,:,kfo) = this.AngleBetweenV1MapAndB0(fo(:,:,:,:,kfo),this.B0dir);
+                        end
+                        extraData.theta = single(theta);
+                        extraData = rmfield(extraData,"fo");
+                    end
+                end
+            else
+                extraData.theta = zeros(dims,'single');
+                extraData.ff    = ones(dims,'single');
+            end
 
         end
 
@@ -826,7 +740,7 @@ classdef gpuGREMWI
 
         %% Utilities
         % check and set default fitting algorithm parameters
-        function fitting2 = check_set_default(fitting)
+        function fitting2 = check_set_default(fitting,data)
             % get basic fitting setting check
             fitting2 = askadam.check_set_default_basic(fitting);
 
@@ -858,6 +772,14 @@ classdef gpuGREMWI
             % get customised fitting setting check
             if ~isfield(fitting,'regmap')
                 fitting2.regmap = 'MWF';
+            end
+
+            if ~isfield(fitting,'isComplex')
+                fitting2.isComplex = true;
+            end
+
+            if isreal(data)
+                fitting.isComplex = false; 
             end
 
         end
@@ -911,52 +833,6 @@ classdef gpuGREMWI
 
             disp('------------------------------------');
 
-        end
-
-        % vectorise 4D image to 2D with the same last dimention
-        function [data, mask_idx] = vectorise_4Dto2D(data,mask)
-
-            dims = size(data,[1 2 3]);
-
-            if nargin < 2
-                mask = ones(dims);
-            end
-
-             % vectorise data
-            data        = reshape(data,prod(dims),size(data,4));
-            mask_idx    = find(mask>0);
-            data        = data(mask_idx,:);
-
-            if ~isreal(data)
-                data = cat(2,real(data),imag(data));
-            end
-
-        end
-
-         % vectorise N-D image to 2D with the 1st dimension=spataial dimension and 2nd dimension=combine from 4th and onwards 
-        function [data, mask_idx] = vectorise_NDto2D(data,mask)
-
-            dims = size(data,[1 2 3]);
-
-            if nargin < 2
-                mask = ones(dims);
-            end
-
-             % vectorise data
-            data        = reshape(data,prod(dims),prod(size(data,4:ndims(data))));
-            mask_idx    = find(mask>0);
-            data        = data(mask_idx,:);
-
-            if ~isreal(data)
-                data = cat(2,real(data),imag(data));
-            end
-
-        end
-
-        function st = cell2str(cellStr)
-            cellStr= cellfun(@(x){[x ',']},cellStr);  % Add ',' after each string.
-            st = cat(2,cellStr{:});  % Convert to string
-            st(end) = [];  % Remove last ','
         end
 
         function theta = AngleBetweenV1MapAndB0(v1,b0dir)

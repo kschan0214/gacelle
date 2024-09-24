@@ -1,23 +1,28 @@
-classdef gpuNEXI
+classdef gpuNEXI < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 8 Dec 2023 (v0.1.0)
 % Date modified: 29 March 2024 (v0.2.0)
 % Date modified: 4 April 2024 (v0.3.0)
+% Date modified: 20 August 2024 (v0.4.0)
 
     properties
         % default model parameters and estimation boundary
+        % fa        : Neurite volume fraction
+        % Da        : longitudinal diffusivity of neurite [ms/us^2]
+        % De        : diffusivity of extracellular water [ms/us^2]
+        % ra        : exchange rate from neurite to extracellular space [1/s]
+        % p2        : non-linear neurite dispersion index
         model_params    = {'fa','Da','De','ra','p2'};
         ub              = [   1,   3,   3,   1,  1];
         lb              = [ eps, eps, eps,1/250, eps];
+        startpoint      = [ 0.4,   2,   1, 0.05, 0.2];
     end
 
     properties (GetAccess = public, SetAccess = protected)
         b;
         Delta;  
         Nav;
-        askadamObj;
-        utilityDWIObj;
     end
     
     methods
@@ -55,9 +60,6 @@ classdef gpuNEXI
         %  Dmitry Novikov (dmitry.novikov@nyulangone.org)
         %  Copyright (c) 2023 New York University
             
-            this.askadamObj     = askadam();
-            this.utilityDWIObj  = DWIutility();
-
             this.b      = b(:) ;
             this.Delta  = Delta(:) ;
             if nargin > 2
@@ -68,9 +70,40 @@ classdef gpuNEXI
             this.Nav = this.Nav(:) ;
         end
         
+        % update properties according to lmax
+        function this = updateProperty(this, fitting)
+
+            % DIMWI
+            if fitting.lmax == 0
+                idx = find(ismember(this.model_params,'p2'));
+                this.model_params(idx)    = [];
+                this.lb(idx)              = [];
+                this.ub(idx)              = [];
+                this.startpoint(idx)      = [];
+            end
+
+        end
+
+        % display some info about the input data and model parameters
+        function display_data_model_info(this)
+
+            disp('========================');
+            disp('NEXI with askAdam solver');
+            disp('========================');
+
+            disp('----------------')
+            disp('Data Information');
+            disp('----------------')
+            fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
+            fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
+
+            fprintf('\n')
+
+        end
+
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out, fa, Da, De, ra, p2] = estimate(this, dwi, mask, extradata, fitting, pars0)
+        function  [out] = estimate(this, dwi, mask, extradata, fitting, pars0)
         % Perform NEXI model parameter estimation based on askAdam
         % Input data are expected in multi-dimensional image
         % 
@@ -97,54 +130,41 @@ classdef gpuNEXI
         % p2        : dispersion index (if fitting.lax=2)
         % 
             
-            disp('========================');
-            disp('NEXI with askAdam solver');
-            disp('========================');
-
-            disp('----------------')
-            disp('Data Information');
-            disp('----------------')
-            fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
-            fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
+            % display basic info
+            this.display_data_model_info;
 
             % get all fitting algorithm parameters 
             fitting = this.check_set_default(fitting);
 
+            % get matrix size
+            dims = size(dwi,1:3);
+
+            %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             dwi = this.prepare_dwi_data(dwi,extradata,fitting.lmax);
 
             % mask sure no nan or inf
-            [dwi,mask] = this.askadamObj.remove_img_naninf(dwi,mask);
+            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
 
-            % get matrix size
-            dims = size(dwi);
-
-            % check prior input
-            if nargin < 6
-                pars0 = [];
-            end
-            if and(fitting.isPrior,isempty(pars0))
-                pars0 = this.estimate_prior(dwi, mask, [], fitting.lmax);
-            end
+            % if no pars input at all (not even empty) then use prior
+            if nargin < 6; pars0 = []; end
 
             % convert datatype to single
             dwi     = single(dwi);
             mask    = mask >0;
             if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
 
+            %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
+
+            %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
             % determine if we need to divide the data to fit in GPU
             g = gpuDevice; reset(g);
             memoryFixPerVoxel       = 0.0013;   % get this number based on mdl fit
             memoryDynamicPerVoxel   = 0.05;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = this.askadamObj.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
             out = [];
-            fa = zeros(dims(1:3),'single');
-            Da = zeros(dims(1:3),'single');
-            De = zeros(dims(1:3),'single');
-            ra = zeros(dims(1:3),'single');
-            p2 = zeros(dims(1:3),'single');
             for ks = 1:NSegment
 
                 fprintf('Running #Segment = %d/%d \n',ks,NSegment);
@@ -164,26 +184,22 @@ classdef gpuNEXI
                 else;               pars0_tmp = [];                 end
 
                 % run fitting
-                if fitting.lmax >0
-                    [out_tmp, fa(:,:,slice), Da(:,:,slice), De(:,:,slice), ra(:,:,slice), p2(:,:,slice)]    = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
-                else
-                    [out_tmp, fa(:,:,slice), Da(:,:,slice), De(:,:,slice), ra(:,:,slice)]                   = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
-                    p2 = [];
-                end
+                [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
 
                 % restore 'out' structure from segment
-                out = this.askadamObj.restore_segment_structure(out,out_tmp,slice,ks);
+                out = askadam.restore_segment_structure(out,out_tmp,slice,ks);
 
             end
             out.mask = mask;
+            %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
-            this.askadamObj.save_askadam_output(fitting.output_filename,out)
+            askadam.save_askadam_output(fitting.output_filename,out)
 
         end
 
         % Data fitting function, can be 2D (voxel-based) or 4D (image-based)
-        function [out, fa, Da, De, ra, p2] = fit(this,dwi,mask,fitting,pars0)
+        function [out] = fit(this,dwi,mask,fitting,pars0)
         %
         % Input
         % -----------
@@ -237,146 +253,64 @@ classdef gpuNEXI
         %
             
             % check GPU
-            g = gpuDevice;
+            gpool = gpuDevice;
             
             % get image size
-            dims = size(dwi);
+            dims = size(dwi,1:3);
 
             %%%%%%%%%%%%%%%%%%%% 1. Validate and parse input %%%%%%%%%%%%%%%%%%%%
-            if nargin < 3 || isempty(mask)
-                % if no mask input then fit everthing
-                mask = ones(dims);
-            else
-                % if mask is 3D
-                if ndims(mask) < 4
-                    mask = repmat(mask,[1 1 1 dims(4)]);
-                end
-            end
-
-            if nargin < 4
-                fitting = struct();
-            end
-
+            if nargin < 3 || isempty(mask); mask = ones(dims,'logical'); end % if no mask input then fit everthing
+            if nargin < 4; fitting = struct(); end
             % set initial tarting points
-            if nargin < 5
-                % no initial starting points
-                pars0 = [];
+            if nargin < 5; pars0 = []; % no initial starting points
             else
-                for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
             end
 
             % get all fitting algorithm parameters 
-            fitting         = this.check_set_default(fitting);
-            fitting.Nsample = numel(mask(mask ~= 0)) / dims(4); 
-
-            % determine how many model parameters
-            if      fitting.lmax == 0;  fitting.model_params = this.model_params(1:4);
-            elseif  fitting.lmax == 2;  fitting.model_params = this.model_params;     end
-
+            fitting                 = this.check_set_default(fitting);
+            % determine fitting parameters
+            this                    = this.updateProperty(fitting);
+            fitting.model_params    = this.model_params;
             % set fitting boundary if no input from user
             if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
             if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
-
-            % put data input gpuArray
-            mask = gpuArray(logical(mask));  
-            dwi  = gpuArray(single(dwi));
             
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
             %%%%%%%%%%%%%%%%%%%% 2. Setting up all necessary data, run askadam and get all output %%%%%%%%%%%%%%%%%%%%
             % 2.1 setup fitting weights
-            w = this.compute_optimisation_weights(mask,dims,fitting.lossFunction,fitting.lmax); % This is a customised funtion
-            w = dlarray(gpuArray(w).','CB');
+            w = this.compute_optimisation_weights(mask,fitting.lossFunction,fitting.lmax); % This is a customised funtion
 
-            % 2.2 display optimisation algorithm parameters
-            this.askadamObj.display_basic_fitting_parameters(fitting);
+            % 2.2 estimate prior if needed
+            if and(fitting.isPrior,isempty(pars0)); pars0 = this.estimate_prior(dwi, mask,[],fitting.lmax); end
+
             % You may add more dispay messages here
+            disp('Model:')
             disp(['lmax                     = ' num2str(fitting.lmax)]);
+
+            % mask out data to reduce memory load
+            dwi    = askadam.vectorise_NDto2D(dwi,mask).';
+            if ~isempty(w); w = askadam.vectorise_NDto2D(w,mask).'; end
             
             % 2.3 askAdam optimisation main
-            out = this.askadamObj.optimisation(pars0, @this.modelGradients, dwi, mask, w, fitting);
-
-            % 2.4 organise output
-            p2 = [];
-            fa = out.final.fa;
-            Da = out.final.Da;
-            De = out.final.De;
-            ra = out.final.ra;
-            if fitting.lmax == 2
-                p2 = out.final.p2;
-            end
+            askadamObj = askadam();
+            % initiate starting points arrays
+            out     = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
             disp('The process is completed.')
             
             % clear GPU
-            reset(g)
+            reset(gpool)
             
         end
 
-        % compute the gradient and loss of forward modelling
-        function [gradients,loss,loss_fidelity,loss_reg] = modelGradients(this, parameters, data, mask, weights, fitting)
-        % Designed your model gradient function here
-        %
-        % For the first 6 input (this -> fitting), you MUST following the same order as above, any newly introduced variables needed to be put after fitting
-        %
-        % Input
-        % -----
-        % parameters    : structure contains all model parameters
-        % data          : N-D measured data
-        % mask          : N-D signal mask, same size as data
-        % weights       : 1D signal weights (already masked)
-        % fitting       : fitting algorithm parameters
-        % 
-            % rescale network parameter to true values
-            parameters = this.askadamObj.rescale_parameters(parameters,fitting.lb,fitting.ub,fitting.model_params);
-            
-            mask        = this.utilityDWIObj.permute_dwi_dimension(mask);
-            data        = this.utilityDWIObj.permute_dwi_dimension(data);
-            parameters  = this.utilityDWIObj.permute_dwi_dimension(parameters);
+        %% Data preparation
 
-            % Forward model
-            % R           = this.FWD(parameters,fitting);
-            R           = this.FWD(parameters,fitting,mask(1,:,:,:));
-            R(isinf(R)) = 0;
-            R(isnan(R)) = 0;
-
-            % Masking
-            % R   = dlarray(R(mask>0).',     'CB');
-            R       = dlarray(R(:).',           'CB');
-            data    = dlarray(data(mask>0).',    'CB');
-
-            % Data fidelity term
-            switch lower(fitting.lossFunction)
-                case 'l1'
-                    loss_fidelity = l1loss(R, data, weights);
-                case 'l2'
-                    loss_fidelity = l2loss(R, data, weights);
-                case 'mse'
-                    loss_fidelity = mse(R, data);
-            end
-            
-            % regularisation term
-            if fitting.lambda > 0
-                cost        = this.askadamObj.reg_TV(squeeze(parameters.(fitting.regmap)),squeeze(mask(1,:,:,:)),fitting.TVmode,fitting.voxelSize);
-                loss_reg    = sum(abs(cost),"all")/fitting.Nsample *fitting.lambda;
-            else
-                loss_reg = 0;
-            end
-            
-            % compute loss
-            loss = loss_fidelity + loss_reg;
-
-            parameters  = this.utilityDWIObj.unpermute_dwi_dimension(parameters);
-            
-            % Calculate gradients with respect to the learnable parameters.
-            gradients = dlgradient(loss,parameters);
-        
-        end
-        
         % compute weights for optimisation
-        function w = compute_optimisation_weights(this,mask,dims,lossFunction,lmax)
+        function w = compute_optimisation_weights(this,mask,lossFunction,lmax)
         % 
         % Output
         % ------
@@ -384,7 +318,8 @@ classdef gpuNEXI
         %
             % lmax dependent weights
             l = 0:2:lmax;
-            w = zeros(dims,'single');
+            w = zeros([size(mask) numel(this.b)*numel(l)],'single');
+            % w = zeros(dims,'single');
             for kl = 1:(lmax/2+1)
                 for kb = 1:numel(this.b)
                     w(:,:,:,(kl-1)*numel(this.b)+kb) = this.Nav(kb) / (2*l(kl)+1);
@@ -395,11 +330,6 @@ classdef gpuNEXI
                 w = sqrt(w);
             end
             w = w ./ max(w(:));
-            
-            % mathcing dimension to the signal generated in modelGradients
-            w       = permute(w,[4 1 2 3]);
-            mask    = permute(mask,[4 1 2 3]);
-            w = w(mask>0);
         end
 
         % compute rotationally invariant DWI signal if necessary
@@ -413,8 +343,8 @@ classdef gpuNEXI
                 if numel(extradata.ldelta) == 1
                     extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
                 end
-
-                [dwi]   = this.utilityDWIObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
+                DWIutilityObj = DWIutility();
+                [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
 
                 fprintf('done.\n');
 
@@ -423,7 +353,7 @@ classdef gpuNEXI
             end
         end
 
-        %% Prior estimation related functions
+        %%%%% Prior estimation related functions %%%%%
         % using maximum likelihood method to estimate starting points
         function pars0 = estimate_prior(this,dwi,mask, Nsample,lmax)
         % Estimation starting points for NEXI using likehood method
@@ -471,13 +401,14 @@ classdef gpuNEXI
             pars           = permute(reshape(pars,[size(pars,1) dims(1:3)]),[2 3 4 1]);
 
             % Correction for CSF
-            idx             = this.b < 4;
-            D0              = this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:));
+            bval_thres      = max(min(gather(this.b)),1.1);
+            idx             = gather(this.b) <= bval_thres;
+            D0              = real(this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:)));
             D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
             D0(isnan(D0))   = 0;
             D0(isinf(D0))   = 0;
             D0(D0<0)        = 0;
-            mask_CSF        = medfilt3(D0)>1;
+            mask_CSF        = D0>1.5;
             
             % ratio to modulate pars0 estimattion
             pars0_csf = [0.01,1,1,0.01,0.01];
@@ -592,19 +523,19 @@ classdef gpuNEXI
 
         %% NEXI signal related functions
         % compute the forward model
-        function [s] = FWD(this, pars, fitting,mask)
+        function [s] = FWD(this, pars, mask, lmax)
         % Forward model to generate NEXI signal
-            if nargin < 4
+            if isempty(mask)
                 fa   = pars.fa;
                 Da   = pars.Da;
                 De   = pars.De;
                 ra   = pars.ra;
             else
                 % mask out voxels to reduce memory
-                fa   = pars.fa(mask(1,:,:,:)).';
-                Da   = pars.Da(mask(1,:,:,:)).';
-                De   = pars.De(mask(1,:,:,:)).';
-                ra   = pars.ra(mask(1,:,:,:)).';
+                fa   = askadam.row_vector(pars.fa(mask));
+                Da   = askadam.row_vector(pars.Da(mask));
+                De   = askadam.row_vector(pars.De(mask));
+                ra   = askadam.row_vector(pars.ra(mask));
             end
                 
             % Forward model
@@ -612,11 +543,11 @@ classdef gpuNEXI
             s = this.Sl0(fa, Da, De, ra);
             
             % Sl2
-            if fitting.lmax == 2
-                if nargin < 4
+            if lmax == 2
+                if isempty(mask)
                     p2 = pars.p2;
                 else
-                    p2 = pars.p2(mask(1,:,:,:)).';
+                    p2 = askadam.row_vector(pars.p2(mask));
                 end
 
                 s = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
@@ -701,6 +632,10 @@ classdef gpuNEXI
             end
             if ~isfield(fitting,'lmax')
                 fitting2.lmax = 0;
+            end
+
+            if ~iscell(fitting2.regmap)
+                fitting2.regmap = cellstr(fitting2.regmap);
             end
 
         end

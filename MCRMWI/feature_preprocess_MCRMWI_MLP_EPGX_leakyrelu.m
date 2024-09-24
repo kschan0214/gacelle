@@ -41,9 +41,9 @@ if isscalar(kiewmw)
     kiewmw = ones(numSample,1) * kiewmw;
 end
 
-if isscalar(tr)
-    tr = ones(numSample,1) * tr;
-end
+% if isscalar(tr)
+%     tr = ones(numSample,1) * tr;
+% end
 
 if isscalar(fa)
     fa = ones(numSample,1) * fa;
