@@ -127,7 +127,7 @@ classdef gpuNEXImcmc < handle
             dwi = this.prepare_dwi_data(dwi,extradata,fitting.lmax);
 
             % mask sure no nan or inf
-            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
+            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -476,6 +476,9 @@ classdef gpuNEXImcmc < handle
                 De   = pars.De;
                 ra   = pars.ra;
             end
+
+            % avoid division by zeros in computing re
+            fa = min(fa,1-askadam.epsilon);
                 
             % Forward model
             if lmax == 2

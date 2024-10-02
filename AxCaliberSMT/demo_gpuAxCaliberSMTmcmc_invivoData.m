@@ -14,18 +14,18 @@ addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/askadam')); % thi
 clear;
 
 %% I/O: Load data
-data_dir = '/autofs/cluster/connectome2/Bay8_C2/bids/derivatives/processed_dwi/sub-010';
+data_dir = '/path/to/your/bids/derivatives/processed_dwi/sub-<label>';
 
 % Nb: # of unique b-value per little delta per big delta
 % Nd: # of unique little delta
 % ND: # of unique big delta
 
-dwi     = niftiread(fullfile(data_dir, 'sub-010_dwi.nii.gz'));                      % full DWI data 
-mask    = niftiread(fullfile(data_dir, 'sub-010_brain_mask.nii.gz'))>0;             % signal mask
-bval    = readmatrix(fullfile(data_dir,'sub-010.bval'),         'FileType','text'); % 1x(Nb*Nd*ND) b-values, same length as the 4th dimension dwi
-bvec    = readmatrix(fullfile(data_dir,'sub-010.bvec'),         'FileType','text'); % 3x(Nb*Nd*ND) gradient directions, 2nd dimension has the same length as the 4th dimension dwi
-ldelta  = readmatrix(fullfile(data_dir,'sub-010.pulseWidth'),   'FileType','text'); % 1x(Nb*Nd*ND) little delta, same length as the 4th dimension dwi
-BDELTA  = readmatrix(fullfile(data_dir,'sub-010.diffusionTime'),'FileType','text'); % 1x(Nb*Nd*ND) big delta, same length as the 4th dimension dwi
+dwi     = niftiread(fullfile(data_dir, 'sub-<label>_dwi.nii.gz'));                      % full DWI data 
+mask    = niftiread(fullfile(data_dir, 'sub-<label>_brain_mask.nii.gz'))>0;             % signal mask
+bval    = readmatrix(fullfile(data_dir,'sub-<label>.bval'),         'FileType','text'); % 1x(Nb*Nd*ND) b-values, same length as the 4th dimension dwi
+bvec    = readmatrix(fullfile(data_dir,'sub-<label>.bvec'),         'FileType','text'); % 3x(Nb*Nd*ND) gradient directions, 2nd dimension has the same length as the 4th dimension dwi
+ldelta  = readmatrix(fullfile(data_dir,'sub-<label>.pulseWidth'),   'FileType','text'); % 1x(Nb*Nd*ND) little delta, same length as the 4th dimension dwi
+BDELTA  = readmatrix(fullfile(data_dir,'sub-<label>.diffusionTime'),'FileType','text'); % 1x(Nb*Nd*ND) big delta, same length as the 4th dimension dwi
 
 %% Algorithm parameters
 bval        = bval/1e3; % s/mm2 to ms/um2

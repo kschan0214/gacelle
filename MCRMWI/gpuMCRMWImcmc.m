@@ -245,7 +245,7 @@ classdef gpuMCRMWImcmc < handle
             [data, scaleFactor] = this.prepare_data(data,mask, extraData.b1);
 
             % mask sure no nan or inf
-            [data,mask] = askadam.remove_img_naninf(data,mask);
+            [data,mask] = utils.remove_img_naninf(data,mask);
 
             % convert datatype to single
             data    = single(data);
@@ -380,7 +380,7 @@ classdef gpuMCRMWImcmc < handle
 
             % split data into real and imaginary parts for complex-valued data
             if fitting.isComplex; data = cat(6,real(data),imag(data)); end
-            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( askadam.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
+            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
 
             % if GW algorithm then replicates Nwalker copies
             if strcmpi(fitting.algorithm,'gw')
@@ -635,7 +635,7 @@ classdef gpuMCRMWImcmc < handle
                     % freqBKG = pars.dfreqBKG + extraData.freqBKG; 
                     freqBKG = extraData.freqBKG;
                     for k = 1:size(extraData.freqBKG,1)
-                        freqBKG(k,:) = freqBKG(k,:) + askadam.row_vector(pars.(['dfreqBKG' num2str(k)]));
+                        freqBKG(k,:) = freqBKG(k,:) + utils.row_vector(pars.(['dfreqBKG' num2str(k)]));
                     end
                     pini    = pars.dpini + extraData.pini;
                 end
@@ -651,18 +651,18 @@ classdef gpuMCRMWImcmc < handle
     
             else
                 % mask out voxels to reduce memory
-                S0   = askadam.row_vector(pars.S0);
-                mwf  = askadam.row_vector(pars.MWF);
-                if fitting.DIMWI.isFitIWF;  iwf  = askadam.row_vector(pars.IWF); else; iwf = extraData.IWF; end
-                r2sMW   = askadam.row_vector(pars.R2sMW);
-                r2sIW   = askadam.row_vector(pars.R2sIW);
-                r1iew   = askadam.row_vector(pars.R1IEW);
+                S0   = utils.row_vector(pars.S0);
+                mwf  = utils.row_vector(pars.MWF);
+                if fitting.DIMWI.isFitIWF;  iwf  = utils.row_vector(pars.IWF); else; iwf = extraData.IWF; end
+                r2sMW   = utils.row_vector(pars.R2sMW);
+                r2sIW   = utils.row_vector(pars.R2sIW);
+                r1iew   = utils.row_vector(pars.R1IEW);
 
-                if fitting.isFitExchange;       kiewm   = askadam.row_vector(pars.kIEWM);     end
+                if fitting.isFitExchange;       kiewm   = utils.row_vector(pars.kIEWM);     end
     
-                if fitting.DIMWI.isFitR2sEW;    r2sEW   = askadam.row_vector(pars.R2sEW);     end
-                if fitting.DIMWI.isFitFreqMW;   freqMW  = askadam.row_vector(pars.freqMW);    end
-                if fitting.DIMWI.isFitFreqIW;   freqIW  = askadam.row_vector(pars.freqIW);    end
+                if fitting.DIMWI.isFitR2sEW;    r2sEW   = utils.row_vector(pars.R2sEW);     end
+                if fitting.DIMWI.isFitFreqMW;   freqMW  = utils.row_vector(pars.freqMW);    end
+                if fitting.DIMWI.isFitFreqIW;   freqIW  = utils.row_vector(pars.freqIW);    end
                 % external effects
                 if ~fitting.isComplex % magnitude fitting
                     freqBKG = 0;                          
@@ -676,10 +676,10 @@ classdef gpuMCRMWImcmc < handle
                     % TODO: add Nwalker for MCMC
                     freqBKG = extraData.freqBKG;
                     for k = 1:size(extraData.freqBKG,1)
-                        freqBKG(k,:) = freqBKG(k,:) + askadam.row_vector(pars.(['dfreqBKG' num2str(k)]));
+                        freqBKG(k,:) = freqBKG(k,:) + utils.row_vector(pars.(['dfreqBKG' num2str(k)]));
                     end
                     freqBKG = shiftdim(freqBKG.',dshift) ; 
-                    pini    = askadam.row_vector(pars.dpini) + extraData.pini;
+                    pini    = utils.row_vector(pars.dpini) + extraData.pini;
                 end
 
                 extraData.ff    = permute(extraData.ff,[3 2 4 1]);

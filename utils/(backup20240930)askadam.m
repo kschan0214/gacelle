@@ -46,7 +46,7 @@ classdef askadam < handle
         % 
         % end
 
-        function [gradients,loss,loss_fidelity,loss_reg,residuals] = modelGradient(this, parameters, data, mask, weights, fitting, FWDfunc, varargin)
+        function [gradients,loss,loss_fidelity,loss_reg] = modelGradient(this, parameters, data, mask, weights, fitting, FWDfunc, varargin)
         % Input
         % ----------
         % parameters    : Structure variable containing all parameters to be estimated
@@ -76,15 +76,14 @@ classdef askadam < handle
             % Data fidelity term
             switch lower(fitting.lossFunction)
                 case 'l1'
-                    residuals = l1loss(signal_FWD, data, weights, Reduction="none");
+                    loss_fidelity = l1loss(signal_FWD, data, weights);
                 case 'l2'
-                    residuals = l2loss(signal_FWD, data, weights, Reduction="none");
+                    loss_fidelity = l2loss(signal_FWD, data, weights);
                 case 'huber'
-                    residuals = huber(signal_FWD, data, weights, Reduction="none");
+                    loss_fidelity = huber(signal_FWD, data, weights);
                 case 'mse'
-                    residuals = mse(signal_FWD, data, Reduction="none");
+                    loss_fidelity = mse(signal_FWD, data);
             end
-            loss_fidelity = mean(residuals);
 
             % regularisation term
             loss_reg = 0;
@@ -109,7 +108,7 @@ classdef askadam < handle
         function out = optimisation(this, data, mask, weights, parameters, fitting, FWDfunc, varargin)
         % Input
         % -----
-        % data                  : 2-D (vectorised imaging) data
+        % data                  : N-D (imaging) data
         % mask                  : (1-3)D signal mask applied on FWDfunc, NOTE this mask does NOT apply on data
         % weights               : N-D wieghts, same dimension as 'data' (optional)
         % parameters            : structure variable containing starting points of all model parameters to be estimated (optional)
@@ -136,23 +135,12 @@ classdef askadam < handle
 
             dims = size(mask,1:3);
 
-            % data can be either 2D or ND, if ND then convert to 2D here
-            if ~ismatrix(data)
-                data = utils.vectorise_NDto2D(data, mask).';
-            end
-            if ~ismatrix(weights)
-                weights = utils.vectorise_NDto2D(weights, mask).';
-            end
-
-            % the first dimension must be 'measurement' and second dimension 'voxel'
-            [Nmeas,Nvol] = size(data);
-
             % check and set fitting default
             fitting = this.check_set_default_basic(fitting);
             
             % put data into gpuArray
             mask    = gpuArray(logical(mask)); 
-            data    = gpuArray(single(data)); 
+            data    = gpuArray(single(data));
             if ~isempty(weights); weights = gpuArray(single(weights)); else; weights = ones(size(data),'like',data); end
             % vectorise input data
             data    = dlarray(data(:).',    'CB');
@@ -169,11 +157,6 @@ classdef askadam < handle
             averageGrad     = [];
             averageSqGrad   = [];
             vel             = [];
-            % 
-            % gradientThreshold   = []; %1.0; % Initial threshold
-            movingAvgFactor     = 0.9; % Moving average factor
-            movingAvgNorm       = []; %0; % Initialize moving average of gradient norms
-            epochsWithoutImprovement = 0;
             
             if fitting.isdisplay
                 figure
@@ -201,7 +184,7 @@ classdef askadam < handle
                 parameters = this.set_boundary01(parameters);
 
                 % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                [~,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
+                [~,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
 
                 % get loss and compute convergence value
                 loss                = double(gather(extractdata(loss)));
@@ -209,7 +192,6 @@ classdef askadam < handle
                 minLoss                 = loss;
                 minLossFidelity         = loss_fidelity;
                 minLossRegularisation   = loss_reg;
-                minResiduals            = residuals;
                 parameters_minLoss      = parameters;
             else
                 % else run optimisation
@@ -223,21 +205,15 @@ classdef askadam < handle
                     parameters = this.set_boundary01(parameters);
     
                     % Evaluate the model gradients and loss using dlfeval and the modelGradients function.
-                    [gradients,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
+                    [gradients,loss,loss_fidelity,loss_reg] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
 
                     if fitting.debug
                         isNaN = this.check_nan_in_gradients(gradients, mask);
                         if isNaN; disp('Gradients have NaN(s)!'); end
                     end
-
-                    % clipping gradients to avoid sudden big jumps
-                    % gradientThreshold   = 1; gradients           = this.clipGradients(gradients, mask, gradientThreshold);
-                    [gradients, movingAvgNorm] = this.adaptiveGradientClipping(gradients, mask, movingAvgNorm, movingAvgFactor, fitting.maxGradientThres);
-
-                    loss_nooutliers = extractdata(mean(reshape(residuals,Nmeas,Nvol),1));
-                    mask_outliers   = isoutlier(loss_nooutliers);
-                    loss_nooutliers = gather( mean(loss_nooutliers(mask_outliers==0)));
-                    
+                    % gradientThreshold = 0.1;
+                    % gradients = this.clipGradients(gradients, mask, gradientThreshold);
+                
                     % Update learning rate.
                     learningRate = fitting.initialLearnRate / (1+ fitting.decayRate*epoch);
                     
@@ -246,31 +222,17 @@ classdef askadam < handle
                     convergenceBuffer   = [convergenceBuffer(2:end);loss];
                     mc                  = A\convergenceBuffer;
                     convergenceCurr     = -mc(1);
-
-
-                    if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
-                        % when gradient > tolerance, -> improving
-                        epochsWithoutImprovement = 0;
-                    elseif minLoss > loss
-                        % when loss < min loss -> improving
-                        epochsWithoutImprovement = 0;
-                    else
-                        epochsWithoutImprovement = epochsWithoutImprovement + 1;
-                    end
     
                     % store also the results with minimal loss
                     if minLoss > loss
                         minLoss                 = loss;
                         minLossFidelity         = loss_fidelity;
                         minLossRegularisation   = loss_reg;
-                        minResiduals            = residuals;
                         parameters_minLoss      = parameters;
-                        
                     end
                     % check if the optimisation should be stopped
-                    % if convergenceCurr < fitting.convergenceValue && epoch >= fitting.convergenceWindow && epochsWithoutImprovement > fitting.patience
-                    if epochsWithoutImprovement > fitting.patience
-                        fprintf('No significant improvements as defined in fitting setup. \n');
+                    if convergenceCurr < fitting.convergenceValue && epoch >= fitting.convergenceWindow
+                        fprintf('Convergence is less than the tolerance %e \n',fitting.convergenceValue);
                         break
                     end
                     if loss < fitting.tol
@@ -278,19 +240,17 @@ classdef askadam < handle
                         break
                     end
     
-                    % Update the network parameters using the one of the following optimiser functions
-                    if epoch < fitting.iteration
-                        switch lower(fitting.optimiser)
-                            case 'adam'
-                                [parameters,averageGrad,averageSqGrad]  = adamupdate(parameters,gradients,averageGrad, ...
-                                                                                        averageSqGrad,epoch,learningRate);
-                            case 'sgdm'
-                                [parameters,vel]                        = sgdmupdate(parameters,gradients,vel, ...
-                                                                                        learningRate);
-                            case 'rmsprop'
-                                [parameters,averageSqGrad]              = sgdmupdate(parameters,gradients,averageSqGrad, ...
-                                                                                        learningRate);
-                        end
+                    % Update the network parameters using the one of the following optimiser function.
+                    switch lower(fitting.optimiser)
+                        case 'adam'
+                            [parameters,averageGrad,averageSqGrad]  = adamupdate(parameters,gradients,averageGrad, ...
+                                                                                    averageSqGrad,epoch,learningRate);
+                        case 'sgdm'
+                            [parameters,vel]                        = sgdmupdate(parameters,gradients,vel, ...
+                                                                                    learningRate);
+                        case 'rmsprop'
+                            [parameters,averageSqGrad]              = sgdmupdate(parameters,gradients,averageSqGrad, ...
+                                                                                    learningRate);
                     end
                     
                     
@@ -305,11 +265,10 @@ classdef askadam < handle
                     if mod(epoch,100) == 0 || epoch == 1
                         % display some info
                         D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                        fprintf('Iteration #%4d,     Loss = %f,     Loss (w/o outliers) = %f,   Convergence = %e,     Elapsed:%s \n',epoch,loss,loss_nooutliers,convergenceCurr,string(D));
+                        fprintf('Iteration #%4d,     Loss = %f,      Convergence = %e,     Elapsed:%s \n',epoch,loss,convergenceCurr,string(D));
                     end
                     
                 end
-                % out.final.mask_outliers = gather(utils.ND2image(mask_outliers.',mask))>0;
             end
             fprintf('Final loss         =  %e\n',double(loss));
             fprintf('Final convergence  =  %e\n',double(convergenceCurr));
@@ -323,29 +282,25 @@ classdef askadam < handle
             parameters_minLoss  = this.rescale_parameters(parameters_minLoss,   fitting.lb,fitting.ub,fitting.model_params);
             for k = 1:numel(fitting.model_params)
                 % final iteration result
-                tmp = utils.dlarray2single(parameters.(fitting.model_params{k}) .* mask); 
+                tmp = single(gather(extractdata(parameters.(fitting.model_params{k}) .* mask))); 
                 out.final.(fitting.model_params{k}) = tmp;
 
                 % minimum loss result
-                tmp = utils.dlarray2single(parameters_minLoss.(fitting.model_params{k}) .* mask); 
+                tmp = single(gather(extractdata(parameters_minLoss.(fitting.model_params{k}) .* mask))); 
                 out.min.(fitting.model_params{k}) = tmp;
             end
             out.final.loss          = loss;
-            out.final.loss_fidelity = utils.dlarray2single(loss_fidelity);
+            out.final.loss_fidelity = double(gather(extractdata(loss_fidelity)));
             out.min.loss            = minLoss;
-            out.min.loss_fidelity   = utils.dlarray2single(minLossFidelity);
+            out.min.loss_fidelity   = double(gather(extractdata(minLossFidelity)));
             if fitting.lambda{1} == 0
                 out.final.loss_reg  = 0;
                 out.min.loss_reg    = 0;
             else
-                out.final.loss_reg  = utils.dlarray2single(loss_reg);
-                out.min.loss_reg    = utils.dlarray2single(minLossRegularisation);
+                out.final.loss_reg  = double(gather(extractdata(loss_reg)));
+                out.min.loss_reg    = double(gather(extractdata(minLossRegularisation)));
             end
-            out.final.resloss   = utils.ND2image( utils.dlarray2single( mean(reshape(residuals,Nmeas,Nvol),1)).',mask);
-            out.min.resloss     = utils.ND2image( utils.dlarray2single( mean(reshape(minResiduals,Nmeas,Nvol),1)).',mask);
-            out.final.residual  = utils.dlarray2single( reshape(residuals,Nmeas,Nvol)).';
-            out.min.residual    = utils.dlarray2single( reshape(minResiduals,Nmeas,Nvol)).';
-           
+
         end
 
         % initialise network parameters
@@ -430,7 +385,8 @@ classdef askadam < handle
             % get fitting algorithm setting
             if ~isfield(fitting,'iteration');           fitting2.iteration = 4000;          end
             if isfield(fitting,'Nepoch') % legacy
-                fitting2.iteration  = fitting.Nepoch; fitting2            = rmfield(fitting2,'Nepoch');
+                fitting2.iteration  = fitting.Nepoch;
+                fitting2            = rmfield(fitting2,'Nepoch');
             end
             if ~isfield(fitting,'initialLearnRate');    fitting2.initialLearnRate = 0.01;   end
             if ~isfield(fitting,'decayRate');           fitting2.decayRate = 0;             end
@@ -449,8 +405,6 @@ classdef askadam < handle
             if ~isfield(fitting,'ub');                  fitting2.ub = [];                   end
             if ~isfield(fitting,'lb');                  fitting2.lb = [];                   end
             if ~isfield(fitting,'debug');               fitting2.debug = false;             end
-            if ~isfield(fitting,'patience');            fitting2.patience = 20;             end
-            if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres = 1;      end
 
             if ~iscell(fitting2.lambda);                fitting2.lambda = num2cell(fitting2.lambda); end
             
@@ -514,8 +468,6 @@ classdef askadam < handle
             disp(['Loss function            = ' fitting.lossFunction]);
             disp(['Loss tolerance           = ' num2str(fitting.tol)]);
             disp(['Convergence tolerance    = ' num2str(fitting.convergenceValue)]);
-            disp(['Patience                 = ' num2str( fitting.patience)]);
-            disp(['Max. gradient threshold  = ' num2str( fitting.maxGradientThres)]);
             disp(['Initial learning rate    = ' num2str(fitting.initialLearnRate)]);
             disp(['Learning rate decay rate = ' num2str( fitting.decayRate)]);
             if fitting.lambda{1} > 0 
@@ -677,41 +629,11 @@ classdef askadam < handle
             for k = 1:numel(fields)
                 % masking
                 gradNorm        = sqrt(sum( utils.vectorise_NDto2D(gradients.(fields{k}),mask) .^2));
-                if gradNorm > threshold
-                    gradients.(fields{k})(gradients.(fields{k})>threshold) = gradients.(fields{k})(gradients.(fields{k})>threshold) * (threshold / gradNorm);
-                    % gradients.(fields{k}) = gradients.(fields{k}) * (threshold / gradNorm);
+                if isnan(gradNorm)
+                    gradients.(fields{k})(isnan(gradients.(fields{k}))) = 1e-6; 
                 end
-            end
-
-        end
-
-        function [gradients, movingAvgNorm] = adaptiveGradientClipping(gradients, mask, movingAvgNorm, movingAvgFactor, maxGradientThres)
-
-            if nargin < 5
-                maxGradientThres = 1;
-            end
-
-            % get field name
-            fields = fieldnames(gradients);
-
-            if isempty(movingAvgNorm);        for k = 1:numel(fields); movingAvgNorm.(fields{k}) = maxGradientThres; end; end
-            % if isempty(gradientThreshold);    for k = 1:numel(fields); gradientThreshold.(fields{k})  = 1; end; end
-
-
-            % loop all parameters
-            for k = 1:numel(fields)
-                % masking and get gradient norm
-                gradNorm        = sqrt(sum( utils.vectorise_NDto2D(gradients.(fields{k}),mask) .^2));
-                % compute moving norm
-                movingAvgNorm.(fields{k})   = movingAvgFactor * movingAvgNorm.(fields{k}) + (1 - movingAvgFactor) * gradNorm;
-                gradientThreshold           = min(movingAvgNorm.(fields{k}),maxGradientThres); % movingAvgNorm.(fields{k}); Update threshold
-
-                if any(gradNorm > gradientThreshold)
-                    mask_outliers = gradients.(fields{k}) > permute(gradientThreshold(:),[2 3 4 1]);
-                    tmp = gradients.(fields{k}) .* permute(gradientThreshold ./ gradNorm,[1 3 4 2]);
-                    gradients.(fields{k})(mask_outliers) = tmp(mask_outliers);
-                    % gradients.(fields{k})(mask_outliers) = gradients.(fields{k})(mask_outliers) .* permute(gradientThreshold ./ gradNorm,[1 3 4 2]);
-                    % gradients.(fields{k}) = gradients.(fields{k}) * (gradientThreshold / gradNorm);
+                if gradNorm > threshold
+                    gradients.(fields{k}) = gradients.(fields{k}) * (threshold / gradNorm);
                 end
             end
 

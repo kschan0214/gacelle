@@ -1,4 +1,4 @@
-classdef gpuAxCaliberSMT
+classdef gpuAxCaliberSMT < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 1 Apr 2024 
@@ -156,7 +156,7 @@ classdef gpuAxCaliberSMT
             dwi = this.prepare_dwi_data(dwi,extradata,0);
 
             % mask sure no nan or inf in data
-            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
+            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -289,8 +289,8 @@ classdef gpuAxCaliberSMT
             % 2.2 estimate prior if neede
             if and(fitting.isPrior,isempty(pars0)); pars0 = this.estimate_prior(dwi, mask); end
 
-            dwi    = askadam.vectorise_NDto2D(dwi,mask).';
-            if ~isempty(w); w = askadam.vectorise_NDto2D(w,mask).'; end
+            dwi    = utils.vectorise_NDto2D(dwi,mask).';
+            if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
 
             % 2.3 askAdam optimisation main
             askadamObj  = askadam(); model = fitting.model;
@@ -507,6 +507,9 @@ classdef gpuAxCaliberSMT
         %%  Signal related functions
         % copmpute the forward model
         function s = FWD(this, pars, mask, model)
+
+            mask  = mask>0;
+            
         % Forward model to generate AxCaliberSMT signal
             if isempty(mask)
                 r       = pars.a/2;
@@ -515,23 +518,23 @@ classdef gpuAxCaliberSMT
                 DeR     = pars.DeR;
             else
                 % mask out voxels to reduce memory
-                r       = askadam.row_vector(pars.a(mask))/2;
-                f       = askadam.row_vector(pars.f(mask));
-                fcsf    = askadam.row_vector(pars.fcsf(mask));
-                DeR     = askadam.row_vector(pars.DeR(mask));
+                r       = utils.row_vector(pars.a(mask))/2;
+                f       = utils.row_vector(pars.f(mask));
+                fcsf    = utils.row_vector(pars.fcsf(mask));
+                DeR     = utils.row_vector(pars.DeR(mask));
             end
                 
             % Forward model
             % 1. Intra-cellular signal
-            switch model
-                case 'Neuman'
+            switch lower(model)
+                case 'neuman'
                     C = this.neuman(r);
-                case 'VanGelderen'
+                case 'vangelderen'
                     C = this.vg2(r);    % less memory efficient but faster
             end
             Sa = sqrt(pi./(4*(this.b*this.Da - C))) .* exp(-C) .* erf(sqrt(this.b*this.Da - C));
             % 2. Extra-cellular signal
-            dDe = (this.DeL - DeR); dDe = max(dDe,0); %dDe(dDe<0) = 0;
+            dDe = (this.DeL - DeR); dDe = max(dDe,askadam.epsilon); %dDe(dDe<0) = 0;    % avoid division by zeros
             Se = sqrt(pi./(4.*(dDe).*this.b)) .* exp(-this.b.*DeR) .* erf(sqrt(this.b .*(dDe)));
             % Combined signal
             s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;

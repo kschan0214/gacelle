@@ -24,8 +24,8 @@ function S = Example_monoexponential_FWD_askadam( pars, mask, t)
 t = t(:);
 
 % convert S0 and R2star into row vectors for matrix multiplication
-S0      = askadam.row_vector(pars.S0(mask));
-R2star  = askadam.row_vector(pars.R2star(mask));
+S0      = utils.row_vector(pars.S0(mask));
+R2star  = utils.row_vector(pars.R2star(mask));
 
 % compute S, as [NtxNvoxel] matrix
 S = S0 .* exp(-t.*R2star);

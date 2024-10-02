@@ -78,6 +78,8 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | fitting                   | Structure array for model parameter estimation                                                               |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting.optimiser         | Algorithm for parameter update, 'adam' (default) | 'sgdm' | 'rmsprop'                                        |
++---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.isdisplay         | boolean, display optimisation process in graphic plot                                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation                                                          |
@@ -94,14 +96,25 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.regmap            | model parameter(s) in which regularisation is applied                                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D'|'3D'                                                      |
+| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D' | '3D'                                                    |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lossFunction      | loss function, 'L1'|'L2'|'huber'|'mse'                                                                       |
+| fitting.lossFunction      | loss function, 'L1' | 'L2' | 'huber' | 'mse'                                                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.isPrior           | Starting point estimated based on likelihood method instead of fix/random location                           |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 
-See example here.
+Example
+^^^^^^^
+
+Example script for noise propagation:
+
+.. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMT_NoisePropagation.m
+    :language: matlab
+
+Example script for real data:
+
+.. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMT_invivoData.m
+    :language: matlab
 
 
 gpuAxCaliberSMTmcmc
@@ -185,7 +198,7 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.metric            | cell variable, metric(s) derived from posterior distribution, 'mean'|'std'|'median'|'iqr' (can be multiple)  |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.start             | Starting point methods, 'likelihood'|'default'|1xM parameters array                                          |
+| fitting.start             | Starting point methods, 'likelihood' | 'default | 1xM parameters array                                       |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 
 +-----------------------------------+--------------------------------------------------------------------------------------------------------------+
@@ -200,4 +213,17 @@ I/O overview
 | out.{metric}.(model_params{k})    | Posterior statistics chosen in fitting.metric                                                                |
 +-----------------------------------+--------------------------------------------------------------------------------------------------------------+
 
-See example here.
+
+Example
+^^^^^^^
+
+Example script for noise propagation:
+
+.. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMTmcmc_NoisePropagation.m
+    :language: matlab
+
+Example script for real data:
+
+.. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMTmcmc_invivoData.m
+    :language: matlab
+

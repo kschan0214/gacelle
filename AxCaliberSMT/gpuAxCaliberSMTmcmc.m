@@ -8,7 +8,11 @@ classdef gpuAxCaliberSMTmcmc < handle
 
     properties
         % default model parameters and estimation boundary
-        % Axon diameter[um], neurite fraction (f=fa/(fa+fe)), CSF fraction, hindered diffusion diffusivity [um2/ms], noise
+        % a     : Axon diameter[um], 
+        % f     : neurite fraction (f=fa/(fa+fe)), 
+        % fcsf  : CSF fraction
+        % DeR   : hindered diffusion diffusivity [um2/ms]
+        % noise : noise level
         model_params    = {'a';                   'f';'fcsf';                'DeR';'noise'};
         ub              = [ 20;                     1;     1;                    3;    0.1];
         lb              = [0.1;                     0;     0;                 0.01;   0.01];
@@ -164,7 +168,7 @@ classdef gpuAxCaliberSMTmcmc < handle
             dwi = this.prepare_dwi_data(dwi,extradata);
 
             % mask sure no nan or inf in data
-            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
+            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -280,10 +284,10 @@ classdef gpuAxCaliberSMTmcmc < handle
             % 
             % Forward model
             % 1. Intra-cellular signal
-            switch model
-                case 'Neuman'
+            switch lower(model)
+                case 'neuman'
                     C = this.neuman(r);
-                case 'VanGelderen'
+                case 'vangelderen'
                     % C = this.vg(r);
                     C = this.vg2(r);    % less memory efficient but faster
             end
@@ -532,7 +536,7 @@ classdef gpuAxCaliberSMTmcmc < handle
                 fitting2.start = 'default';
             end
             if ~isfield(fitting,'model')
-                fitting2.start = 'vangelderen';
+                fitting2.model = 'vangelderen';
             end
             % if ~isfield(fitting,'boundary')
             %     % otherwise uses default

@@ -34,8 +34,8 @@ Model parameters
     % dfreqBKG  : background frequency in addition to the one provided [ppm]
     % dpini     : B1 phase offset in addition to the one provided [rad]
     model_params    = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW';'R2sIW';'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
-    ub              = [    2;     0.3;      1;       2;      10;     300;     40;     40;     0.25;    0.05;       0.4;   pi/2];
-    lb              = [    0;       0;      0;    0.25;       0;      40;      2;      2;    -0.05;    -0.1;      -0.4;  -pi/2];
+    ub              = [    2;     0.3;      1;       2;      10;     200;     50;     50;     0.25;    0.05;       0.4;   pi/2];
+    lb              = [    0;       0;      0;    0.25;       0;      50;      2;      2;    -0.05;    -0.1;      -0.4;  -pi/2];
     startpoint      = [    1;     0.1;    0.8;       1;       0;     100;     15;     21;     0.04;       0;         0;      0];
 
 I/O overview
@@ -80,6 +80,8 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extraData                 | Structure array with additional data                                                                         |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
+| extraData.b1              | 3D B1+ map [ratio], [x,y,z]                                                                                  |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extraData.freqBKG         | 3D/4D initial estimation of total field [Hz] (highly recommended), [x,y,z,fa]                                |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extraData.pini            | 3D initial estimation of B1 offset [rad]  (highly recommended), [x,y,z]                                      |
@@ -93,6 +95,8 @@ I/O overview
 | extraData.IWF             | 3D volume fraction Intracellular/(Intracellular+extracellular), [x,y,z] (for DIMWI only)                     |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | fitting                   | Structure array for model parameter estimation                                                               |
++---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting.optimiser         | Algorithm for parameter update, 'adam' (default) | 'sgdm' | 'rmsprop'                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.isdisplay         | boolean, display optimisation process in graphic plot                                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
@@ -110,13 +114,13 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.regmap            | model parameter(s) in which regularisation is applied,                                                       |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D'|'3D'                                                      |
+| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D' | '3D'                                                    |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lossFunction      | loss function, 'L1'|'L2'|'huber'|'mse'                                                                       |
+| fitting.lossFunction      | loss function, 'L1' | 'L2' | 'huber' | 'mse'                                                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.isWeighted        | is cost weighted, true|false, default = true                                                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.weightMethod      | Weighting method, '1stecho'|'norm', default = '1stecho'                                                      |
+| fitting.weightMethod      | Weighting method, '1stecho' (default) | 'norm'                                                               |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.weightPower       | power order of the weight, default = 2                                                                       |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 

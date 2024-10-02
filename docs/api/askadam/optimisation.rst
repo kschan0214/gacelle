@@ -29,6 +29,8 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting                   | structure contains fitting algorithm parameters                                                              |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting.optimiser         | Algorithm for parameter update, 'adam' (default) | 'sgdm' | 'rmsprop'                                        |
++---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.model_params      | 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star'};                                    |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.lb                | 1xM numeric variable, fitting lower bound, same order as field 'model_params', e.g. [0.5, 0];                |
@@ -37,13 +39,15 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.isdisplay         | boolean, display optimisation process in graphic plot                                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation                                                          |
+| fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation, set to -inf to disable checking the gradient            |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceWindow | # of elements in which 'convergenceValue' is computed                                                        |
+| fitting.convergenceWindow | #iterations in which 'convergenceValue' is computed                                                          |
++---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting.patience          | #iterations to wait before stopping then optimisation when the loss does not improve                         |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.iteration         | maximum # of optimisation iterations                                                                         |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.initialLearnRate  | initial learn rate of Adam optimiser                                                                         |
+| fitting.initialLearnRate  | (initial) learn rate of Adam optimiser                                                                       |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.tol               | tolerance in loss                                                                                            |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
@@ -51,9 +55,13 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.regmap            | model parameter(s) in which regularisation is applied                                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D'|'3D'                                                      |
+| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D' | '3D'                                                    |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lossFunction      | loss function, 'L1'|'L2'|'huber'|'mse'                                                                       |
+| fitting.lossFunction      | loss function, 'L1' | 'L2' | 'huber' | 'mse'                                                                 |
++---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting.randomness        | randomness of starting point; value between [0,1] 0 (fixed point) > somewhere inbetween >1 completely random |
++---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting.debug             | Dispay extra messages for debugging                                                                          |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | FWDfunc                   | function handle for forward signal generation; size of the output must match size of 'data'                  |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 

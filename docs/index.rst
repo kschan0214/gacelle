@@ -41,6 +41,13 @@ Table of Contents
 
 .. toctree::
    :maxdepth: 1
+   :caption: Tips and Tricks
+   :name: sec-tips
+
+   tipsandtricks/general
+
+.. toctree::
+   :maxdepth: 1
    :caption: API
    :name: sec-api
 

@@ -144,7 +144,7 @@ classdef gpuNEXI < handle
             dwi = this.prepare_dwi_data(dwi,extradata,fitting.lmax);
 
             % mask sure no nan or inf
-            [dwi,mask] = askadam.remove_img_naninf(dwi,mask);
+            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -290,8 +290,8 @@ classdef gpuNEXI < handle
             disp(['lmax                     = ' num2str(fitting.lmax)]);
 
             % mask out data to reduce memory load
-            dwi    = askadam.vectorise_NDto2D(dwi,mask).';
-            if ~isempty(w); w = askadam.vectorise_NDto2D(w,mask).'; end
+            dwi    = utils.vectorise_NDto2D(dwi,mask).';
+            if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
             
             % 2.3 askAdam optimisation main
             askadamObj = askadam();
@@ -532,11 +532,14 @@ classdef gpuNEXI < handle
                 ra   = pars.ra;
             else
                 % mask out voxels to reduce memory
-                fa   = askadam.row_vector(pars.fa(mask));
-                Da   = askadam.row_vector(pars.Da(mask));
-                De   = askadam.row_vector(pars.De(mask));
-                ra   = askadam.row_vector(pars.ra(mask));
+                fa   = utils.row_vector(pars.fa(mask));
+                Da   = utils.row_vector(pars.Da(mask));
+                De   = utils.row_vector(pars.De(mask));
+                ra   = utils.row_vector(pars.ra(mask));
             end
+
+             % avoid division by zeros when computing re
+            fa = min(fa,1-askadam.epsilon);
                 
             % Forward model
             % Sl0
@@ -547,7 +550,7 @@ classdef gpuNEXI < handle
                 if isempty(mask)
                     p2 = pars.p2;
                 else
-                    p2 = askadam.row_vector(pars.p2(mask));
+                    p2 = utils.row_vector(pars.p2(mask));
                 end
 
                 s = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
@@ -568,7 +571,7 @@ classdef gpuNEXI < handle
                 bval = this.b;
                 DELTA   = this.Delta;
             end
-
+            
             Da = bval.*Da;
             De = bval.*De;
             ra = DELTA.*ra;
@@ -614,7 +617,7 @@ classdef gpuNEXI < handle
         function M = M(x, fa, Da, d2, r1, r2)
             d1 = Da.*x.^2;
             l1 = (r1+r2+d1+d2)/2;
-            l2 = sqrt( (r1-r2+d1-d2).^2 + 4*r1.*r2 )/2; 
+            l2 = sqrt( (r1-r2+d1-d2).^2 + 4*r1.*r2 )/2; l2 = max(l2, askadam.epsilon);  % avoid division by zeros
             lm = l1-l2;
             Pp = (fa.*d1 + (1-fa).*d2 - lm)./(l2*2);
             M  = Pp.*exp(-(l1+l2)) + (1-Pp).*exp(-lm); 

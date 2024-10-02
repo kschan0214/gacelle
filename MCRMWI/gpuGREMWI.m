@@ -1,4 +1,4 @@
-classdef gpuGREMWI
+classdef gpuGREMWI < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 22 July 2024
@@ -22,8 +22,8 @@ classdef gpuGREMWI
         % dfreqBKG  : background frequency in addition to the one provided [ppm]
         % dpini     : B1 phase offset in addition to the one provided [rad]
         model_params    = { 'S0';   'MWF';  'IWF';  'R2sMW';'R2sIW';'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
-        ub              = [    2;     0.3;      1;      300;     40;     40;     0.25;    0.05;       0.4;   pi/2];
-        lb              = [    0;       0;      0;       40;      2;      2;    -0.05;    -0.1;      -0.4;  -pi/2];
+        ub              = [    2;     0.3;      1;      200;     50;     50;     0.25;    0.05;       0.4;   pi/2];
+        lb              = [    0;       0;      0;       50;      2;      2;    -0.05;    -0.1;      -0.4;  -pi/2];
         startpoint      = [    1;     0.1;    0.8;      100;     15;     21;     0.04;       0;         0;      0];
 
     end
@@ -73,27 +73,13 @@ classdef gpuGREMWI
             this.te     = single(te(:));
             % fixed tissue and scanner parameters
             if nargin == 2
-                if isfield(fixed_params,'x_i')
-                    this.x_i     = single(fixed_params.x_i);
-                end
-                if isfield(fixed_params,'x_a')
-                    this.x_a     = single(fixed_params.x_a);
-                end
-                if isfield(fixed_params,'E')
-                    this.E       = single(fixed_params.E);
-                end
-                if isfield(fixed_params,'rho_mw')
-                    this.rho_mw  = single(fixed_params.rho_mw);
-                end
-                if isfield(fixed_params,'B0')
-                    this.B0      = single(fixed_params.B0);
-                end
-                if isfield(fixed_params,'B0dir')
-                    this.B0dir   = single(fixed_params.B0dir);
-                end
-                if isfield(fixed_params,'thres_R2s')
-                    this.thres_R2star   = single(fixed_params.thres_R2star);
-                end
+                if isfield(fixed_params,'x_i');         this.x_i            = single(fixed_params.x_i);             end
+                if isfield(fixed_params,'x_a');         this.x_a            = single(fixed_params.x_a);             end
+                if isfield(fixed_params,'E');           this.E              = single(fixed_params.E);               end
+                if isfield(fixed_params,'rho_mw');      this.rho_mw         = single(fixed_params.rho_mw);          end
+                if isfield(fixed_params,'B0');          this.B0             = single(fixed_params.B0);              end
+                if isfield(fixed_params,'B0dir');       this.B0dir          = single(fixed_params.B0dir);           end
+                if isfield(fixed_params,'thres_R2s');   this.thres_R2star   = single(fixed_params.thres_R2star);    end
             end
         end
         
@@ -199,6 +185,9 @@ classdef gpuGREMWI
             % get all fitting algorithm parameters 
             fitting = this.check_set_default(fitting,data);
 
+            % get matrix size
+            dims = size(data,1:3);
+
             % make sure input data are valid
             [extraData,mask] = this.validate_data(data,extraData,mask,fitting);
 
@@ -206,10 +195,7 @@ classdef gpuGREMWI
             [data, scaleFactor] = this.prepare_data(data,mask);
 
             % mask sure no nan or inf
-            [data,mask] = askadam.remove_img_naninf(data,mask);
-
-            % get matrix size
-            dims = size(data);
+            [data,mask] = utils.remove_img_naninf(data,mask);
 
             % convert datatype to single
             data    = single(data);
@@ -314,8 +300,9 @@ classdef gpuGREMWI
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting,data);
+            % determine fitting parameters
+            this                    = this.updateProperty(fitting);
             fitting.model_params    = this.model_params;
-            fitting.Nsample         = numel(mask(mask ~= 0)); 
             % set fitting boundary if no input from user
             if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.model_params)); end
             if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.model_params)); end
@@ -337,9 +324,9 @@ classdef gpuGREMWI
 
             % 3. askAdam optimisation main
             % mask out data to reduce memory load
-            data = askadam.vectorise_NDto2D(data,mask).';
-            if ~isempty(w); w = askadam.vectorise_NDto2D(w,mask).'; end
-            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( askadam.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
+            data = utils.vectorise_NDto2D(data,mask).';
+            if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
+            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
             
             disp('##############################################')
             disp('Runnning optimisation on all voxels...')
@@ -431,13 +418,10 @@ classdef gpuGREMWI
             end
 
             % [~,mwf] = this.superfast_mwi_2m_standard(abs(data),this.te,[]);
-            % mwf(mwf>0.1)    = 0.1;     % mainly WM
-            % mwf(mwf<0.05)   = 0.02;   % mainly GM
-            % mwf(R2s0>35)    = 0.02;
-            % mwf             = smooth3(mwf);
-            % mwf = single(this.startpoint(2)*ones(dims));
-            % mwf(R2s0<15) = 0.05;
-            % pars0.(this.model_params{2}) = single(mwf);
+            % mwf(mwf>0.15)                   = 0.15;         
+            % mwf(and(mwf>=0.05,mwf<=0.1))    = 0.1;   
+            % mwf(mwf<0.015)                  = 0.03;
+            % pars0.(this.model_params{2})    = single(mwf);
             
 
         end
@@ -475,22 +459,22 @@ classdef gpuGREMWI
             else
                 
                 % mask out voxels to reduce memory
-                S0   = askadam.row_vector( pars.S0(mask) );
-                mwf  = askadam.row_vector( pars.MWF(mask));
-                if fitting.DIMWI.isFitIWF;      iwf = askadam.row_vector( pars.IWF(mask)); else; iwf = extraData.IWF; end
-                r2sMW   = askadam.row_vector( pars.R2sMW(mask));
-                r2sIW   = askadam.row_vector( pars.R2sIW(mask));
+                S0   = utils.row_vector( pars.S0(mask) );
+                mwf  = utils.row_vector( pars.MWF(mask));
+                if fitting.DIMWI.isFitIWF;      iwf = utils.row_vector( pars.IWF(mask)); else; iwf = extraData.IWF; end
+                r2sMW   = utils.row_vector( pars.R2sMW(mask));
+                r2sIW   = utils.row_vector( pars.R2sIW(mask));
 
-                if fitting.DIMWI.isFitR2sEW;    r2sEW   = askadam.row_vector( pars.R2sEW(mask));  end
-                if fitting.DIMWI.isFitFreqMW;   freqMW  = askadam.row_vector( pars.freqMW(mask)); end
-                if fitting.DIMWI.isFitFreqIW;   freqIW  = askadam.row_vector( pars.freqIW(mask)); end
+                if fitting.DIMWI.isFitR2sEW;    r2sEW   = utils.row_vector( pars.R2sEW(mask));  end
+                if fitting.DIMWI.isFitFreqMW;   freqMW  = utils.row_vector( pars.freqMW(mask)); end
+                if fitting.DIMWI.isFitFreqIW;   freqIW  = utils.row_vector( pars.freqIW(mask)); end
                 % external effects
                 if ~fitting.isComplex % magnitude fitting
                     freqBKG = 0;                          
                     pini    = 0;
                 else    % other fittings
-                    freqBKG = askadam.row_vector( pars.dfreqBKG(mask)) + extraData.freqBKG; 
-                    pini    = askadam.row_vector( pars.dpini(mask)) + extraData.pini;
+                    freqBKG = utils.row_vector( pars.dfreqBKG(mask)) + extraData.freqBKG; 
+                    pini    = utils.row_vector( pars.dpini(mask)) + extraData.pini;
                 end
 
                 extraData.ff    = permute(extraData.ff.',[3 1 2]);
@@ -745,42 +729,21 @@ classdef gpuGREMWI
             fitting2 = askadam.check_set_default_basic(fitting);
 
             % check weighted sum of cost function
-            if ~isfield(fitting,'isWeighted')
-                fitting2.isWeighted = true;
-            end
-            if ~isfield(fitting,'weightMethod')
-                fitting2.weightMethod = '1stecho';
-            end
-            if ~isfield(fitting,'weightPower')
-                fitting2.weightPower = 2;
-            end
+            if ~isfield(fitting,'isWeighted');      fitting2.isWeighted     = true;         end
+            if ~isfield(fitting,'weightMethod');    fitting2.weightMethod   = '1stecho';    end
+            if ~isfield(fitting,'weightPower');     fitting2.weightPower    = 1;            end
             
             % check hollow cylinder fibre model parameters
-            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitFreqMW')
-                fitting2.DIMWI.isFitFreqMW = true;
-            end
-            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitFreqIW')
-                fitting2.DIMWI.isFitFreqIW = true;
-            end
-            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitR2sEW')
-                fitting2.DIMWI.isFitR2sEW = true;
-            end
-            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitIWF')
-                fitting2.DIMWI.isFitIWF = true;
-            end
+            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitFreqMW');  fitting2.DIMWI.isFitFreqMW  = true; end
+            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitFreqIW');  fitting2.DIMWI.isFitFreqIW  = true; end
+            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitR2sEW');   fitting2.DIMWI.isFitR2sEW   = true; end
+            if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitIWF');     fitting2.DIMWI.isFitIWF     = true; end
 
             % get customised fitting setting check
-            if ~isfield(fitting,'regmap')
-                fitting2.regmap = 'MWF';
-            end
+            if ~isfield(fitting,'regmap');      fitting2.regmap = 'MWF'; end
 
-            if ~isfield(fitting,'isComplex')
-                fitting2.isComplex = true;
-            end
-
-            if isreal(data)
-                fitting.isComplex = false; 
-            end
+            if ~isfield(fitting,'isComplex');   fitting2.isComplex = true; end
+            if isreal(data);                    fitting.isComplex = false;  end
 
         end
 

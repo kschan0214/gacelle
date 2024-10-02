@@ -12,13 +12,11 @@ bval_sorted     = [2.3, 3.5, 4.8, 6.5, 2.3, 3.5, 4.8, 6.5, 11.0, 2.3, 3.5, 4.8, 
 BDELTA_sorted   = [13, 13, 13, 13, 21, 21, 21, 21, 21, 30, 30, 30, 30, 30, 30]; %ms
 
 % Parameter raneg for forward simulation
-ra_range    = [1/250, 0.3];
 tex_range   = [2, 50];
 fa_range    = [0.01, 0.8];
 Da_range    = [1.5, 3];
 De_range    = [0.5, 1.5];
 p2_range    = [0.05, 0.5];
-% noise_range     = [0.01 0.05];
 
 % generate ground truth
 tex_GT  = single(rand(1,Nsample) * diff(tex_range) + min(tex_range) );
@@ -35,44 +33,44 @@ pars.Da     = Da_GT;
 pars.De     = De_GT;
 pars.ra     = ra_GT;
 pars.p2     = p2_GT;
-objGPU      = gpuNEXImcmc(bval_sorted, BDELTA_sorted);
-s           = gather(objGPU.FWD(pars, lmax));
+objGPU      = gpuNEXI(bval_sorted, BDELTA_sorted);
+s           = objGPU.FWD(pars, [], lmax);
 
-% Let assume Gaussian noise to simplify everything
+% Let's assume Gaussian noise for simplicity
 noiseLv = 1/SNR;
 s       = s + randn(size(s)) .* noiseLv;
 s       = permute(s,[2 3 4 1]);
-mask    = ones(size(s,1:3));
+mask    = ones(size(s,1:3)) > 0;
 
-%% MCMC estimation
-fitting             = [];
-fitting.algorithm   = 'GW';
-fitting.Nwalker     = 50;
-fitting.StepSize    = 2;
-fitting.iteration   = 5e3;
-fitting.thinning    = 20;        % Sample every 20 iteration
-fitting.metric      = 'median';
-fitting.burnin      = 0.1;       % 10% burn-in
-fitting.lmax        = 2;     
-fitting.start       = 'likelihood';     
-extraData           = [];
+%% askadam estimation
+fitting                     = [];
+fitting.iteration           = 4000;
+fitting.initialLearnRate    = 0.001;
+fitting.convergenceValue    = 1e-8;
+fitting.lossFunction        = 'l1';
+fitting.tol                 = 1e-3;
+fitting.isdisplay           = false;
+fitting.isPrior             = 1;   
+fitting.lmax                = lmax;  
+fitting.randomness          = 0;  
+fitting.isdisplay           = 0;   
+extraData                   = [];
 
-objGPU  = gpuNEXImcmc(bval_sorted, BDELTA_sorted);
-out     = objGPU.estimate(s, mask, extraData, fitting);
+out   = objGPU.estimate(s, mask, extraData, fitting);
 
 %% plot result
 field = fieldnames(pars);
 tiledlayout(1,numel(field)+1);
 for k = 1:numel(field)
     nexttile;
-    scatter(pars.(field{k}),out.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
 end
 nexttile;
-scatter((1-pars.fa)./pars.ra,(1-out.median.fa)./out.median.ra,5,'filled','MarkerFaceAlpha',.4);
+scatter((1-pars.fa)./pars.ra,(1-out.final.fa)./out.final.ra,5,'filled','MarkerFaceAlpha',.4);
 h = refline(1);
 h.Color = 'k';
 title('tex');

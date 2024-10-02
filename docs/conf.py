@@ -14,10 +14,10 @@ release = '0.1.0'
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-extensions = [
-    'sphinx.ext.githubpages',
-    'sphinx.ext.imgmath',
-]
+# extensions = [
+#     'sphinx.ext.githubpages',
+#     'sphinx.ext.imgmath',
+# ]
 
 templates_path = ['_templates']
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
@@ -47,4 +47,4 @@ latex_documents = [
 # a list of builtin themes.
 #
 # html_theme = 'default'
-html_theme = "sphinx_rtd_theme"
+# html_theme = "sphinx_rtd_theme"

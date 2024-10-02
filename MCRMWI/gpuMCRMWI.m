@@ -24,7 +24,7 @@ classdef gpuMCRMWI < handle
         model_params    = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW'; 'R2sIW'; 'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
         ub              = [    2;     0.3;      1;       2;      10;     200;      50;      50;     0.25;    0.05;       0.4;   pi/2];
         lb              = [ 1e-8;    1e-8;   1e-8;     1/3;    1e-8;      50;1/150e-3;1/150e-3;    -0.05;    -0.1;      -0.4;  -pi/2];
-        startpoint      = [    1;     0.1;    0.8;       1;       0;     100;      15;      21;     0.04;       0;         0;      0];
+        startpoint      = [    1;     0.1;    0.8;       1;    1e-8;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8];
 
     end
 
@@ -353,6 +353,7 @@ classdef gpuMCRMWI < handle
 
             % 3. askAdam optimisation main
             askadamObj  = askadam();
+            
             % 3.1. initial global optimisation
             disp('##############################################')
             disp('1. Runnning optimisation on all voxels...')
@@ -421,47 +422,7 @@ classdef gpuMCRMWI < handle
                 out             = askadamObj.optimisation(data, mask, w, pars0_fit, fitting_final, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
 
                 out.step1 = out_init.final;
-                % % 3.2. short T1 voxel optimisation
-                % if this.B0 < 2; thresT1 = 0.8; elseif this.B0 > 4; thresT1 = 1.5; else; thresT1 = 1.3; end % T1 threshold fo 1.5T|7T|3T; TODO: find a more robust more for thresholding
-                % 
-                % disp('##############################################')
-                % disp('2. Fitting short T1 voxels...')
-                % mask_T1short = and(pars0.R1IEW > 1/thresT1, mask);
-                % pars0_fit = []; fields = fieldnames(pars0); for kf = 1:numel(fields); pars0_fit.(fields{kf}) = out_init.final.(fields{kf}); end
-                % 
-                % data_fit = utils.vectorise_NDto2D(data,mask_T1short).';
-                % if ~isempty(w); w_fit = utils.vectorise_NDto2D(w,mask_T1short).'; end
-                % fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData_fit.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask_T1short) ).'); end
-                % out_T1short = askadamObj.optimisation(data_fit, mask_T1short, w_fit, pars0_fit, fitting, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
-                % disp('Short T1 optimisation completed.');
-                % disp('##############################################')
-                % 
-                % % long T1 optimisation
-                % disp('##############################################')
-                % disp('3. Fitting long T1 voxels...')
-                % % mask_T1long      = and(imdilate(pars0.R1IEW <= 1/thresT1,strel('sphere',1)),mask);
-                % mask_T1long      = and(pars0.R1IEW <= 1/thresT1,mask);
-                % pars0_fit     = []; fields = fieldnames(pars0); for kf = 1:numel(fields); pars0_fit.(fields{kf}) = out_init.final.(fields{kf}); end
-                % pars0_fit.MWF = pars0_fit.MWF*0.5; % modulate MWF to escape local minima
-                % 
-                % data_fit    = utils.vectorise_NDto2D(data,mask_T1long).';
-                % if ~isempty(w); w_fit = utils.vectorise_NDto2D(w,mask_T1long).'; end
-                % fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData_fit.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask_T1long) ).'); end
-                % out_T1long = askadamObj.optimisation(data_fit, mask_T1long, w_fit, pars0_fit, fitting, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
-                % mask_T1long = (pars0.R1IEW <= 1/thresT1).*mask;
-                % disp('Long T1 optimisation completed.');
-                % disp('##############################################')
-                % 
-                % % Combine and run a final optimisation
-                % disp('##############################################')
-                % disp('4. Combining final result...')
-                % pars0_fit = []; fields = fieldnames(pars0); for kf = 1:numel(fields); pars0_fit.(fields{kf}) = out_T1long.final.(fields{kf}).*mask_T1long + out_T1short.final.(fields{kf}).*mask_T1short; end
-                % data_fit    = utils.vectorise_NDto2D(data,mask).';
-                % if ~isempty(w); w_fit = utils.vectorise_NDto2D(w,mask).'; end
-                % fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData_fit.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
-                % fitting_final           = fitting;
-                % fitting_final.Nepoch    = 0;
-                % out = askadamObj.optimisation(data_fit, mask, w_fit, pars0_fit, fitting_final, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
+                
             else
                 out = out_init;
             end
