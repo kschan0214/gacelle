@@ -1,4 +1,4 @@
-addpath(genpath('../askadam/'));
+addpath(genpath('../../askadam/'));
 clear;
 %% Simulate data
 
@@ -52,7 +52,7 @@ fitting.algorithm   = 'GW';
 fitting.Nwalker     = 50;
 fitting.StepSize    = 2;
 fitting.iteration   = 1e4;
-fitting.thinning    = 10;        % Sample every 20 iteration
+fitting.thinning    = 10;        % Sample every 10 iteration
 fitting.metric      = {'median','iqr'};
 fitting.burnin      = 0.1;       % 10% burn-in
 extraData           = [];
@@ -60,6 +60,7 @@ extraData           = [];
 out   = objGPU.estimate(s, mask, extraData, fitting);
 
 %% plot result
+figure;
 field = fieldnames(pars);
 tiledlayout(1,numel(field));
 for k = 1:numel(field)

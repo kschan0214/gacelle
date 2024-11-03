@@ -255,7 +255,7 @@ classdef gpuMCRMWImcmc < handle
             g = gpuDevice; reset(g);
             memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
             memoryDynamicPerVoxel   = 0.0001;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
             out = [];
@@ -281,7 +281,7 @@ classdef gpuMCRMWImcmc < handle
                 [out]    = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp);
 
                 % % restore 'out' structure from segment
-                % out = askadam.restore_segment_structure(out,out_tmp,slice,ks);
+                % out = utils.restore_segment_structure(out,out_tmp,slice,ks);
 
             end
             out.mask = mask;
@@ -294,7 +294,7 @@ classdef gpuMCRMWImcmc < handle
             % out.min.S0      = out.min.S0 *scaleFactor;
 
             % save the estimation results if the output filename is provided
-            % askadam.save_askadam_output(fitting.output_filename,out)
+            % askadam.save_askadam_output(fitting.outputFilename,out)
 
         end
 

@@ -21,10 +21,10 @@ classdef gpuMCRMWI < handle
         % freqIW    : frequency IW [ppm]
         % dfreqBKG  : background frequency in addition to the one provided [ppm]
         % dpini     : B1 phase offset in addition to the one provided [rad]
-        modelParams     = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW'; 'R2sIW'; 'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
+        model_params    = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW'; 'R2sIW'; 'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
         ub              = [    2;     0.3;      1;       2;      10;     200;      50;      50;     0.25;    0.05;       0.4;   pi/2];
         lb              = [ 1e-8;    1e-8;   1e-8;     1/3;    1e-8;      50;1/150e-3;1/150e-3;    -0.05;    -0.1;      -0.4;  -pi/2];
-        startPoint      = [    1;     0.1;    0.6;       1;    1e-8;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8];
+        startpoint      = [    1;     0.1;    0.8;       1;    1e-8;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8];
 
     end
 
@@ -101,53 +101,53 @@ classdef gpuMCRMWI < handle
 
             if fitting.isComplex == 0
                 for kpar = {'dfreqBKG','dpini'}
-                    idx = find(ismember(this.modelParams,kpar));
-                    this.modelParams(idx)    = [];
+                    idx = find(ismember(this.model_params,kpar));
+                    this.model_params(idx)    = [];
                     this.lb(idx)              = [];
                     this.ub(idx)              = [];
-                    this.startPoint(idx)      = [];
+                    this.startpoint(idx)      = [];
                 end
             end
 
             % DIMWI
             if fitting.DIMWI.isFitFreqIW == 0
-                idx = find(ismember(this.modelParams,'freqIW'));
-                this.modelParams(idx)    = [];
+                idx = find(ismember(this.model_params,'freqIW'));
+                this.model_params(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+                this.startpoint(idx)      = [];
             end
 
             if fitting.DIMWI.isFitFreqMW == 0
-                idx = find(ismember(this.modelParams,'freqMW'));
-                this.modelParams(idx)    = [];
+                idx = find(ismember(this.model_params,'freqMW'));
+                this.model_params(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+                this.startpoint(idx)      = [];
             end
 
             if fitting.DIMWI.isFitIWF == 0
-                idx = find(ismember(this.modelParams,'IWF'));
-                this.modelParams(idx)    = [];
+                idx = find(ismember(this.model_params,'IWF'));
+                this.model_params(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+                this.startpoint(idx)      = [];
             end
 
             if fitting.DIMWI.isFitR2sEW == 0
-                idx = find(ismember(this.modelParams,'R2sEW'));
-                this.modelParams(idx)    = [];
+                idx = find(ismember(this.model_params,'R2sEW'));
+                this.model_params(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+                this.startpoint(idx)      = [];
             end
 
             if fitting.isFitExchange == 0
-                idx = find(ismember(this.modelParams,'kIEWM'));
-                this.modelParams(idx)    = [];
+                idx = find(ismember(this.model_params,'kIEWM'));
+                this.model_params(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+                this.startpoint(idx)      = [];
             end
 
         end
@@ -248,7 +248,7 @@ classdef gpuMCRMWI < handle
                 % divide the data
                 dwi_tmp     = data(:,:,slice,:,:);
                 mask_tmp    = mask(:,:,slice);
-                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); end
+                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:); end
 
                 % run fitting
                 [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp);
@@ -327,10 +327,10 @@ classdef gpuMCRMWI < handle
             fitting                 = this.check_set_default(fitting,data);
             % determine fitting parameters
             this                    = this.updateProperty(fitting);
-            fitting.modelParams     = this.modelParams;
+            fitting.model_params    = this.model_params;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.modelParams)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.modelParams)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.model_params)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.model_params)); end
             
             % set initial starting points
             pars0 = this.estimate_prior(data,mask,extraData);
@@ -356,18 +356,89 @@ classdef gpuMCRMWI < handle
 
             % 3.1. initial global optimisation
             disp('##############################################')
-            disp('Runnning optimisation on all voxels...')
+            disp('1. Runnning optimisation on all voxels...')
 
             % askadam.optimisation does not see extractData so we have to manually mask the data inside here, make sure the voxel is on the second dimension
-            % extraData   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
-            extraData   = utils.masking_ND2AD_preserve_struct(extraData,mask) ;
+            extraData_fit   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
             
+            % get residual of the initial starting point
+            fitting0    = fitting; fitting0.iteration = 0; fitting0.isdisplay = false;
+            out0        = askadamObj.optimisation(data, mask, w, pars0, fitting0, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
+
             % run optimisation
-            out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
-            
-            if fitting.isComplex
-                out.final.dfreqBKG  = permute(out.final.dfreqBKG,[1 2 3 5 4]);
-                out.min.dfreqBKG    = permute(out.min.dfreqBKG,[1 2 3 5 4]);
+            out_init    = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
+
+            % find bad fit voxels
+            mask_badfit = out_init.final.resloss >= out0.final.resloss; % utils.reshape_ND2image(mean(abs(utils.vectorise_NDto2D(data.*w,ones(size(mask)))),2),ones(size(mask))); 
+
+            disp('Optimisation completed.');
+            disp('##############################################')
+
+            % whether to further refine the fitting
+            if fitting.isMultiStep
+                mask_outlier                = isoutlier(out_init.final.resloss);
+                mask_outlier(mask_badfit)   = 1;
+
+                % inliners
+                disp('##############################################')
+                disp('2. Further optimising non-outlier voxels...')
+
+                
+                mask_fit    = and(mask, mask_outlier==0 ); % update fitting mask
+                pars0_fit   = []; fields = fieldnames(pars0); for kf = 1:numel(fields); pars0_fit.(fields{kf}) = out_init.final.(fields{kf}); end % update starting positions
+                
+                % refine inliner
+                extraData_fit   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask_fit) ,'UniformOutput',false);
+
+                reductionFactor = 1; attempt = 1;
+                while attempt <=2 
+                    % update learning rate if needed (to avoid being too large)
+                    fitting_refine = fitting; fitting_refine.initialLearnRate = fitting.initialLearnRate / reductionFactor; if fitting_refine.initialLearnRate ~= fitting.initialLearnRate; disp('Leaarning rate is updated'); end
+                    out_inliners    = askadamObj.optimisation(data, mask_fit, w, pars0_fit, fitting_refine, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
+                    if out_inliners.final.Niteration < min(100, fitting_refine.iteration)
+                        attempt         = attempt + 1;
+                        reductionFactor = reductionFactor*2;    % if too fewer iterations then reduces learning rate
+                    else
+                        break
+                    end
+                end
+                
+                % find bad fit voxels
+                mask_badfit_inliners = out_inliners.final.resloss - out_init.final.resloss > 1e-4;
+
+                disp('Optimisation completed.');
+                disp('##############################################')
+                
+                % outliers
+                disp('##############################################')
+                disp('3. Re-fitting outliers voxels...')
+
+                mask_fit = and(mask,  mask_outlier>0 ); % update fitting mask
+                
+                extraData_fit = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask_fit) ,'UniformOutput',false);
+                out_outliners = askadamObj.optimisation(data, mask_fit, w, pars0, fitting, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
+
+                % find bad fit voxels
+                mask_badfit_outliners =  out_outliners.final.resloss - out_init.final.resloss > 1e-4;
+
+                disp('Optimisation completed.');
+                disp('##############################################')
+
+                % Combine and run a final optimisation
+                disp('##############################################')
+                disp('4. Combining final result...')
+                pars0_fit = []; fields = fieldnames(pars0); for kf = 1:numel(fields); pars0_fit.(fields{kf}) = out_init.final.(fields{kf}) .* and(mask,or(mask_badfit_inliners,mask_badfit_outliners)) + ...
+                                                                                                                        out_inliners.final.(fields{kf}).*and(mask,~mask_outlier.*~mask_badfit_inliners ) + ...
+                                                                                                                        out_outliners.final.(fields{kf}).*and(mask,mask_outlier.*~mask_badfit_outliners); end
+                               
+                fitting_final   = fitting; fitting_final.iteration = 0; fitting_final.isdisplay = 0;
+                extraData_fit   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
+                out             = askadamObj.optimisation(data, mask, w, pars0_fit, fitting_final, @this.FWD, fitting, extraData_fit, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
+
+                out.step1 = out_init.final;
+                
+            else
+                out = out_init;
             end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
@@ -417,8 +488,8 @@ classdef gpuMCRMWI < handle
 
             dims = size(data,1:3);
 
-            for k = 1:numel(this.modelParams)
-                pars0.(this.modelParams{k}) = single(this.startPoint(k)*ones(dims));
+            for k = 1:numel(this.model_params)
+                pars0.(this.model_params{k}) = single(this.startpoint(k)*ones(dims));
             end
             
             disp('Estimate starting points based on hybrid fixed points/prior information ...')
@@ -431,39 +502,40 @@ classdef gpuMCRMWI < handle
             S0(isnan(S0)) = 0; S0(isinf(S0)) = 0;
             despot1_obj = despot1(this.tr,this.fa);
             [t1, M0, ~] = despot1_obj.estimate(S0, mask, extraData.b1);
-            pars0.(this.modelParams{1}) = single(M0);
+            pars0.(this.model_params{1}) = single(M0);
 
             % R1
-            idx = find(ismember(this.modelParams,'R1IEW'));
             pars0.R1IEW = single(1./t1); pars0.R1IEW(isnan(pars0.R1IEW)) = 0; pars0.R1IEW(isinf(pars0.R1IEW)) = 0;
-            pars0.R1IEW = max(pars0.R1IEW, this.lb(idx)); pars0.R1IEW = min(pars0.R1IEW, this.ub(idx));
 
             % freqBKG
-            if isfield(pars0,'dfreqBKG')
-                pars0.dfreqBKG = repmat(pars0.dfreqBKG,[1,1,1,1,size(extraData.freqBKG,5)]);
-            end
+            pars0.dfreqBKG = repmat(pars0.dfreqBKG,[1,1,1,size(extraData.freqBKG,4)]);
 
             [R2s,~]  = this.R2star_trapezoidal(mean(abs(data),5),this.te);
             % R2*IW
-            idx = find(ismember(this.modelParams,'R2sIW'));
+            idx = find(ismember(this.model_params,'R2sIW'));
             R2sIW = R2s - 3;
-            R2sIW(isnan(R2sIW)) = single(this.startPoint(idx)); R2sIW(isinf(R2sIW)) = single(this.startPoint(idx)); 
+            R2sIW(isnan(R2sIW)) = single(this.startpoint(idx)); R2sIW(isinf(R2sIW)) = single(this.startpoint(idx)); 
             R2sIW(R2sIW < this.lb(idx)) = single(this.lb(idx)); R2sIW(R2sIW > this.ub(idx)) = single(this.ub(idx));
             pars0.R2sIW = R2sIW;
 
             % R2*EW
-            idx = find(ismember(this.modelParams,'R2sEW'));
+            idx = find(ismember(this.model_params,'R2sEW'));
             if ~isempty(idx)
                 R2sEW = R2s + 3;
-                R2sEW(isnan(R2sEW)) = single(this.startPoint(idx)); R2sEW(isinf(R2sEW)) = single(this.startPoint(idx)); 
+                R2sEW(isnan(R2sEW)) = single(this.startpoint(idx)); R2sEW(isinf(R2sEW)) = single(this.startpoint(idx)); 
                 R2sEW(R2sEW < this.lb(idx)) = single(this.lb(idx)); R2sEW(R2sEW > this.ub(idx)) = single(this.ub(idx));
                 pars0.R2sEW = R2sEW;
             end
 
             % [~,mwf] = this.superfast_mwi_2m_mcr(abs(data),[],mask,extraData.b1,1);
+            % % mwf = mwf + 0.02;
             % mwf = min(mwf,0.25);
             % mwf = max(mwf,0.05);
-            % pars0.(this.modelParams{2})    = single(mwf);
+            % % mwf = max(mwf,this.lb(2));
+            % % mwf(mwf>0.15)                   = 0.15;
+            % % mwf(and(mwf>=0.015,mwf<=0.1))   = 0.1;
+            % % mwf(mwf < 0.05)                 = 0.05;
+            % pars0.(this.model_params{2})    = single(mwf);
 
         end
 
@@ -624,35 +696,77 @@ classdef gpuMCRMWI < handle
         %% Signal related functions
 
         % compute the forward model
-        function [s] = FWD(this, pars, fitting, extraData, dlnet_phase,dlnet_magn)
+        function [s] = FWD(this, pars, mask, fitting, extraData, dlnet_phase,dlnet_magn)
 
-            TE = gpuArray(dlarray( permute(this.te, [2 3 4 1] )));              % TE always on 4th dim
-            FA = gpuArray(dlarray( permute(deg2rad(this.fa), [2 3 4 5 1] )));   % FA always on 5th dim
+            nFA = numel(this.fa);
 
-            Nfa = numel(this.fa);
+        % Forward model to generate NEXI signal
+            if isempty(mask)
+                S0   = pars.S0;
+                mwf  = pars.MWF;
+                if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
+                r2sMW   = pars.R2sMW;
+                r2sIW   = pars.R2sIW;
+                r1iew   = pars.R1IEW;
 
-            S0   = pars.S0;
-            mwf  = pars.MWF;
-            if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
-            r2sMW   = pars.R2sMW;
-            r2sIW   = pars.R2sIW;
-            r1iew   = pars.R1IEW;
+                if fitting.isFitExchange;       kiewm = pars.kIEWM; end
+    
+                if fitting.DIMWI.isFitR2sEW;    r2sEW  = pars.R2sEW;    end
+                if fitting.DIMWI.isFitFreqMW;   freqMW  = pars.freqMW;  end
+                if fitting.DIMWI.isFitFreqIW;   freqIW  = pars.freqIW;  end
+                % external effects
+                if ~fitting.isComplex % magnitude fitting
+                    freqBKG = 0;                          
+                    pini    = 0;
+                else    % other fittings
+                    freqBKG = pars.dfreqBKG + extraData.freqBKG; 
+                    pini    = pars.dpini + extraData.pini;
+                end
 
-            if fitting.isFitExchange;       kiewm = pars.kIEWM; end
+                % move fibre oreintation to the 5th dimension
+                extraData.ff    = permute(extraData.ff,[1 2 3 5 4]);
+                extraData.theta = permute(extraData.theta,[1 2 3 5 4]);
 
-            if fitting.DIMWI.isFitR2sEW;    r2sEW  = pars.R2sEW;    end
-            if fitting.DIMWI.isFitFreqMW;   freqMW  = pars.freqMW;  end
-            if fitting.DIMWI.isFitFreqIW;   freqIW  = pars.freqIW;  end
-            % external effects
-            if ~fitting.isComplex % magnitude fitting
-                freqBKG = 0;                          
-                pini    = 0;
-            else    % other fittings
-                freqBKG = pars.dfreqBKG + extraData.freqBKG;
-                pini    = pars.dpini    + extraData.pini;
-                
+                % TE = permute(this.te,[2 3 4 1]);
+                TE = gpuArray(dlarray( permute(this.te,[2 3 4 1]) ));
+                FA = gpuArray(dlarray( deg2rad(this.fa) ));
+                % FA = gpuArray(dlarray( permute(deg2rad(this.fa), [2 3 4 5 1]) ));
+    
+            else
+                % mask out voxels to reduce memory
+                S0   = utils.row_vector(pars.S0(mask));
+                mwf  = utils.row_vector(pars.MWF(mask));
+                if fitting.DIMWI.isFitIWF;  iwf  = utils.row_vector(pars.IWF(mask)); else; iwf = extraData.IWF; end
+                r2sMW   = utils.row_vector(pars.R2sMW(mask));
+                r2sIW   = utils.row_vector(pars.R2sIW(mask));
+                r1iew   = utils.row_vector(pars.R1IEW(mask));
+
+                if fitting.isFitExchange;       kiewm   = utils.row_vector(pars.kIEWM(mask));     end
+    
+                if fitting.DIMWI.isFitR2sEW;    r2sEW   = utils.row_vector(pars.R2sEW(mask));     end
+                if fitting.DIMWI.isFitFreqMW;   freqMW  = utils.row_vector(pars.freqMW(mask));    end
+                if fitting.DIMWI.isFitFreqIW;   freqIW  = utils.row_vector(pars.freqIW(mask));    end
+                % external effects
+                if ~fitting.isComplex % magnitude fitting
+                    freqBKG = 0;                          
+                    pini    = 0;
+                else    % other fittings
+                    if isscalar(mask)
+                        dshift = -2;
+                    else
+                        dshift = -1;
+                    end
+                    freqBKG = shiftdim((utils.vectorise_NDto2D(pars.dfreqBKG,mask).' + extraData.freqBKG).',dshift) ; 
+                    pini    = utils.row_vector(pars.dpini(mask)) + extraData.pini;
+                end
+
+                extraData.ff    = permute(extraData.ff,[3 2 4 1]);
+                extraData.theta = permute(extraData.theta,[3 2 4 1]);
+
+                TE = gpuArray(dlarray( this.te ));
+                FA = gpuArray(dlarray( deg2rad(this.fa) ));
             end
-        
+                
             % Forward model
             %%%%%%%%%%%%%%%%%%%% DIMWI related operations %%%%%%%%%%%%%%%%%%%%
             % Compartmental Signals
@@ -666,8 +780,7 @@ classdef gpuMCRMWI < handle
                 hcfm_obj = HCFM(this.te,this.B0);
 
                 % derive g-ratio 
-                % g = hcfm_obj.gratio(abs(S0IW),abs(S0MW)/this.rho_mw);
-                g = max(hcfm_obj.gratio(abs(S0IW)./totalVolume,MVF),askadam.epsilon);
+                g = hcfm_obj.gratio(abs(S0IW),abs(S0MW)/this.rho_mw);
 
             end
             
@@ -677,11 +790,10 @@ classdef gpuMCRMWI < handle
                 % assume extracellular water has the same T2* as intra-axonal water
                 r2sEW   = r2sIW;
                 % fibre volume fraction
-                fvf     = max(hcfm_obj.FibreVolumeFraction(abs(S0IW)./totalVolume,abs(S0EW)./totalVolume,MVF),askadam.epsilon);
+                fvf     = hcfm_obj.FibreVolumeFraction(abs(S0IW),abs(S0EW),abs(S0MW)/this.rho_mw);
 
                 % signal dephase in extracellular water due to myelin sheath, Eq.[A7]
                 decayEW = hcfm_obj.DephasingExtraaxonal(fvf,g,this.x_i,this.x_a,extraData.theta);
-                decayEW = permute(decayEW,[4 2 3 1 5 6]);
 
            else
                 decayEW = 0;
@@ -710,32 +822,31 @@ classdef gpuMCRMWI < handle
             if fitting.isFitExchange
                 if fitting.isEPG
                     % EPG-X
-                    features = feature_preprocess_MCRMWI_MLP_EPGX_leakyrelu( repmat(MVF(:),Nfa,1),      1./repmat(r1iew(:),Nfa,1), ...
-                                                                             repmat(kiewm(:),Nfa,1),    (squeeze(FA) .* extraData.b1(:).').', ...    % true_famp = (FA .* extraData.b1(:).').';
-                                                                             this.tr, 1./repmat(r2sIW(:),Nfa,1), this.t1_mw);
+                    features = feature_preprocess_MCRMWI_MLP_EPGX_leakyrelu( repmat(MVF(:),nFA,1),      1./repmat(r1iew(:),nFA,1), ...
+                                                                             repmat(kiewm(:),nFA,1),    (squeeze(FA) .* extraData.b1(:).').', ...    % true_famp = (FA .* extraData.b1(:).').';
+                                                                             this.tr, 1./repmat(r2sIW(:),nFA,1), this.t1_mw);
                     features    = gpuArray( dlarray(features,'CB'));
                     
                     % phase of long T2 components
                     S0IEW_phase   = mlp_model_leakyRelu(dlnet_phase.parameters,features,dlnet_phase.alpha);
-                    S0IEW_phase   = reshape(S0IEW_phase,[size(MVF),1,1,Nfa]);
+                    S0IEW_phase   = reshape(S0IEW_phase,[size(MVF),nFA]);
     
                     % signal_steadystate_phase   = reshape(signal_steadystate_phase,size(mvf,1),size(mvf,2),size(mvf,3),1,nFA);
                     Ss_diff    = mlp_model_leakyRelu(dlnet_magn.parameters,features,dlnet_magn.alpha);
-                    Ss_diff    = shiftdim( reshape(Ss_diff,[2, size(MVF),1,1,Nfa]), 1);
+                    Ss_diff    = shiftdim( reshape(Ss_diff,[2, size(MVF), nFA]), 1);
     
                     % true_famp = permute(FA,[2:ndims(MVF)+1 1]) .* extraData.b1;
                     % [S0MW, S0IEW]   = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    % [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    S0MW  = (S0MW  + Ss_diff(:,:,:,:,:,1)) .* totalVolume .* this.rho_mw;   S0MW  = max(S0MW, utils.epsilon);
-                    S0IEW = (S0IEW + Ss_diff(:,:,:,:,:,2)) .* totalVolume;                  S0IEW = max(S0IEW, utils.epsilon);
+                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
+                    S0MW  = (S0MW  + Ss_diff(:,:,:,1)) .* totalVolume .* this.rho_mw;
+                    S0IEW = (S0IEW + Ss_diff(:,:,:,2)) .* totalVolume;
                     % S0_mag          = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm) + Ss_diff ) .* totalVolume;
                 
                 else
                     % BM analytical solution
                     % S0_mag          = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm)) .* totalVolume;
                     % [S0MW, S0IEW]   = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
+                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
                     S0MW            = S0MW  .* totalVolume .* this.rho_mw;
                     S0IEW           = S0IEW .* totalVolume;
                     S0IEW_phase     = 0;
@@ -746,6 +857,16 @@ classdef gpuMCRMWI < handle
             end
 
             %%%%%%%%%%%%%%%%%%%% Forward model %%%%%%%%%%%%%%%%%%%%
+            if isempty(mask)
+                % Image-based operation
+                if ismatrix(pars.MWF)
+                    S0MW  = permute(S0MW,[1 2 5 4 3]);
+                    S0IEW = permute(S0IEW,[1 2 5 4 3]);
+                    % S0IW = permute(S0IW,[1 2 5 4 3]);
+                    % S0EW = permute(S0EW,[1 2 5 4 3]);
+                    freqBKG = permute(freqBKG,[3 2 4 5 1]);
+                    S0IEW_phase = permute(S0IEW_phase,[1 2 5 4 3]);
+                end
                 Sreal = sum((   S0MW            .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...               % MW
                                 S0IEW.*iwf      .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) + ...    % IW
                                 S0IEW.*(1-iwf)  .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) .* exp(-decayEW) ).*extraData.ff,6);
@@ -754,15 +875,38 @@ classdef gpuMCRMWI < handle
                                 S0IEW.*iwf      .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) + ...
                                 S0IEW.*(1-iwf)  .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) .* exp(-decayEW) ).*extraData.ff,6);
 
-                if fitting.isComplex
-                    s = cat(6,Sreal,Simag);
-                else
-                    s = sqrt(Sreal.^2 + Simag.^2);
-                end
+                % Sreal = sum((   S0MW .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                %                 S0IW .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                %                 S0EW .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,6);
+                % 
+                % Simag = sum((   S0MW .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                %                 S0IW .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                %                 S0EW .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,6);
 
-                % vectorise to match maksed measurement data
-                s = utils.reshape_ND2AD(s,[]);
-            
+                s = cat(6,Sreal,Simag);
+
+            else
+                % voxel-based operation
+                Sreal = sum((   S0MW            .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...               % MW
+                                S0IEW.*iwf      .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) + ...    % IW
+                                S0IEW.*(1-iwf)  .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) .* exp(-decayEW) ).*extraData.ff,4);
+    
+                Simag = sum((   S0MW            .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                                S0IEW.*iwf      .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) + ...
+                                S0IEW.*(1-iwf)  .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) .* exp(-decayEW) ).*extraData.ff,4);
+
+                if ~fitting.isComplex
+                    s = permute( sqrt(Sreal.^2 + Simag.^2), [1 3 2]);
+                    
+                else
+                    % Sreal = reshape( permute( Sreal, [2 1 3]), numel(MVF), numel(TE)*numel(FA)).';
+                    % Simag = reshape( permute( Simag, [2 1 3]), numel(MVF), numel(TE)*numel(FA)).';
+                    
+                    s = cat(1,reshape( permute( Sreal, [2 1 3]), numel(MVF), numel(TE)*numel(FA)).',...     % real
+                              reshape( permute( Simag, [2 1 3]), numel(MVF), numel(TE)*numel(FA)).');       % imaginary
+                end
+            end
+    
         end
         
         %% Utilities
@@ -783,10 +927,6 @@ classdef gpuMCRMWI < handle
                 extraData.freqBKG = zeros(dims);
                 if fitting.isComplex
                     warning('No total field map is provided for fitting complex-valued data.');
-                end
-            else
-                if ndims(extraData.freqBKG) == 4
-                    extraData.freqBKG = permute(extraData.freqBKG,[1 2 3 5 4]);
                 end
             end
             if ~isfield(extraData,'pini')
@@ -811,7 +951,6 @@ classdef gpuMCRMWI < handle
                     extraData.ff                        = bsxfun(@rdivide,extraData.ff,sum(extraData.ff,4));
                     mask                                = and(mask,min(~isnan(extraData.ff),[],4));
                     extraData.ff(isnan(extraData.ff))   = 0;
-                    extraData.ff                        = permute(extraData.ff,[1 2 3 5 6 4]);
                 else
                     error('Fibre fraction map is required for MCR-DIMWI!');
                 end
@@ -823,20 +962,17 @@ classdef gpuMCRMWI < handle
                         fo    = double(extraData.fo); % fibre orientation w.r.t. B0
                         theta = zeros(size(extraData.ff));
                         for kfo = 1:size(fo,5)
-                            theta(:,:,:,:,:,kfo) = this.AngleBetweenV1MapAndB0(fo(:,:,:,:,kfo),this.B0dir);
+                            theta(:,:,:,kfo) = this.AngleBetweenV1MapAndB0(fo(:,:,:,:,kfo),this.B0dir);
                         end
                         extraData.theta = single(theta);
                         extraData = rmfield(extraData,"fo");
                     end
-                else
-                    extraData.theta = permute(extraData.theta,[1 2 3 5 6 4]);
                 end
-                extraData.theta = max(extraData.theta,askadam.epsilon);
             else
-                extraData.theta = ones(dims,'single')*askadam.epsilon;
+                extraData.theta = zeros(dims,'single');
                 extraData.ff    = ones(dims,'single');
             end
-            if size(extraData.theta,6) ~= size(extraData.ff,6)
+            if size(extraData.theta,4) ~= size(extraData.ff,4)
                 error('The last dimention of the theta map does not match the last dimension of the fibre fraction map');
             end
 
@@ -897,6 +1033,108 @@ classdef gpuMCRMWI < handle
             
             S0IEW   = ((ap.*d-bp.*c).*R1f.*(1-f) + (-ap.*b+bp.*a).*R1r.*f).*C;
             S0M     = ((cp.*d-c.*dp).*R1f.*(1-f) + (-cp.*b+a.*dp).*R1r.*f).*C;
+        
+        end
+
+        % Bloch-McConnell 2-pool exchange steady-state signal
+        function [S0M, S0IEW] = model_BM_2T1_matlab(TR,true_famp,f,R1f,R1r,kfr)
+        % Matlab symbolic toolbox
+        % f : myelin volume fraction
+        % R1f : R1 of free (IE) water
+        % kfr : exchange rate from free (IE) water to myelin
+        % true_famp: true flip angle map in radian (5D), flip angle in 5th dim
+        % ss_pool: 1st-3rd dim:image; 4th dim: TE;5th dim: FA;6th dim: [S_M,S_IEW]
+        
+            % free pool
+            S0IEW = ((f./2 - 1./2).*(kfr.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - ...
+                        (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + ...
+                        R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) - ...
+                        2.*sin(2.*true_famp).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + ...
+                        2.*kfr.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) + ...
+                        sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*(R1f.^2.*f.^2 - ...
+                        2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + ...
+                        2.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) - ...
+                        2.*kfr.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + ...
+                        R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) - ...
+                        kfr.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) - ...
+                        4.*exp((TR.*(kfr + R1f.*f + R1r.*f))./f).*sin(true_famp).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + 2.*exp((TR.*(kfr + R1f.*f + ...
+                        R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + ...
+                        2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + ...
+                        sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*(R1f.^2.*f.^2 - ...
+                        2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) - ...
+                        R1f.*f.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + ...
+                        R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) + R1r.*f.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + ...
+                        R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + ...
+                        kfr.^2).^(1./2)))./(2.*f)) - 2.*R1f.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) + ...
+                        2.*R1r.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) + ...
+                        2.*R1f.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + ...
+                        R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) + ...
+                        R1f.*f.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) - ...
+                        2.*R1r.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + ...
+                        R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) - ...
+                        R1r.*f.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f))))./(2.*(exp((TR.*(kfr + R1f.*f + ...
+                        R1r.*f))./f) + cos(true_famp).^2 - exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*cos(true_famp) - exp((TR.*(kfr + ...
+                        R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + ...
+                        2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*cos(true_famp)).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2));
+            
+            % restricted pool
+            S0M = -(2.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + ...
+                        R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) - 2.*f.*sin(2.*true_famp).*(R1f.^2.*f.^2 - ...
+                        2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) - ...
+                        2.*f.*kfr.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) - f.*kfr.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + ...
+                        (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) - ...
+                        4.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f))./f).*sin(true_famp).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) - 2.*R1f.*f.^2.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) - ...
+                        R1f.*f.^2.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) + 2.*R1r.*f.^2.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) + ...
+                        R1r.*f.^2.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) + 2.*f.*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp).*(R1f.^2.*f.^2 - ...
+                        2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + ...
+                        f.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + f.*kfr.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) + 2.*f.*kfr.*exp((TR.*(kfr + R1f.*f + ...
+                        R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + ...
+                        2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) + R1f.*f.^2.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - ...
+                        2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) - ...
+                        R1r.*f.^2.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)) + f.*sin(2.*true_famp).*exp((TR.*(kfr + R1f.*f + R1r.*f - ...
+                        (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + ...
+                        2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2) + 2.*R1f.*f.^2.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp) - ...
+                        2.*R1r.*f.^2.*exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - ...
+                        4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*sin(true_famp))./(4.*(exp((TR.*(kfr + R1f.*f + R1r.*f))./f) + cos(true_famp).^2 - ...
+                        exp((TR.*(kfr + R1f.*f + R1r.*f - (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + ...
+                        2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*cos(true_famp) - exp((TR.*(kfr + R1f.*f + R1r.*f + (R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + 4.*R1f.*f.^2.*kfr - ...
+                        2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2)))./(2.*f)).*cos(true_famp)).*(R1f.^2.*f.^2 - 2.*R1f.*R1r.*f.^2 + ...
+                        4.*R1f.*f.^2.*kfr - 2.*R1f.*f.*kfr + R1r.^2.*f.^2 - 4.*R1r.*f.^2.*kfr + 2.*R1r.*f.*kfr + kfr.^2).^(1./2));
+             
+            % idx = find(size(Sr) == 1);
+            % if isempty(idx)
+            %     idx = ndims(Sr) + 1;
+            % end
+            % 
+            % ss_pool = cat(ndims(Sr)+1,Sr,Sf);
         
         end
         

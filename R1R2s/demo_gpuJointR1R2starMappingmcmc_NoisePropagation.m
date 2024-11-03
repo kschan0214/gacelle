@@ -50,6 +50,7 @@ fitting.iteration   = 1e4;
 fitting.thinning    = 10;        % Sample every 10 iteration
 fitting.metric      = {'mean','std'};
 fitting.burnin      = 0.1;       % 10% burn-in
+fitting.start       = 'default';
 extraData           = [];
 extraData.b1        = b1.';
 

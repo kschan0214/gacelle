@@ -147,7 +147,7 @@ classdef askadam < handle
             % create buffer arrays
             convergenceBuffer       = ones(fitting.convergenceWindow,1);
             insepctInterval         = 5;  % interval to check loss on each voxel
-            NparamBuffer            = 5; kBuffer = 1;
+            NparamBuffer            = 5;
             parameterBuffer         = repmat({parameters},1,NparamBuffer);
 
             if fitting.isDisplay; lineLoss = this.setup_display; end
@@ -185,26 +185,15 @@ classdef askadam < handle
                     [gradients,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:}); % Evaluate the model gradients and loss using dlfeval and the modelGradients function
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-                    if fitting.debug; isNaNInf = this.check_nan_in_gradients(gradients, mask_idx); if isNaNInf; disp(num2str(epoch));end; end % DEBUG module
+                    if fitting.debug; this.check_nan_in_gradients(gradients, mask_idx); end % DEBUG module
                     
                     %%%%%%%%%%%%%%%%%%%% 3.2. Stopping criteria module %%%%%%%%%%%%%%%%%%%%
                     loss = double(utils.dlarray2single(loss)); % get loss
 
-                    % store the results with minimal loss
-                    if minLoss > loss
-                        minLoss                 = loss;
-                        minLossFidelity         = loss_fidelity;
-                        minLossRegularisation   = loss_reg;
-                        minResiduals            = residuals;
-                        parameters_minLoss      = parameters;
-                        minIteration            = epoch;
-                        
-                    end
-
                     % Update convergence value
                     [convergenceCurr, convergenceBuffer] = this.update_convergence([convergenceBuffer(2:end);loss]); 
 
-                    % check if there is any global improvement
+                    % check if there are any global improvement
                     if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
                         
                         epochsWithoutImprovement = 0; % when global loss gradient > tolerance, -> improving, then reset epochsWithoutImprovement
@@ -216,6 +205,17 @@ classdef askadam < handle
                         epochsWithoutImprovement = epochsWithoutImprovement + 1;
                     end
     
+                    % store also the results with minimal loss
+                    if minLoss > loss
+                        minLoss                 = loss;
+                        minLossFidelity         = loss_fidelity;
+                        minLossRegularisation   = loss_reg;
+                        minResiduals            = residuals;
+                        parameters_minLoss      = parameters;
+                        minIteration            = epoch;
+                        
+                    end
+
                     % check if the optimisation should be stopped
                     if epochsWithoutImprovement > fitting.patience
                         fprintf('Optimisation is done. No significant improvements as defined in fitting setup. \n');
@@ -236,24 +236,6 @@ classdef askadam < handle
                     end
 
                     if fitting.isSampleConsistency
-                        
-                        % preparing buffer
-                        if kBuffer < NparamBuffer
-                            % compute loss on each voxel and compare to previous loss
-                            lossAll         = extractdata(mean(reshape(residuals,Nmeas,Nvol),1));
-                            maskNoImprove   = lossAll > lossAll0;
-                            for kf = 1:numel(fitting.modelParams)
-                                % replace the no-improvement voxel with previous position
-                                parameters.(fitting.modelParams{kf})(maskNoImprove) = parameterBuffer{kBuffer}.(fitting.modelParams{kf})(maskNoImprove);
-                            end
-                            % update loss
-                            lossAll(maskNoImprove)  = lossAll0(maskNoImprove);
-                            lossAll0                = lossAll;   
-                            % update buffer
-                            parameterBuffer(1:end-1) = parameterBuffer(2:end); parameterBuffer(end) = {parameters};
-                            kBuffer = kBuffer + 1;
-                        end
-
 
                         % check if the loss of the each voxel gets improved every 5 iterations
                         if mod(epoch,insepctInterval) == 0 
@@ -267,16 +249,15 @@ classdef askadam < handle
     
                                 for kf = 1:numel(fitting.modelParams)
                                     % draw a random number
-                                    n = randi(NparamBuffer);  
+                                    n = randi(5);  
                                     % replace the no-improvement voxel with one of those in the buffer for restart
                                     parameters.(fitting.modelParams{kf})(maskNoImprove) = parameterBuffer{n}.(fitting.modelParams{kf})(maskNoImprove);
                                 end
                                 % update loss
-                                lossAll0 = lossAll;          
-
-                                 % update buffer
-                                parameterBuffer(1:end-1) = parameterBuffer(2:end); parameterBuffer(end) = {parameters};
+                                lossAll0 = lossAll;                                     
                             end
+                            % update buffer
+                            parameterBuffer(1:end-1) = parameterBuffer(2:end); parameterBuffer(end) = {parameters};
                         end
                     end
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -289,13 +270,13 @@ classdef askadam < handle
                         switch lower(fitting.optimiser)
                             case 'adam'
                                 [parameters,averageGrad,averageSqGrad]  = adamupdate(parameters,gradients,averageGrad, ...
-                                                                                        averageSqGrad,epoch,learningRate,fitting.adamupdateGradDecay,fitting.adamupdateSqGradDecay,fitting.adamupdateEpsilon);
+                                                                                        averageSqGrad,epoch,learningRate);
                             case 'sgdm'
                                 [parameters,vel]                        = sgdmupdate(parameters,gradients,vel, ...
-                                                                                        learningRate,fitting.sgdmupdateMomentum);
+                                                                                        learningRate);
                             case 'rmsprop'
                                 [parameters,averageSqGrad]              = rmspropupdate(parameters,gradients,averageSqGrad, ...
-                                                                                        learningRate,fitting.rmspropupdateSqGradDecay,fitting.rmspropupdateEpsilon);
+                                                                                        learningRate);
                         end
                     end
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -352,14 +333,14 @@ classdef askadam < handle
             out.final.loss_fidelity = utils.dlarray2single(loss_fidelity);
             out.final.loss_reg      = utils.dlarray2single(loss_reg);
             out.final.resloss       = utils.reshape_ND2image( utils.dlarray2single( mean(reshape(residuals,Nmeas,Nvol),1)).',mask);
-            out.final.residual      = utils.dlarray2single( reshape(residuals,Nmeas,Nvol));
+            out.final.residual      = utils.dlarray2single( reshape(residuals,Nmeas,Nvol)).';
             out.final.Niteration    = epoch;
 
             out.min.loss            = minLoss;
             out.min.loss_fidelity   = utils.dlarray2single(minLossFidelity);
             out.min.loss_reg        = utils.dlarray2single(minLossRegularisation);
             out.min.resloss         = utils.reshape_ND2image( utils.dlarray2single( mean(reshape(minResiduals,Nmeas,Nvol),1)).',mask);
-            out.min.residual        = utils.dlarray2single( reshape(minResiduals,Nmeas,Nvol));
+            out.min.residual        = utils.dlarray2single( reshape(minResiduals,Nmeas,Nvol)).';
             out.min.Niteration      = minIteration;
            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -449,18 +430,6 @@ classdef askadam < handle
             if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres   = 1;        end
             
             if ~iscell(fitting2.lambda);                fitting2.lambda = num2cell(fitting2.lambda); end
-
-            switch fitting2.optimiser
-                case 'adam'
-                    if ~isfield(fitting,'adamupdateGradDecay');         fitting2.adamupdateGradDecay        = .9;    end
-                    if ~isfield(fitting,'adamupdateSqGradDecay');       fitting2.adamupdateSqGradDecay      = .999;  end
-                    if ~isfield(fitting,'adamupdateEpsilon');           fitting2.adamupdateEpsilon          = 1e-8;  end
-                case 'sgdm'
-                    if ~isfield(fitting,'sgdmupdateMomentum');          fitting2.sgdmupdateMomentum         = .9;    end
-                case 'rmsprop'
-                    if ~isfield(fitting,'rmspropupdateSqGradDecay');    fitting2.rmspropupdateSqGradDecay   = .9;    end
-                    if ~isfield(fitting,'rmspropupdateEpsilon');        fitting2.rmspropupdateEpsilon       = 1e-8;  end
-            end
             
         end
 
@@ -681,9 +650,9 @@ classdef askadam < handle
 
         %% DEBUG tools
 
-        function isNaNInf = check_nan_in_gradients(gradients, mask)
+        function check_nan_in_gradients(gradients, mask)
 
-            isNaNInf = false;
+            isNaN = false;
 
             % get field name
             fields = fieldnames(gradients);
@@ -692,10 +661,10 @@ classdef askadam < handle
                 % masking
                 gradNorm = sqrt(sum( utils.vectorise_NDto2D(gradients.(fields{k}),mask) .^2));
 
-                isNaNInf = or(or(isNaNInf,isnan(gradNorm)),isinf(gradNorm));
+                isNaN = or(isNaN,isnan(gradNorm));
             end
 
-             if isNaNInf; disp('Gradients have NaN(s)!'); end
+             if isNaN; disp('Gradients have NaN(s)!'); end
         end
 
         function lineLoss = setup_display

@@ -1,5 +1,5 @@
 
-addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/dwi/C2_protocoldesign'));
+addpath(genpath('../../dwi/C2_protocoldesign'));
 clear
 
 %% Simulation setting
@@ -29,16 +29,16 @@ Nav   = Ngdir*ones(numel(bval),1);
 
 N = Nsample;
 
-NEXIobj = NEXI(bval, Delta);
+NEXIobj = NEXIrotinv(bval, Delta);
 SMEXobj = SMEXSH(bval, Delta, delta);
-intervals = [0.01 0.99  ;   % fa: intra-neurite volume fraction
-                0.1 3   ;   % Da: intra-neurite axial diffusivity
-                0.1 3   ;   % De/Da: ratio of Da to De
-                1 50    ;   % (1-fa)/r: exchange time
+intervals = [0.1 0.9  ;   % fa: intra-neurite volume fraction
+                1.5 3   ;   % Da: intra-neurite axial diffusivity
+                0.5 1.5   ;   % De/Da: ratio of Da to De
+                2 50    ;   % (1-fa)/r: exchange time
               0.5 1.5]  ;   % kappa
 pars      = intervals(:,1) + rand(size(intervals,1),N).*diff(intervals,[],2);
 % pars(3,:) = pars(2,:) .* pars(3,:);         % De: extra-cellular diffusivity
-pars(4,:) = 1./pars(4,:).*(1-pars(1,:));    % r: exchange rate (intra to extra)
+pars(4,:) = max(1./pars(4,:).*(1-pars(1,:)),1/200);    % r: exchange rate (intra to extra)
 
 tmp = pars;
 ind = find(pars(2,:)<pars(3,:));
@@ -80,16 +80,18 @@ GT.ra = pars(4,:);
 GT.p2 = pl(2,:);
 
 %% askadam estimation
-fitting                     = [];
+objGPU = gpuNEXI(bval, Delta);
+
+fitting                     = objGPU.check_set_default([]);
 fitting.iteration           = 4000;
 fitting.initialLearnRate    = 0.001;
 fitting.convergenceValue    = 1e-8;
 fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-3;
-fitting.isdisplay           = false;
-fitting.isPrior             = 1;   
+fitting.tol                 = 1e-8;
+fitting.isDisplay           = false; 
 fitting.lmax                = 2;  
-fitting.randomness          = 0;  
+fitting.patience            = 5;    
+fitting.start               = 'likelihood'; 
 
 mask = ones(size(S_SH_NEXI_n,1:3),'logical');
 extraData = [];
@@ -98,10 +100,15 @@ extraData.bvec      = bvec_all.';
 extraData.ldelta    = delta_all.';
 extraData.BDELTA    = DELTA_all.';
 
-objGPU      = gpuNEXI(bval, Delta);
-out         = objGPU.estimate(S_SH_NEXI_n, mask, extraData, fitting);
+out = objGPU.estimate(S_SH_NEXI_n, mask, extraData, fitting);
+
+% obj = DWIutility();
+% s = obj.get_Sl_all(S_SH_NEXI_n,extraData.bval,extraData.bvec,extraData.ldelta,extraData.BDELTA,2);
+% shat = permute(objGPU.FWD(GT,2),[2 3 4 1]);
+% out = objGPU.estimate(shat, mask, extraData, fitting);
 
 %% plot result
+figure;
 field = fieldnames(GT);
 tiledlayout(1,numel(field)+1);
 for k = 1:numel(field)

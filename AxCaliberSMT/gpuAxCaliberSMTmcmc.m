@@ -13,11 +13,11 @@ classdef gpuAxCaliberSMTmcmc < handle
         % fcsf  : CSF fraction
         % DeR   : hindered diffusion diffusivity [um2/ms]
         % noise : noise level
-        model_params    = {'a';                   'f';'fcsf';                'DeR';'noise'};
+        modelParams     = {'a';                   'f';'fcsf';                'DeR';'noise'};
         ub              = [ 20;                     1;     1;                    3;    0.1];
         lb              = [0.1;                     0;     0;                 0.01;   0.01];
         step            = [0.24875;              0.05;  0.05;   0.0393421052631579;  0.005];
-        startpoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895;	  0.05];
+        startPoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895;	  0.05];
 
     end
 
@@ -125,7 +125,7 @@ classdef gpuAxCaliberSMTmcmc < handle
             disp(['Diffusivity intra-cellular axial (um2/ms)    : ' num2str(this.Da,'%.2f')]);
             disp(['Diffusivity extra-cellular axial (um2/ms)    : ' num2str(this.DeL,'%.2f')]);
             disp(['Diffusivity CSF (um2/ms)                     : ' num2str(this.Dcsf,'%.2f')]);
-            fprintf('\n')
+            disp('----------------')
 
         end
 
@@ -176,7 +176,7 @@ classdef gpuAxCaliberSMTmcmc < handle
             % convert datatype to single or logical
             dwi     = single(dwi);
             mask    = mask >0;
-            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+            if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
@@ -185,7 +185,7 @@ classdef gpuAxCaliberSMTmcmc < handle
             out.mask = mask;
 
             % save the estimation results if the output filename is provided
-            mcmc.save_mcmc_output(fitting.output_filename,out)
+            mcmc.save_mcmc_output(fitting.outputFilename,out)
 
         end
         
@@ -214,15 +214,15 @@ classdef gpuAxCaliberSMTmcmc < handle
             % set initial tarting points
             if nargin < 5; pars0 = []; % no user input initial starting points
             else
-                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
             end
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
-            fitting.model_params    = this.model_params;
+            fitting.modelParams     = this.modelParams;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.modelParams)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.modelParams)); end
             fitting.xStepSize = this.step;
 
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
@@ -231,13 +231,15 @@ classdef gpuAxCaliberSMTmcmc < handle
             % 2.1 setup fitting weights
             w = this.compute_optimisation_weights(mask,0); % This is a customised funtion
 
-            % additional message(s)
-            if ischar(fitting.start); disp(['Starting points   : ', fitting.start ]); end; fprintf('\n');
             % set starting points
             if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
 
-            mcmcObj = mcmc(); model = fitting.model;
-            out     = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, model);
+            mcmcObj = mcmc(); 
+            out     = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.model);
+
+            %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
+
+            disp('The estimation is completed.');
 
             % clear GPU
             reset(gpool)
@@ -269,7 +271,7 @@ classdef gpuAxCaliberSMTmcmc < handle
         
         % FWD signal model
         function s = FWD(this, pars,  model)
-            % make sure the first dimension is 1
+            % make sure the first dimension is 1 where all measuremnts will be calculated
             if size(pars.a,1) ~= 1
                 r       = shiftdim(pars.a/2,-1);
                 f       = shiftdim(pars.f,-1);
@@ -281,7 +283,7 @@ classdef gpuAxCaliberSMTmcmc < handle
                 fcsf    = pars.fcsf;
                 DeR     = pars.DeR;
             end
-            % 
+
             % Forward model
             % 1. Intra-cellular signal
             switch lower(model)
@@ -315,6 +317,12 @@ classdef gpuAxCaliberSMTmcmc < handle
         % determine how the starting points will be set up
         function x0 = determine_x0(this,y,mask,fitting) 
 
+            disp('---------------');
+            disp('Starting points');
+            disp('---------------');
+
+            dims = size(mask,1:3);
+
             if ischar(fitting.start)
                 switch lower(fitting.start)
                     case 'likelihood'
@@ -323,24 +331,23 @@ classdef gpuAxCaliberSMTmcmc < handle
     
                     case 'default'
                         % use fixed points
-                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n\n',mcmc.cell2str(this.model_params),replace(num2str(this.startpoint.',' %.2f'),' ',','));
-                        fitting.start = this.startpoint;
-                        x0 = mcmc.initialise_start(size(mask,1:3),fitting);
-                        % x0 = repmat(this.startpoint, 1, Nv);
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n\n', cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
+                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
                     
                 end
             else
                 % user defined starting point
                 x0 = fitting.start(:);
-                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n\n',mcmc.cell2str(this.model_params),replace(num2str(x0.',' %.2f'),' ',','));
-                x0 = mcmc.initialise_start(dims,fitting);
-                % x0 = repmat(x0, 1, Nv);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
             end
-            fprintf('Estimation lower bound [%s]: [%s]\n',      mcmc.cell2str(this.model_params),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
-            fprintf('Estimation upper bound [%s]: [%s]\n',      mcmc.cell2str(this.model_params),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            
+            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
             if strcmpi(fitting.algorithm,'mh')
-                fprintf('MCMC step size [%s]: [%s]\n\n',        mcmc.cell2str(this.model_params),replace(num2str(this.step.',' %.2f'),'  ',','));
+                fprintf('MCMC step size [%s]: [%s]\n\n',        cell2str(this.modelParams),replace(num2str(this.step.',' %.2f'),'  ',','));
             end
+            ('---------------');
         end
 
         % using maximum likelihood method to estimate starting points
@@ -413,11 +420,11 @@ classdef gpuAxCaliberSMTmcmc < handle
             end
 
             for km = 1:size(pars,4)
-                pars0.(this.model_params{km}) = pars(:,:,:,km); 
+                pars0.(this.modelParams{km}) = pars(:,:,:,km); 
             end
 
             % noise
-            pars0.(this.model_params{end}) = single(ones(size(mask)) * this.startpoint(end));
+            pars0.(this.modelParams{end}) = single(ones(size(mask)) * this.startPoint(end));
 
         end
 
@@ -452,7 +459,7 @@ classdef gpuAxCaliberSMTmcmc < handle
                 params.fcsf = pars(3,:);
                 params.DeR  = pars(4,:);
 
-                Sl0 = this.FWD(params, [],model);
+                Sl0 = this.FWD(params, model);
 
                 % remaining signals (dot, soma)
                 x_train(:,:,k) = pars;
@@ -532,16 +539,9 @@ classdef gpuAxCaliberSMTmcmc < handle
             fitting2 = mcmc.check_set_default_basic(fitting);
 
             % get fitting algorithm setting
-            if ~isfield(fitting,'start')
-                fitting2.start = 'default';
-            end
-            if ~isfield(fitting,'model')
-                fitting2.model = 'vangelderen';
-            end
-            % if ~isfield(fitting,'boundary')
-            %     % otherwise uses default
-            %     fitting2.boundary   = cat(2, this.lb(:),this.ub(:));
-            % end
+            if ~isfield(fitting,'start');       fitting2.start = 'default'; end
+            if ~isfield(fitting,'model');       fitting2.model = 'vangelderen'; end
+           
             if isfield(fitting,'step')
                 if numel(fitting.step) == numel(this.step)
                     % update step size in the constructor

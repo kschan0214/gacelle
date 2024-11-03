@@ -7,6 +7,7 @@ classdef mcmc < handle
 % Date created: 13 June 2024 
 % Date modified: 7 August 2024
 % Date modified: 23 August 2024
+% Date modified: 5 October 2024
 %
     properties (GetAccess = public, SetAccess = protected)
 
@@ -21,15 +22,15 @@ classdef mcmc < handle
         % weights       : N-D weights for optimisaiton, same dim as 'data'
         % pars0         : Structure variable containing all parameters to be estimated
         % fitting       : Structure variable containing all fitting algorithm setting
-        %   .model_params       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
-        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'model_params', e.g. [0.5, 0, 0.001];
-        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'model_params', e.g. [2, 1, 0.1];
+        %   .modelParams       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
+        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'modelParams', e.g. [0.5, 0, 0.001];
+        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];
         %   .algorithm          : MCMC algorithm, 'MH'|'GW'
         %   .iteration          : # MCMC iterations
         %   .thinning           : sampling interval between iterations
         %   .burnin             : iterations at the beginning to be discarded, if burnin>1, then the exact number will  be used; if 0<burnin<1 then actual burnin = iteration*burnin
         %   .repetition         : # repetition of MCMC proposal
-        %   .xStepSize          : step size of model parameter in MCMC proposal, same size and order as 'model_params' ('MH' only)
+        %   .xStepSize          : step size of model parameter in MCMC proposal, same size and order as 'modelParams' ('MH' only)
         %   .StepSize           : step size for 'GW' in MCMC proposal ('GW' only)
         %   .Nwalker            : # random walkers ('GW' only)
         % FWDfunc       : function handle of forward model
@@ -42,9 +43,9 @@ classdef mcmc < handle
             this.display_basic_algorithm_parameters(fitting);
 
             % mask data to reduce memory load
-            data = this.vectorise_NDto2D(data,mask).';
-            if ~isempty(weights); weights = this.vectorise_NDto2D(weights,mask).'; else; weights = ones(size(data),'like',data); end
-            for km = 1:numel(fitting.model_params); pars0.(fitting.model_params{km}) = this.vectorise_NDto2D( pars0.(fitting.model_params{km}), mask).' ;end
+            data = utils.reshape_ND2AD(data,mask);
+            if ~isempty(weights); weights = utils.reshape_ND2AD(weights,mask); else; weights = ones(size(data), 'like', data); end
+            pars0 = utils.reshape_ND2AD_struct(pars0,mask);
 
             % MCMC
             if strcmpi(fitting.algorithm,'mh')
@@ -65,14 +66,14 @@ classdef mcmc < handle
         % x0        : structure array, starting points, N fields, each field 1xNvoxel
         % weights   : weighting for non-linear least square fitting, same dimension as y
         % fitting       : Structure variable containing all fitting algorithm setting
-        %   .model_params       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
-        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'model_params', e.g. [0.5, 0, 0.001];
-        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'model_params', e.g. [2, 1, 0.1];
+        %   .modelParams       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
+        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'modelParams', e.g. [0.5, 0, 0.001];
+        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];
         %   .iteration          : # MCMC iterations
         %   .thinning           : sampling interval between iterations
         %   .burnin             : iterations at the beginning to be discarded, if burnin>1, then the exact number will  be used; if 0<burnin<1 then actual burnin = iteration*burnin
         %   .repetition         : # repetition of MCMC proposal
-        %   .xStepSize          : step size of model parameter in MCMC proposal, same size and order as 'model_params' ('MH' only)
+        %   .xStepSize          : step size of model parameter in MCMC proposal, same size and order as 'modelParams' ('MH' only)
         % FWDfunc   : function handle for forward signal model
         % varargin  : other input required for @FWDfunc
         %
@@ -83,7 +84,7 @@ classdef mcmc < handle
             % Nm: # measurements; Nv: # voxels
             [Nm, Nv]    = size(y);
             % Nvar: # estimation parameters
-            Nvar        = numel(fitting.model_params);
+            Nvar        = numel(fitting.modelParams);
             Nburnin     = this.get_number_burnin(fitting);
             % Ns: # samples in posterior distribution
             Ns          = numel(Nburnin+1:fitting.thinning:fitting.iteration);  %floor( (fitting.iteration - floor(fitting.iteration*fitting.burnin)) / fitting.thinning );
@@ -91,7 +92,7 @@ classdef mcmc < handle
             % convert data into single datatype for better performance and out themn into GPU
             y       = gpuArray( single(y) );
             weights = gpuArray( single(weights) );
-            for km = 1:Nvar; x0.(fitting.model_params{km}) = gpuArray(single( x0.(fitting.model_params{km}) ));end
+            for km = 1:Nvar; x0.(fitting.modelParams{km}) = gpuArray(single( x0.(fitting.modelParams{km}) ));end
             xStepsize = gpuArray(single(fitting.xStepSize(:)));
             % setup boundary variables
             lb          = gpuArray( single(repmat(fitting.lb(:),1,Nv)));
@@ -102,9 +103,9 @@ classdef mcmc < handle
             % compute likelihood at starting points
             % logP is converted into external function for specific CUDA kernel 
             % logP = @(X, Y) -sum( (this.FWD(X(1:4, :), model)-Y).^2, 1 )./(2*X(5,:).^2) + Nm/2*log(1./X(5,:).^2);
-            xCurr   = this.struct2array(x0,fitting.model_params);      % extract parameter structure to numeric array for faster computation
+            xCurr   = this.struct2array(x0,fitting.modelParams);      % extract parameter structure to numeric array for faster computation
             xCurr   = max(xCurr,lb); xCurr = min(xCurr,ub);            % set boundary
-            x0      = this.array2struct(xCurr,fitting.model_params);   % convert array back to structure for FWD function
+            x0      = this.array2struct(xCurr,fitting.modelParams);   % convert array back to structure for FWD function
             logP0   = arrayfun(@logP_Gaussian, sum( weights.* (FWDfunc(x0,varargin{:})-y).^2, 1 ), x0.noise, Nm);
 
             disp('-------------------------');
@@ -117,7 +118,7 @@ classdef mcmc < handle
 
             % reset start point
             logPCurr    = logP0;
-            xCurr       = this.struct2array(x0,fitting.model_params);
+            xCurr       = this.struct2array(x0,fitting.modelParams);
 
             counter = 0; start = tic;
             for k = 1:fitting.iteration
@@ -129,7 +130,7 @@ classdef mcmc < handle
                 % replace out of bound by boundary values to avoid error when compting probability
                 xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
                 % convert the proposal into structure array for FWD function
-                xProposed_struct = this.array2struct(xProposed,fitting.model_params);
+                xProposed_struct = this.array2struct(xProposed,fitting.modelParams);
 
                 % 2. Metropolis sampling
                 % If the probability ratio of new to old > threshold, we take the new solution.
@@ -161,10 +162,10 @@ classdef mcmc < handle
             end
 
             % convert final posterior distribution into structure
-            xPosterior = this.array2struct(xPosterior,fitting.model_params);
-            for kvar = 1:Nvar; xPosterior.(fitting.model_params{kvar}) = shiftdim(xPosterior.(fitting.model_params{kvar}),1); end
+            xPosterior = this.array2struct(xPosterior,fitting.modelParams);
+            for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
 
-            disp('The process is completed.')
+            disp('The Metroplis-Hastings MCMC sampling is completed.')
 
         end
 
@@ -176,9 +177,9 @@ classdef mcmc < handle
         % weights   : weighting for non-linear least square fitting, same dimension as y
         % pars0         : Structure variable containing all parameters to be estimated
         % fitting       : Structure variable containing all fitting algorithm setting
-        %   .model_params       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
-        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'model_params', e.g. [0.5, 0, 0.001];
-        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'model_params', e.g. [2, 1, 0.1];
+        %   .modelParams       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
+        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'modelParams', e.g. [0.5, 0, 0.001];
+        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];
         %   .iteration          : # MCMC iterations
         %   .thinning           : sampling interval between iterations
         %   .burnin             : iterations at the beginning to be discarded, if burnin>1, then the exact number will  be used; if 0<burnin<1 then actual burnin = iteration*burnin
@@ -200,7 +201,7 @@ classdef mcmc < handle
             % Nm: # measurements; Nv: # voxels
             [Nm, Nv] = size(y);
             % Nvar: # estimation parameters
-            Nvar     = numel(fitting.model_params);
+            Nvar     = numel(fitting.modelParams);
             Nburnin  = this.get_number_burnin(fitting);
             % Ns: # samples in posterior distribution
             Ns       = numel(Nburnin+1:fitting.thinning:fitting.iteration);
@@ -210,7 +211,7 @@ classdef mcmc < handle
             % convert data into single datatype for better performance
             y       = gpuArray( single(y) );
             weights = gpuArray( single(weights) );
-            for km = 1:Nvar; x0.(fitting.model_params{km}) = gpuArray(single( x0.(fitting.model_params{km}) ));end
+            for km = 1:Nvar; x0.(fitting.modelParams{km}) = gpuArray(single( x0.(fitting.modelParams{km}) ));end
         
             % setup boundary variables
             lb          = gpuArray( single(repmat(fitting.lb(:),1,Nv,Nwalker)));
@@ -222,10 +223,10 @@ classdef mcmc < handle
             
             % initiate an ensemble of walkers around the starting position (0.1% full range) with Gaussian distribution
             % 1st: Nvar;2nd: Nv; 3rd: Nwalker
-            xCurr   = this.struct2array(x0,fitting.model_params);       % extract parameter structure to numeric array for faster computation
+            xCurr   = this.struct2array(x0,fitting.modelParams);       % extract parameter structure to numeric array for faster computation
             xCurr   = xCurr + (ub-lb)*0.001.*randn(size(ub));           % initiate starting position for all walkers
             xCurr   = max(xCurr,lb); xCurr = min(xCurr,ub);             % set boundary
-            x0      = this.array2struct(xCurr,fitting.model_params);    % convert array back to structure for FWD function
+            x0      = this.array2struct(xCurr,fitting.modelParams);    % convert array back to structure for FWD function
             % compute likelihood at starting points
             logP0   = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0, varargin{:})-y).^2, 1 ), x0.noise, Nm);
         
@@ -237,7 +238,7 @@ classdef mcmc < handle
             fprintf('Repetition #%i/%i \n',ii,fitting.repetition)
         
             logPCurr= logP0;
-            xCurr   = this.struct2array(x0,fitting.model_params);
+            xCurr   = this.struct2array(x0,fitting.modelParams);
         
             counter = 0; start = tic;
             for k = 1:fitting.iteration
@@ -252,7 +253,7 @@ classdef mcmc < handle
                 % replace boundary values so it does not give error when compting probability
                 xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
                 % convert the proposal into structure array for FWD function
-                xProposed_struct = this.array2struct(xProposed,fitting.model_params);
+                xProposed_struct = this.array2struct(xProposed,fitting.modelParams);
         
                 % 2. Metropolis sampling
                 % If the probability ratio of new to old > threshold, we take the new solution.
@@ -284,58 +285,11 @@ classdef mcmc < handle
             end
 
             % convert final posterior distribution into structure
-            xPosterior = this.array2struct(xPosterior,fitting.model_params);
-            for kvar = 1:Nvar; xPosterior.(fitting.model_params{kvar}) = shiftdim(xPosterior.(fitting.model_params{kvar}),1); end
+            xPosterior = this.array2struct(xPosterior,fitting.modelParams);
+            for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
         
-            disp('The process is completed.')
+            disp('The affline invariant ensemble MCMC sampling is completed.')
         
-        end
-
-        % convert estimation into organised output structure
-        function out = res2out(this,xPosterior,fitting,mask)
-            
-            % store the unshaped posterior into out
-            out.posterior = xPosterior;
-
-            % compute additional metric if specified
-            fields = fieldnames(xPosterior);
-
-            Nvox    = size(xPosterior.(fields{1}),1);
-            Nsample = prod(size(xPosterior.(fields{1}),2:5));
-
-            metrics = fitting.metric;
-            if ~isempty(metrics)
-                for km = 1:numel(metrics)
-                    switch lower(metrics{km})
-                        case 'mean'
-                            for kvar=1:numel(fields)
-                                tmp = mean( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
-                                tmp = this.ND2image(tmp,mask);
-                                out.mean.(fields{kvar}) = tmp;
-                            end
-                        case 'median'
-                            for kvar=1:numel(fields)
-                                tmp = median( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
-                                tmp = this.ND2image(tmp,mask);
-                                out.median.(fields{kvar}) = tmp;
-                            end
-                        case 'std'
-                            for kvar=1:numel(fields)
-                                tmp = std( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),[],2);
-                                tmp = this.ND2image(tmp,mask);
-                                out.std.(fields{kvar}) = tmp;
-                            end
-                        case 'iqr'
-                            for kvar=1:numel(fields)
-                                tmp = iqr( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
-                                tmp = this.ND2image(tmp,mask);
-                                out.iqr.(fields{kvar}) = tmp;
-                            end
-                    end
-                end
-            end
-
-
         end
 
     end
@@ -359,39 +313,23 @@ classdef mcmc < handle
             fitting2 = fitting;
 
             % get fitting algorithm setting
-            if ~isfield(fitting,'iteration')
-                fitting2.iteration = 2e5;
+            if ~isfield(fitting,'iteration');           fitting2.iteration      = 2e5;              end
+            if ~isfield(fitting,'thinning');            fitting2.thinning       = 20;               end  % thinning, sampled every 100 interval
+            if ~isfield(fitting,'metric');              fitting2.metric         = {'mean','std'};   end
+            if ~isfield(fitting,'burnin');              fitting2.burnin         = 0.1;              end  % 10% burnin
+            
+            if ~isfield(fitting,'repetition');          fitting2.repetition     = 1;                end 
+            if ~isfield(fitting,'outputFilename');      fitting2.outputFilename = [];               end
+            if ~isfield(fitting,'algorithm');           fitting2.algorithm      = 'MH';             end
+            if ~isfield(fitting,'StepSize');            fitting2.StepSize       = 2;                end
+            if ~isfield(fitting,'Nwalker');             fitting2.Nwalker        = 50;               end 
+            if ~isfield(fitting,'ub');                  fitting2.ub             = [];               end
+            if ~isfield(fitting,'lb');                  fitting2.lb             = [];               end
+
+            if any(ismember(fitting2.metric,'mode'))
+                if ~isfield(fitting,'Nbin');            fitting2.Nbin     = 1001;                end 
             end
-            if ~isfield(fitting,'thinning')
-                fitting2.thinning = 20;    % thinning, sampled every 100 interval
-            end
-            if ~isfield(fitting,'metric')
-                fitting2.metric = {'mean','std'};
-            end
-            if ~isfield(fitting,'burnin')
-                fitting2.burnin = 0.1;      % 10% burnin
-            end
-            if ~isfield(fitting,'repetition')
-                fitting2.repetition = 1;
-            end 
-            if ~isfield(fitting,'output_filename')
-                fitting2.output_filename = [];
-            end
-            if ~isfield(fitting,'algorithm')
-                fitting2.algorithm = 'MH';
-            end
-            if ~isfield(fitting,'StepSize')
-                fitting2.StepSize = 2;
-            end
-            if ~isfield(fitting,'Nwalker')
-                fitting2.Nwalker = 50;
-            end 
-            if ~isfield(fitting,'ub')
-                fitting2.ub = [];
-            end
-            if ~isfield(fitting,'lb')
-                fitting2.lb = [];
-            end
+
             if ~iscell(fitting2.metric)
                 fitting2.metric = cellstr(fitting2.metric);
             end
@@ -400,18 +338,9 @@ classdef mcmc < handle
         % display fitting algorithm parameters
         function display_basic_algorithm_parameters(fitting)
 
-            if strcmpi( fitting.algorithm, 'gw')
-                algorithm = 'Affine-Invariant Ensemble';
-            else
-                algorithm = 'Metropolis-Hastings';
-            end
+            if strcmpi( fitting.algorithm, 'gw');   algorithm = 'Affine-Invariant Ensemble';
+            else;                                   algorithm = 'Metropolis-Hastings';          end
 
-            if fitting.burnin > 1
-                burnin = (fitting.burnin ./ fitting.iteration) * 100;
-            else
-                burnin = fitting.burnin * 100;
-            end
-            
             disp('----------------------------------------------------');
             disp('Markov Chain Monte Carlo (MCMC) algorithm parameters');
             disp('----------------------------------------------------');
@@ -419,77 +348,29 @@ classdef mcmc < handle
             disp(['No. of iterations : ', num2str(fitting.iteration)]);
             disp(['No. of repetitions: ', num2str(fitting.repetition)])
             disp(['Thinning          : ', num2str(fitting.thinning)]);
-            disp(['Burn-in (%)       : '  num2str(burnin)])
+            disp(['Burn-in (#iter.)  : '  num2str(mcmc.get_number_burnin(fitting))])
             disp(['Metric(s)         : ', cell2str(fitting.metric)]);
             if strcmpi( fitting.algorithm, 'gw'); disp(['Step size         : ', num2str(fitting.StepSize) ]); end
             if strcmpi( fitting.algorithm, 'gw'); disp(['No. of walkers    : ', num2str(fitting.Nwalker) ]); end
 
         end
         
-        % vectorise N-D image to 2D with the 1st dimension=spataial dimension and 2nd dimension=combine from 4th and onwards 
-        function [data, mask_idx] = vectorise_NDto2D(data,mask)
-
-            dims = size(data,[1 2 3]);
-
-            if nargin < 2
-                mask = ones(dims);
-            end
-
-             % vectorise data
-            data        = reshape(data,prod(dims),prod(size(data,4:ndims(data))));
-            mask_idx    = find(mask>0);
-            data        = data(mask_idx,:);
-
-            if ~isreal(data)
-                data = cat(2,real(data),imag(data));
-            end
-
-        end
-
-        % this utility function to convert the MCMC posterior distribution into 4D/5D image
-        function img = ND2image(dist,mask)
-            
-            imageDims = size(mask,1:3);
-            extraDims = size(dist,2:ndims(dist));
-
-            % find masked signal
-            mask_idx            = find(mask>0);
-            % reshape the input to an image         
-            img                     = zeros(numel(mask),extraDims,'single'); 
-            img(mask_idx,:,:,:,:,:) = dist; 
-            img                     = reshape(img, [imageDims, extraDims]);
-            
-        end
-
-        % initialise parameters
-        function parameters = initialise_start(dims,fitting)
-            
-            % get relevant parameters
-            model_params    = fitting.model_params;
-
-            for k = 1:numel(model_params)
-                parameters.(model_params{k}) = ones(dims,'single') *fitting.start(k);
-            end
-
-
-        end
-
         % save the mcmc output structure variable into disk space 
-        function save_mcmc_output(output_filename,out)
+        function save_mcmc_output(outputFilename,out)
         % Input
         % ------------------
-        % output_filename   : output filename
+        % outputFilename   : output filename
         % out               : output structure of askadam
         %
 
             % save the estimation results if the output filename is provided
-            if ~isempty(output_filename)
-                [output_dir,~,~] = fileparts(output_filename);
+            if ~isempty(outputFilename)
+                [output_dir,~,~] = fileparts(outputFilename);
                 if ~exist(output_dir,'dir')
                     mkdir(output_dir);
                 end
-                save(output_filename,'out');
-                fprintf('Estimation output is saved at %s\n',output_filename);
+                save(outputFilename,'out');
+                fprintf('Estimation output is saved at %s\n',outputFilename);
             end
         end
 
@@ -530,11 +411,65 @@ classdef mcmc < handle
             end
         end
 
-        function st = cell2str(cellStr)
-            cellStr= cellfun(@(x){[x ',']},cellStr);  % Add ',' after each string.
-            st = cat(2,cellStr{:});  % Convert to string
-            st(end) = [];  % Remove last ','
+        % convert estimation into organised output structure
+        function out = res2out(xPosterior,fitting,mask)
+            
+            % store the unshaped posterior into out
+            out.posterior = xPosterior;
+
+            % compute additional metric if specified
+            fields = fieldnames(xPosterior);
+
+            Nvox    = size(xPosterior.(fields{1}),1);
+            Nsample = prod(size(xPosterior.(fields{1}),2:5));
+
+            metrics = fitting.metric;
+            if ~isempty(metrics)
+                for km = 1:numel(metrics)
+                    switch lower(metrics{km})
+                        case 'mean'
+                            for kvar=1:numel(fields)
+                                tmp = mean( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
+                                tmp = utils.reshape_ND2image(tmp,mask);
+                                out.mean.(fields{kvar}) = tmp;
+                            end
+                        case 'median'
+                            for kvar=1:numel(fields)
+                                tmp = median( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
+                                tmp = utils.reshape_ND2image(tmp,mask);
+                                out.median.(fields{kvar}) = tmp;
+                            end
+                        case 'std'
+                            for kvar=1:numel(fields)
+                                tmp = std( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),[],2);
+                                tmp = utils.reshape_ND2image(tmp,mask);
+                                out.std.(fields{kvar}) = tmp;
+                            end
+                        case 'iqr'
+                            for kvar=1:numel(fields)
+                                tmp = iqr( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
+                                tmp = utils.reshape_ND2image(tmp,mask);
+                                out.iqr.(fields{kvar}) = tmp;
+                            end
+                        case 'mode'
+                            for kvar=1:numel(fields)
+
+                                Nbin = fitting.Nbin;
+
+                                idx     = find(ismember(fitting.modelParams,fields{kvar}));
+                                edges   = linspace(fitting.lb(idx)-1e-8,fitting.ub(idx)+1e-8,Nbin);
+
+                                tmp     = reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]);
+                                tmp     = mode(discretize(tmp,edges),2);
+                                tmp     = (edges(tmp) + edges(tmp+1)) / 2;
+                                tmp     = utils.reshape_ND2image(tmp.',mask);
+                                out.mode.(fields{kvar}) = tmp;
+                            end
+                    end
+                end
+            end
         end
+
 
     end
 end

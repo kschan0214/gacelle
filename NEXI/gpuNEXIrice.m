@@ -1,4 +1,4 @@
-classdef gpuNEXI < handle
+classdef gpuNEXIrice < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 8 Dec 2023 (v0.1.0)
@@ -14,7 +14,7 @@ classdef gpuNEXI < handle
         % ra        : exchange rate from neurite to extracellular space [1/s]
         % p2        : non-linear neurite dispersion index
         modelParams     = {'fa';'Da';'De';'ra';'p2'};
-        ub              = [   1;   3;   3;   1;  1];
+        ub              = [1-eps;   3;   3;   1;  1];
         lb              = [ eps; eps; eps;1/250; eps];
         startPoint      = [ 0.4;   2;   1; 0.05; 0.2];
     end
@@ -28,7 +28,7 @@ classdef gpuNEXI < handle
     methods
 
         % constructuor
-        function this = gpuNEXI(b, Delta, varargin)
+        function this = gpuNEXIrice(b, Delta, varargin)
         % NEXI Exchange rate estimation using NEXI model
         % obj = gpuNEXI(b, Delta, Nav)
         %
@@ -87,9 +87,9 @@ classdef gpuNEXI < handle
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('========================');
-            disp('NEXI with askAdam solver');
-            disp('========================');
+            disp('=============================');
+            disp('NEXI Rice with askAdam solver');
+            disp('=============================');
 
             disp('----------------')
             disp('Data Information');
@@ -101,7 +101,7 @@ classdef gpuNEXI < handle
 
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out] = estimate(this, dwi, mask, extradata, fitting, pars0)
+        function  [out] = estimate(this, dwi, mask, extraData, fitting, pars0)
         % Perform NEXI model parameter estimation based on askAdam
         % Input data are expected in multi-dimensional image
         % 
@@ -139,7 +139,7 @@ classdef gpuNEXI < handle
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [dwi,mask] = this.prepare_dwi_data(dwi,mask,extradata,fitting.lmax);
+            [dwi,mask,extraData] = this.prepare_dwi_data(dwi,mask,extraData,fitting.lmax);
 
             % mask sure no nan or inf
             [dwi,mask] = utils.remove_img_naninf(dwi,mask);
@@ -182,9 +182,10 @@ classdef gpuNEXI < handle
                 mask_tmp    = mask(:,:,slice);
                 if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end
                 else;               pars0_tmp = [];                 end
+                fields      = fieldnames(extraData); for kfield = 1:numel(fields); if all(size(extraData.(fields{kfield}),1:3) == size(mask)); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); end; end
 
                 % run fitting
-                [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+                [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp,pars0_tmp);
 
                 % restore 'out' structure from segment
                 out = utils.restore_segment_structure(out,out_tmp,slice,ks);
@@ -199,7 +200,7 @@ classdef gpuNEXI < handle
         end
 
         % Data fitting function, can be 2D (voxel-based) or 4D (image-based)
-        function [out] = fit(this,dwi,mask,fitting,pars0)
+        function [out] = fit(this,dwi,mask,fitting,extraData,pars0)
         %
         % Input
         % -----------
@@ -283,19 +284,25 @@ classdef gpuNEXI < handle
             w = this.compute_optimisation_weights(mask,fitting.lossFunction,fitting.lmax); % This is a customised funtion
 
             % 2.2 estimate prior if needed
-            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
+            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting,extraData); end
 
             % You may add more dispay messages here
             disp('---------------------------');
             disp('Additional model parameters');
             disp('---------------------------');
-            disp(['NEXI rotational invariant model, lmax = ' num2str(fitting.lmax)]);
+            disp(['NEXI Rice rotational invariant model, lmax = ' num2str(fitting.lmax)]);
             disp('---------------------------');
 
             % 2.3 askAdam optimisation main
             askadamObj = askadam();
+
+            % askadam.optimisation does not see extractData so we have to manually mask the data inside here, make sure the voxel is on the second dimension
+            % extraData   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
+            extraData   = utils.masking_ND2AD_preserve_struct(extraData,mask) ;
+
             % initiate starting points arrays
-            out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
+            out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, extraData);
+            % out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
@@ -334,8 +341,21 @@ classdef gpuNEXI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [dwi, mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        function [dwi,mask,extradata] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
             % full DWI data then compute rotaionally invariant signal
+
+            dims = size(dwi,1:3);
+
+            % normalised sigma by b0
+            ind_b0 = extradata.bval == 0;
+            if sum(ind_b0==0)==numel(ind_b0)
+                dwi_b0      = ones(dims);
+            else
+                dwi_b0      = mean(dwi(:,:,:,ind_b0),4);
+            end
+            extradata.sigma = extradata.sigma ./ dwi_b0;
+            extradata.sigma = max(utils.set_nan_inf_zero(extradata.sigma),askadam.epsilon);
+
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
                 % compute spherical mean signal
                 fprintf('Computing rotationally invariant signal...')
@@ -352,11 +372,14 @@ classdef gpuNEXI < handle
             elseif size(dwi,4) < numel(this.b)
                 error('There are more b-shells in the class object than available in the input data. Please check your input data.');
             end
-
+            
             % make sure no NaN/Inf in signal
             [dwi, mask_naninf] = utils.set_nan_inf_zero(dwi); mask_naninf = max(mask_naninf,[],4);
             mask_valid         = and(and(mask, max(dwi,[],4)<=1.01),~mask_naninf);
-
+            % make sure not fitting SNR too low
+            mask_LowSNR = extradata.sigma > 1;  % SNR = 1
+            mask_valid  = and(mask_valid,~mask_LowSNR);
+            
             % check signal similarity
             dwi_2D          = utils.reshape_ND2AD(dwi,mask_valid);
             signalTemplate  = mean(dwi_2D,2,"omitmissing");         % assuming the majority of the signal are from tissues
@@ -370,17 +393,21 @@ classdef gpuNEXI < handle
             Rcorr            = utils.reshape_AD2ND(Rcorr,mask_valid);
             mask_dissimilar  = Rcorr < 0.1;
             mask_valid       = and(mask_valid,~mask_dissimilar);
-
+            
             if numel(mask_valid(mask_valid)) ~= numel(mask(mask)) 
                 disp('Signal mask is updated! Please use the fitted mask in your subsequent analysis.');
                 mask = mask_valid;
             end
+
+            % thres_SNR               = 20;
+            % extradata.maskhighSNR   = (dwi ./extradata.sigma) > thres_SNR;
+
         end
 
         %%%%% Prior estimation related functions %%%%%
 
         % determine how the starting points will be set up
-        function x0 = determine_x0(this,y,mask,fitting) 
+        function x0 = determine_x0(this,y,mask,fitting,extradata) 
 
             disp('---------------');
             disp('Starting points');
@@ -392,7 +419,9 @@ classdef gpuNEXI < handle
                 switch lower(fitting.start)
                     case 'likelihood'
                         % using maximum likelihood method to estimate starting points
-                        x0 = this.estimate_prior(y,mask,[],fitting.lmax);
+                        sigma = median(extradata.sigma(mask>0));
+                        x0 = this.estimate_prior(y,mask,[],sigma);
+                        % x0 = this.estimate_prior(y,mask,[],extradata);
     
                     case 'default'
                         % use fixed points
@@ -417,12 +446,14 @@ classdef gpuNEXI < handle
         end
 
         % using maximum likelihood method to estimate starting points
-        function pars0 = estimate_prior(this,dwi,mask, Nsample,lmax)
+        function pars0 = estimate_prior(this,dwi,mask, Nsample,sigma)
         % Estimation starting points for NEXI using likehood method
 
             start = tic;
             
             disp('Estimate starting points based on likelihood ...')
+
+            lmax = 0;
 
             % manage pool
             pool            = gcp('nocreate');
@@ -439,43 +470,49 @@ classdef gpuNEXI < handle
                 Nsample         = 1e4;
             end
             % create training data
-            [x_train, S_train] = this.traindata(Nsample,lmax);
+            [x_train, S_train] = this.traindata(Nsample);
+            S_train = this.myriceM1(S_train,sigma);
 
             % reshape input data,  put DWI dimension to 1st dim
-            dims    = size(dwi);
-            dwi     = permute(dwi,[4 1 2 3]);
-            dwi     = reshape(dwi,[dims(4), prod(dims(1:3))]);
+            % dims    = size(dwi);
+            dwi     = utils.reshape_ND2AD(dwi,mask);
+            % sigma   = utils.reshape_ND2AD(extradata.sigma,mask);
+            % dwi     = permute(dwi,[4 1 2 3]);
+            % dwi     = reshape(dwi,[dims(4), prod(dims(1:3))]);
 
             % find masked voxels
-            ind         = find(mask(:));
+            % ind         = find(mask(:));
             if lmax == 0
                 Nparam = 4;
             elseif lmax == 2
                 Nparam = 5;
             end
 
-            pars0_mask  = zeros(Nparam,length(ind));
+            % pars0_mask  = zeros(Nparam,length(ind));
+            pars0_mask  = zeros(Nparam,size(dwi,2));
             if ~isempty(pool)
-                parfor kvol = 1:length(ind)
-                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
+                parfor kvol = 1:size(dwi,2)
+                    pars0_mask(:,kvol) = this.likelihood(dwi(:,kvol), x_train, S_train);
                 end
             else
-                for kvol = 1:length(ind)
-                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
+                for kvol = 1:size(dwi,2)
+                    pars0_mask(:,kvol) = this.likelihood(dwi(:,kvol), x_train, S_train);
                 end
             end
-            pars           = zeros(Nparam,size(dwi,2));
-            pars(:,ind)    = pars0_mask;
-
-            % reshape estimation into image
-            pars           = permute(reshape(pars,[size(pars,1) dims(1:3)]),[2 3 4 1]);
+            pars = utils.reshape_AD2ND(pars0_mask,mask);        
+            % pars           = zeros(Nparam,size(dwi,2));
+            % pars(:,ind)    = pars0_mask;
+            % 
+            % % reshape estimation into image
+            % pars           = permute(reshape(pars,[size(pars,1) dims(1:3)]),[2 3 4 1]);
 
             % Correction for CSF
             bval_thres      = max(min(gather(this.b)),1.1);
             idx             = gather(this.b) <= bval_thres;
             D0              = real(this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:)));
-            D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
-            D0              = max(utils.set_nan_inf_zero(D0),0);
+            D0              = utils.reshape_AD2ND(D0,mask);
+            % D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
+            D0              = max(utils.set_nan_inf_zero(D0),1e-8);
             mask_CSF        = D0>1.5;
             
             % ratio to modulate pars0 estimattion
@@ -499,7 +536,7 @@ classdef gpuNEXI < handle
         end
 
         % create training data for likelihood
-        function [x_train, S_train, intervals] = traindata(this, N_samples, lmax, varargin)
+        function [x_train, S_train, intervals] = traindata(this, N_samples, varargin)
             if nargin < 4
                 intervals = [0.01 0.99  ;   % fa
                               1.5 3     ;   % Da
@@ -509,7 +546,7 @@ classdef gpuNEXI < handle
             else
                 intervals = varargin{1};
             end
-            
+            lmax = 0;
             if lmax == 0
                 numBSample = numel(this.b);
                 numParam   = size(intervals,1) - 1;
@@ -533,6 +570,8 @@ classdef gpuNEXI < handle
                 Sl0 = zeros(numel(this.b),batch_size);
                 for j = 1:batch_size
                     Sl0(:,j) = this.Sl0(pars(1,j), pars(2,j), pars(3,j), pars(4,j));
+                    % % Rician floor correction
+                    % Sl0(:,j) = this.myriceM1(Sl0(:,j), sigma);
                 end
 
                 % in case of Sl2
@@ -560,7 +599,8 @@ classdef gpuNEXI < handle
         end
         
         % likelihood
-        function [pars_best, sse_best] = likelihood(this, S0, x_train, S_train,lmax)
+        function [pars_best, sse_best] = likelihood(this, S0, x_train, S_train)
+            lmax = 0;
             wt = kron(this.Nav(:), 1./(2*(0:2:lmax)+1));
             wt = wt(:);
             nL = floor(lmax/2);
@@ -592,7 +632,7 @@ classdef gpuNEXI < handle
         %% NEXI signal related functions
 
         % Forward model to generate NEXI signal
-        function [s] = FWD(this, pars, lmax)
+        function [s] = FWD(this, pars, extraData)
         
             fa   = max(pars.fa, askadam.epsilon); % avoid division by zeros when computing re
             Da   = pars.Da;
@@ -602,11 +642,19 @@ classdef gpuNEXI < handle
             % Sl0
             s = this.Sl0(fa, Da, De, ra);
             
-            % Sl2
-            if lmax == 2
-                p2  = pars.p2;
-                s   = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
-            end
+            % % Sl2
+            % if lmax == 2
+            %     p2  = pars.p2;
+            %     s   = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
+            % end
+
+            % Rician floor correction
+            s = this.myriceM1(s, extraData.sigma);
+            % thres_SNR       = 20;
+            % maskLowSNR      = s./extraData.sigma <= thres_SNR;
+            % sRice           = this.myriceM1(s, extraData.sigma);
+            % s(maskLowSNR)   = sRice(maskLowSNR);
+
 
             % make sure s cannot be greater than 1
             s = min(s,1);   % s = [Nb, Nvoxel]
@@ -627,7 +675,7 @@ classdef gpuNEXI < handle
             Da = bval.*Da;
             De = bval.*De;
             ra = DELTA.*ra;
-            re = ra.*fa./(1-fa);
+            re = ra.*fa./max(1-fa,askadam.epsilon);
             
             % Trapezoidal's rule replacement
             Nx  = 14;    % NRMSE<0.05% for Nx=14
@@ -673,6 +721,37 @@ classdef gpuNEXI < handle
             lm = l1-l2;
             Pp = (fa.*d1 + (1-fa).*d2 - lm)./(l2*2);
             M  = Pp.*exp(-(l1+l2)) + (1-Pp).*exp(-lm); 
+        end
+
+        function M1 = myriceM1( nu, sigma)
+            % if sigma < 1/75
+                % TODO: this neeeded to be tested
+                % M1 = sigma .* sqrt(pi/2) .* hypergeom(-1/2, 1, -nu.^2/2./sigma.^2);
+                % disp('SNR is too high. PLease use the ordinary NEXI model instead.')
+            % else
+                M1              = max(sigma .* sqrt(pi/2) .* gpuNEXIrice.myL12(-nu.^2/2./sigma.^2),nu);
+                % M1              = min(M1,max(nu));
+                % M1(isnan(M1))   = nu(isnan(M1));
+                % M1(isinf(M1))   = nu(isinf(M1));
+            % end
+        end
+
+        function y = myL12(x)
+            x = max(x,-170);
+            % TODO: besseli does not support dlarray
+            y = exp(x/2) .* ( (1-x).*gpuNEXIrice.mybesseli(0,-x/2) - x.*gpuNEXIrice.mybesseli(1,-x/2) );
+            % y = exp(x/2) .* ( (1-x).*besseli(0,-x/2) - x.*besseli(1,-x/2) );
+            % y = hypergeom(-1/2,1,x);
+        end
+
+        function y = L12(x)
+            y = exp(x/2) .* ( (1-x).*besseli(0,-x/2) - x.*besseli(1,-x/2) );
+        end
+
+        function I = mybesseli(nu,z)
+            Nx  = 34;    % NRMSE<0.05% for Nx=34
+            x   = zeros([ones(1,ndims(z)), Nx]); x(:) = linspace(0,pi,Nx);
+            I   = 1/pi * trapz(x(:),exp(z.*cos(x)).*cos(nu*x),ndims(x));
         end
 
         %% Utilities

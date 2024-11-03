@@ -39,7 +39,8 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.isdisplay         | boolean, display optimisation process in graphic plot                                                        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation, set to -inf to disable checking the gradient            |
+| fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation, set to -inf to disable checking the gradient;           |
+|                           | +ve: decreasing loss; -ve: increasing loss                                                                   |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.convergenceWindow | #iterations in which 'convergenceValue' is computed                                                          |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 

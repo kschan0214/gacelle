@@ -100,9 +100,10 @@ classdef HCFM
             % linear dephasing
             D_E_linear      = (fvf/2).*(abs(x_d).*obj.gyro.*obj.B0.*sin(theta).^2).*...
                                     (TE - 2./(abs(x_d).*obj.gyro.*obj.B0.*sin(theta).^2));
-            D_E             = D_E_quadratic;
+            % D_E             = D_E_quadratic;
             % if TE > alpha then transit from quadratic to linear dephasing regime
-            D_E(TE>=alpha)  = D_E_linear(TE>=alpha);
+            % D_E(TE>alpha)  = D_E_linear(TE>alpha);
+            D_E  = D_E_quadratic .* ~(TE>alpha) + D_E_linear .* (TE>alpha);
 
 
             % if isscalar(alpha)

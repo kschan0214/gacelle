@@ -5,7 +5,7 @@ clear;
 % for reproducibility
 seed        = 8715; rng(seed); gpurng(seed);
 Nsample     = 1e3;  % #voxel
-SNR         = 50;   
+SNR         = 100;   
 
 % fixed parameters
 D0          = 1.7;
@@ -19,7 +19,7 @@ ldelta_sorted   = ones(size(bval_sorted))* 6; % ms
 BDELTA_sorted   = [13,13,13,13,13,13,13,13,30,30,30,30,30,30,30,30]; %ms
 
 % Parameter raneg for forward simulation
-axonDia_range   = [0.1 6];
+axonDia_range   = [0.5 6];
 f_range         = [0.3, 1];
 fscf_range      = [0 0.3];
 DeR_range       = [0.5 1.5];
@@ -38,7 +38,7 @@ pars.f      = single(f_GT);
 pars.fcsf   = single(fcsf_GT);
 pars.DeR    = single(DeR_GT);
 objGPU      = gpuAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
-s           = objGPU.FWD(pars, [], model);
+s           = objGPU.FWD(pars, model);
 
 % Let assume Gaussian noise for simplicity
 noiseLv = 1/SNR;
@@ -52,15 +52,17 @@ fitting.iteration           = 4000;
 fitting.initialLearnRate    = 0.001;
 fitting.convergenceValue    = 1e-8;
 fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-3;
-fitting.isdisplay           = false;
+fitting.tol                 = 1e-4;
+fitting.isDisplay           = false;
 fitting.lambda              = 0;
-fitting.isPrior             = 1;
+fitting.start               = 'likelihood';
+fitting.patience            = 5;   
 extraData                   = [];
 
 out   = objGPU.estimate(s, mask, extraData, fitting);
 
 %% plot result
+figure;
 field = fieldnames(pars);
 tiledlayout(1,numel(field));
 for k = 1:numel(field)
@@ -69,5 +71,5 @@ for k = 1:numel(field)
     h = refline(1);
     h.Color = 'k';
     title(field{k});
-    xlabel('GT');ylabel('Estimate');
+    xlabel('GT');ylabel('Fitted');
 end

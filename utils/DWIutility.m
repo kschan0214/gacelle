@@ -108,6 +108,13 @@ classdef DWIutility
     end
 
     methods(Static)
+
+        function pl = WatsonSHexact(k)
+            k = k(:).';
+            p2 = 1/4*(3./sqrt(k)./dawson(sqrt(k)) -2 -3./k);
+            p4 = 1/32./k.^2.*(105 + 12*k.*(5+k) + 5*sqrt(k).*(2*k-21)./dawson(sqrt(k)));
+            pl = [ones(1,numel(k)); p2; p4];
+        end
         
         % correct bvals
         function bval = RectifyBVal(bval,bval_target)
@@ -126,6 +133,52 @@ classdef DWIutility
 
         end
         
+        function bval_corr = rectify_bval_v2(bvals,thres)
+
+            % maxi difference
+            if nargin < 3
+                thres = 0.05; % 5%
+            end
+            
+            % round up bval
+            bvals = round(bvals);
+            
+            % count occurance
+            [gc, gr] = groupcounts(bvals');
+            
+            % grouping
+            g = zeros(size((gr)));
+            counter = 0;
+            for k = 1:numel(gr)-1
+                bw = thres*gr(k+1);
+                if (gr(k+1) - gr(k)) > bw
+                    counter = counter + 1;
+                    g(k)    = counter;
+                else
+                    g(k)    = counter;
+                end
+            end
+            g = circshift(g,1);
+            % find unique group
+            m = unique(g);
+            
+            % find unique b-values
+            b_unique = zeros(numel(m),1);
+            for k = 1:numel(m)
+            
+              idx = find( g == m(k) );
+              [~,ii] = max(gc(idx));
+              b_unique(k) = gr(idx(ii));
+            
+            end
+            
+            tmp_diff = abs(b_unique - bvals);
+            
+            [~,idx] = min(tmp_diff,[],1);
+            
+            bval_corr = b_unique(idx).';
+        end
+
         % Cartiseian to spherical coordinate
         function dirs = cart2sph_incl(g)
             [azi, elev] = cart2sph(g(:,1),g(:,2),g(:,3));

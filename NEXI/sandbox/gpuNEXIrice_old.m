@@ -1,4 +1,4 @@
-classdef gpuNEXIrice
+classdef gpuNEXIrice_old
 
     properties (GetAccess = public, SetAccess = protected)
         b;
@@ -8,7 +8,7 @@ classdef gpuNEXIrice
     
     methods
 
-        function this = gpuNEXIrice(b, Delta, varargin)
+        function this = gpuNEXIrice_old(b, Delta, varargin)
 %NEXIDOT Exchange rate estimation using NEXI model with dot compartment
 % smt = NEXIdot(b, Delta[, Nav])
 %       output:

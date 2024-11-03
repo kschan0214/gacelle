@@ -200,13 +200,13 @@ classdef gpuNEXI
             out.mask = mask;
 
             % save the estimation results if the output filename is provided
-            if ~isempty(fitting.output_filename)
-                [output_dir,~,~] = fileparts(fitting.output_filename);
+            if ~isempty(fitting.outputFilename)
+                [output_dir,~,~] = fileparts(fitting.outputFilename);
                 if ~exist(output_dir,'dir')
                     mkdir(output_dir);
                 end
-                save(fitting.output_filename,'out');
-                fprintf('Estimation output is saved at %s\n',fitting.output_filename);
+                save(fitting.outputFilename,'out');
+                fprintf('Estimation output is saved at %s\n',fitting.outputFilename);
             end
 
         end

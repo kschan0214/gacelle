@@ -13,10 +13,10 @@ classdef gpuNEXI < handle
         % De        : diffusivity of extracellular water [ms/us^2]
         % ra        : exchange rate from neurite to extracellular space [1/s]
         % p2        : non-linear neurite dispersion index
-        modelParams     = {'fa';'Da';'De';'ra';'p2'};
-        ub              = [   1;   3;   3;   1;  1];
-        lb              = [ eps; eps; eps;1/250; eps];
-        startPoint      = [ 0.4;   2;   1; 0.05; 0.2];
+        model_params    = {'fa','Da','De','ra','p2'};
+        ub              = [   1,   3,   3,   1,  1];
+        lb              = [ eps, eps, eps,1/250, eps];
+        startpoint      = [ 0.4,   2,   1, 0.05, 0.2];
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -75,11 +75,11 @@ classdef gpuNEXI < handle
 
             % DIMWI
             if fitting.lmax == 0
-                idx = find(ismember(this.modelParams,'p2'));
-                this.modelParams(idx)     = [];
+                idx = find(ismember(this.model_params,'p2'));
+                this.model_params(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+                this.startpoint(idx)      = [];
             end
 
         end
@@ -95,8 +95,10 @@ classdef gpuNEXI < handle
             disp('Data Information');
             disp('----------------')
             fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
-            fprintf('Diffusion time (ms)            : [%s] \n',num2str(this.Delta.',' %i'));
-            disp('----------------');
+            fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
+
+            fprintf('\n')
+
         end
 
         %% higher-level data fitting functions
@@ -139,7 +141,7 @@ classdef gpuNEXI < handle
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [dwi,mask] = this.prepare_dwi_data(dwi,mask,extradata,fitting.lmax);
+            dwi = this.prepare_dwi_data(dwi,extradata,fitting.lmax);
 
             % mask sure no nan or inf
             [dwi,mask] = utils.remove_img_naninf(dwi,mask);
@@ -150,7 +152,7 @@ classdef gpuNEXI < handle
             % convert datatype to single
             dwi     = single(dwi);
             mask    = mask >0;
-            if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
+            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
@@ -164,11 +166,9 @@ classdef gpuNEXI < handle
             % parameter estimation
             out = [];
             for ks = 1:NSegment
-                
-                if NSegment ~= 1
-                    fprintf('Running #Segment = %d/%d \n',ks,NSegment);
-                    disp   ('------------------------')
-                end
+
+                fprintf('Running #Segment = %d/%d \n',ks,NSegment);
+                disp   ('------------------------')
     
                 % determine slice# given a segment
                 if ks ~= NSegment
@@ -180,7 +180,7 @@ classdef gpuNEXI < handle
                 % divide the data
                 dwi_tmp     = dwi(:,:,slice,:);
                 mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0_tmp.(this.model_params{km}) = pars0.(this.model_params{km})(:,:,slice); end
                 else;               pars0_tmp = [];                 end
 
                 % run fitting
@@ -264,17 +264,17 @@ classdef gpuNEXI < handle
             % set initial tarting points
             if nargin < 5; pars0 = []; % no initial starting points
             else
-                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
+                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
             end
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
             % determine fitting parameters
             this                    = this.updateProperty(fitting);
-            fitting.modelParams     = this.modelParams;
+            fitting.model_params    = this.model_params;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.modelParams)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.modelParams)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
             
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
@@ -283,23 +283,20 @@ classdef gpuNEXI < handle
             w = this.compute_optimisation_weights(mask,fitting.lossFunction,fitting.lmax); % This is a customised funtion
 
             % 2.2 estimate prior if needed
-            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
+            if and(fitting.isPrior,isempty(pars0)); pars0 = this.estimate_prior(dwi, mask,[],fitting.lmax); end
 
             % You may add more dispay messages here
-            disp('---------------------------');
-            disp('Additional model parameters');
-            disp('---------------------------');
-            disp(['NEXI rotational invariant model, lmax = ' num2str(fitting.lmax)]);
-            disp('---------------------------');
-
+            disp('Model:')
+            disp(['lmax                     = ' num2str(fitting.lmax)]);
+            
             % 2.3 askAdam optimisation main
             askadamObj = askadam();
             % initiate starting points arrays
-            out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
+            out     = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
-            disp('The estimation is completed.');
+            disp('The process is completed.')
             
             % clear GPU
             reset(gpool)
@@ -315,11 +312,9 @@ classdef gpuNEXI < handle
         % ------
         % w         : 1D signal masked wegiths
         %
-
-            dims = size(mask,1:3);
             % lmax dependent weights
             l = 0:2:lmax;
-            w = zeros([dims numel(this.b)*numel(l)],'single');
+            w = zeros([size(mask,1:3) numel(this.b)*numel(l)],'single');
             % w = zeros(dims,'single');
             for kl = 1:(lmax/2+1)
                 for kb = 1:numel(this.b)
@@ -334,7 +329,7 @@ classdef gpuNEXI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [dwi, mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        function dwi = prepare_dwi_data(this,dwi,extradata,lmax)
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
                 % compute spherical mean signal
@@ -352,70 +347,9 @@ classdef gpuNEXI < handle
             elseif size(dwi,4) < numel(this.b)
                 error('There are more b-shells in the class object than available in the input data. Please check your input data.');
             end
-
-            % make sure no NaN/Inf in signal
-            [dwi, mask_naninf] = utils.set_nan_inf_zero(dwi); mask_naninf = max(mask_naninf,[],4);
-            mask_valid         = and(and(mask, max(dwi,[],4)<=1.01),~mask_naninf);
-
-            % check signal similarity
-            dwi_2D          = utils.reshape_ND2AD(dwi,mask_valid);
-            signalTemplate  = mean(dwi_2D,2,"omitmissing");         % assuming the majority of the signal are from tissues
-            signalTemplate  = (signalTemplate - mean(signalTemplate)) ./ std(signalTemplate);
-            Rcorr           = zeros(1,size(dwi_2D,2));
-            for k = 1:size(dwi_2D,2)
-                signalVoxel = dwi_2D(:,k);
-                signalVoxel = (signalVoxel - mean(signalVoxel)) ./ std(signalVoxel);
-                Rcorr(k)    = corr(signalTemplate,signalVoxel);
-            end
-            Rcorr            = utils.reshape_AD2ND(Rcorr,mask_valid);
-            mask_dissimilar  = Rcorr < 0.1;
-            mask_valid       = and(mask_valid,~mask_dissimilar);
-
-            if numel(mask_valid(mask_valid)) ~= numel(mask(mask)) 
-                disp('Signal mask is updated! Please use the fitted mask in your subsequent analysis.');
-                mask = mask_valid;
-            end
         end
 
         %%%%% Prior estimation related functions %%%%%
-
-        % determine how the starting points will be set up
-        function x0 = determine_x0(this,y,mask,fitting) 
-
-            disp('---------------');
-            disp('Starting points');
-            disp('---------------');
-
-            dims = size(mask,1:3);
-
-            if ischar(fitting.start)
-                switch lower(fitting.start)
-                    case 'likelihood'
-                        % using maximum likelihood method to estimate starting points
-                        x0 = this.estimate_prior(y,mask,[],fitting.lmax);
-    
-                    case 'default'
-                        % use fixed points
-                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n', cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
-                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
-
-                end
-            else
-                % user defined starting point
-                x0 = fitting.start(:);
-                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
-                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
-
-            end
-            
-            % make sure the input is bounded
-            x0 = askadam.set_boundary(x0,fitting.ub,fitting.lb);
-
-            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
-            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
-            ('---------------');
-        end
-
         % using maximum likelihood method to estimate starting points
         function pars0 = estimate_prior(this,dwi,mask, Nsample,lmax)
         % Estimation starting points for NEXI using likehood method
@@ -427,12 +361,10 @@ classdef gpuNEXI < handle
             % manage pool
             pool            = gcp('nocreate');
             isDeletepool    = false;
-            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
-                if isempty(pool)
-                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                    pool    = parpool('Processes',Nworker);
-                    isDeletepool = true;
-                end
+            if isempty(pool)
+                Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                pool    = parpool('Processes',Nworker);
+                isDeletepool = true;
             end
 
             if nargin < 4 || isempty(Nsample)
@@ -455,14 +387,8 @@ classdef gpuNEXI < handle
             end
 
             pars0_mask  = zeros(Nparam,length(ind));
-            if ~isempty(pool)
-                parfor kvol = 1:length(ind)
-                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
-                end
-            else
-                for kvol = 1:length(ind)
-                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
-                end
+            parfor kvol = 1:length(ind)
+                pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
             end
             pars           = zeros(Nparam,size(dwi,2));
             pars(:,ind)    = pars0_mask;
@@ -475,7 +401,9 @@ classdef gpuNEXI < handle
             idx             = gather(this.b) <= bval_thres;
             D0              = real(this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:)));
             D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
-            D0              = max(utils.set_nan_inf_zero(D0),0);
+            D0(isnan(D0))   = 0;
+            D0(isinf(D0))   = 0;
+            D0(D0<0)        = 0;
             mask_CSF        = D0>1.5;
             
             % ratio to modulate pars0 estimattion
@@ -493,7 +421,7 @@ classdef gpuNEXI < handle
             end
 
             for km = 1:size(pars,4)
-                pars0.(this.modelParams{km}) = pars(:,:,:,km); ...
+                pars0.(this.model_params{km}) = pars(:,:,:,km); ...
             end
 
         end
@@ -590,26 +518,42 @@ classdef gpuNEXI < handle
         end
 
         %% NEXI signal related functions
-
+        % compute the forward model
+        function [s] = FWD(this, pars, mask, lmax)
         % Forward model to generate NEXI signal
-        function [s] = FWD(this, pars, lmax)
-        
-            fa   = max(pars.fa, askadam.epsilon); % avoid division by zeros when computing re
-            Da   = pars.Da;
-            De   = pars.De;
-            ra   = pars.ra;
-    
+            if isempty(mask)
+                fa   = pars.fa;
+                Da   = pars.Da;
+                De   = pars.De;
+                ra   = pars.ra;
+            else
+                % mask out voxels to reduce memory
+                fa   = utils.row_vector(pars.fa(mask));
+                Da   = utils.row_vector(pars.Da(mask));
+                De   = utils.row_vector(pars.De(mask));
+                ra   = utils.row_vector(pars.ra(mask));
+            end
+
+             % avoid division by zeros when computing re
+            fa = min(fa,1-askadam.epsilon);
+                
+            % Forward model
             % Sl0
             s = this.Sl0(fa, Da, De, ra);
             
             % Sl2
             if lmax == 2
-                p2  = pars.p2;
-                s   = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
+                if isempty(mask)
+                    p2 = pars.p2;
+                else
+                    p2 = utils.row_vector(pars.p2(mask));
+                end
+
+                s = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
             end
 
             % make sure s cannot be greater than 1
-            s = min(s,1);   % s = [Nb, Nvoxel]
+            s = min(s,1);
                 
         end
         
@@ -682,9 +626,12 @@ classdef gpuNEXI < handle
             fitting2 = askadam.check_set_default_basic(fitting);
 
             % get customised fitting setting check
-            if ~isfield(fitting,'regmap');          fitting2.regmap     = 'fa';             end
-            if ~isfield(fitting,'lmax');            fitting2.lmax       = 0;                end
-            if ~isfield(fitting,'start');           fitting2.start      = 'likelihood';     end
+            if ~-isfield(fitting,'regmap')
+                fitting2.regmap = 'fa';
+            end
+            if ~isfield(fitting,'lmax')
+                fitting2.lmax = 0;
+            end
 
             if ~iscell(fitting2.regmap)
                 fitting2.regmap = cellstr(fitting2.regmap);

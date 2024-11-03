@@ -91,7 +91,7 @@ fitting.iteration       = 2e4;
 fitting.sampling        = 100;
 fitting.method          = 'median';
 fitting.start           = 'default';
-fitting.output_filename = '/path/to/output_dir/filename.mat';   % provide your output info here
+fitting.outputFilename = '/path/to/output_dir/filename.mat';   % provide your output info here
 
 g = gpuDevice;
 smt_gpu                 = gpuAxCaliberSMTmcmc(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
@@ -99,7 +99,7 @@ out                     = smt_gpu.estimate(dwi, mask, extraData, fitting);
 reset(g)
 
 % to load the distribution back to Workspace
-load(fitting.output_filename);
+load(fitting.outputFilename);
 a_dist = mcmc.distribution2image(out.posterior.a,mask);
 
 %% Usgae #3: If you perfer to use the spherical mean signal as the input it is also possible
@@ -229,8 +229,8 @@ fitting.sampling        = 100;
 fitting.method          = 'median';
 fitting.start           = [2,0.5,0.20,0.7,0.02] .* (1-random_bound)+(random_bound*2)*rand(1,5);
 % if you want the posterior distribution of each iteration, you need to save it in the disk space instead
-% fitting.output_filename = strcat('/path/to/output_dir/filename_',num2str(k),'.mat');   
-fitting.output_filename = [];
+% fitting.outputFilename = strcat('/path/to/output_dir/filename_',num2str(k),'.mat');   
+fitting.outputFilename = [];
 
 smt_gpu                     = gpuAxCaliberSMTmcmc(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
 [~,a(:,:,:,k),f(:,:,:,k),fcsf(:,:,:,k),DeR(:,:,:,k),noise(:,:,:,k)]    = smt_gpu.estimate(dwi, mask, extraData, fitting);

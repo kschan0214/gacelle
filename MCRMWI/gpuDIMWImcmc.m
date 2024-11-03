@@ -250,7 +250,7 @@ classdef gpuDIMWImcmc < handle
             % for k = 1:length(this.model_params); eval([this.model_params{k} ' = out.expected.' this.model_params{k} ';']); end
             
             % save the estimation results if the output filename is provided
-            mcmc.save_mcmc_output(fitting.output_filename,out)
+            mcmc.save_mcmc_output(fitting.outputFilename,out)
 
         end
         

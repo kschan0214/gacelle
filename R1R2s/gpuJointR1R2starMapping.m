@@ -10,10 +10,10 @@ classdef gpuJointR1R2starMapping < handle
         % M0    : Proton density weighted signal
         % R1    : (=1/T1) in s^-1
         % R2star: R2* in s^-1   
-        model_params    = {'M0';'R1';'R2star'};
-        ub              = [  2;  10;  200];
-        lb              = [  0; 0.1;  0.1];
-        startpoint      = [   1;   1;  30];
+        modelParams     = {'M0';'R1';'R2star'};
+        ub              = [  2;   10;  200];
+        lb              = [  0;  0.1;  0.1];
+        startPoint      = [   1;   1;  30];
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -47,8 +47,7 @@ classdef gpuJointR1R2starMapping < handle
             fprintf('Echo time (TE) (ms)             : [%s] \n',num2str(this.te.' * 1e3,' %.2f'));
             fprintf('Repetition time (TR) (ms)       : [%s] \n',num2str(this.tr.' * 1e3,' %.2f'));
             fprintf('Flip angle (degree)             : [%s] \n\n',num2str(this.fa.',' %i'));
-            
-            fprintf('\n')
+            disp('----------------')
 
         end
 
@@ -77,7 +76,6 @@ classdef gpuJointR1R2starMapping < handle
             % display basic info
             this.display_data_model_info;
             
-
             % get all fitting algorithm parameters 
             fitting             = this.check_set_default(fitting);
 
@@ -101,7 +99,7 @@ classdef gpuJointR1R2starMapping < handle
             g = gpuDevice; reset(g);
             memoryFixPerVoxel       = 0.0013/3;   % get this number based on mdl fit
             memoryDynamicPerVoxel   = 0.05/3;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
             out     = [];
@@ -120,13 +118,13 @@ classdef gpuJointR1R2starMapping < handle
                 % divide the data
                 data_tmp    = data(:,:,slice,:,:);
                 mask_tmp    = mask(:,:,slice);
-                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:); end
+                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:); end
 
                 % run fitting
                 [out_tmp] = this.fit(data_tmp,mask_tmp,fitting,extraData_tmp);
 
                 % restore 'out' structure from segment
-                out = askadam.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
 
             end
             out.mask        = mask;
@@ -134,7 +132,7 @@ classdef gpuJointR1R2starMapping < handle
             out.final.M0    = out.final.M0 * scaleFactor; % undo scaling
 
             % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.output_filename,out)
+            askadam.save_askadam_output(fitting.outputFilename,out)
 
         end
 
@@ -190,13 +188,13 @@ classdef gpuJointR1R2starMapping < handle
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
             % determine fitting parameters
-            fitting.model_params    = this.model_params;
+            fitting.modelParams     = this.modelParams;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.model_params)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.model_params)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.modelParams)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.modelParams)); end
 
             % set initial tarting points
-            pars0 = this.estimate_prior(data,mask,extraData);
+            pars0 = this.determine_x0(data,mask,extraData,fitting) ;
 
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
@@ -210,12 +208,9 @@ classdef gpuJointR1R2starMapping < handle
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
             % 3. askAdam optimisation main
-            % 3.1. initial global optimisation
-            % mask out data to reduce memory load
-            data = utils.vectorise_NDto2D(data,mask).';
-            if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
-            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
             askadamObj  = askadam();
+            % 3.1. initial global optimisation
+            extraData   = utils.gpu_reshape_ND2AD_struct(extraData,mask);
             out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData);
 
             disp('The process is completed.')
@@ -226,13 +221,51 @@ classdef gpuJointR1R2starMapping < handle
         end
         
         %% Prior estimation related functions
+
+        % determine how the starting points will be set up
+        function x0 = determine_x0(this,y,mask,extraData,fitting) 
+
+            disp('---------------');
+            disp('Starting points');
+            disp('---------------');
+
+            dims = size(mask,1:3);
+
+            if ischar(fitting.start)
+                switch lower(fitting.start)
+                    case 'prior'
+                        % using maximum likelihood method to estimate starting points
+                        x0 = this.estimate_prior(y,mask,extraData);
+    
+                    case 'default'
+                        % use fixed points
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n', cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
+                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
+                end
+            else
+                % user defined starting point
+                x0 = fitting.start(:);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
+            end
+            
+            % make sure the input is bounded
+            x0 = askadam.set_boundary(x0,fitting.ub,fitting.lb);
+
+            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            ('---------------');
+        end
+
         % closed-form solution to estimate better starting points
         function pars0 = estimate_prior(this,data, mask, extraData)
 
             dims = size(data,1:3);
 
-            for k = 1:numel(this.model_params)
-                pars0.(this.model_params{k}) = single(this.startpoint(k)*ones(dims));
+            for k = 1:numel(this.modelParams)
+                pars0.(this.modelParams{k}) = single(this.startPoint(k)*ones(dims));
             end
 
             disp('Estimate starting points using closed-form solutions...')
@@ -259,9 +292,9 @@ classdef gpuJointR1R2starMapping < handle
             % r2s0   = medfilt3(r2s0);
 
             % always follow the order specified in the beginning of the file
-            pars0.(this.model_params{1}) = single(m00); 
-            pars0.(this.model_params{2}) = single(R10);
-            pars0.(this.model_params{3}) = single(R2s0);
+            pars0.(this.modelParams{1}) = single(m00); 
+            pars0.(this.modelParams{2}) = single(R10);
+            pars0.(this.modelParams{3}) = single(R2s0);
             % pars0 = cat(4, m00, R10, r2s0);
 
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
@@ -271,7 +304,7 @@ classdef gpuJointR1R2starMapping < handle
 
         %% Signal related functions
         % compute the forward model
-        function [s] = FWD(this, pars, mask, extraData)
+        function [s] = FWD(this, pars, extraData)
             
             TE  = gpuArray(dlarray( permute(this.te,[2 3 4 1 5]))); % TE in 4th dimension
             FA  = gpuArray(dlarray( permute(deg2rad(this.fa),[2 3 4 5 1]))); % FA in 5th dimension
@@ -282,22 +315,14 @@ classdef gpuJointR1R2starMapping < handle
                 trueFlipAngle = extraData.trueFlipAngle;
             end
             
-            if isempty(mask)
-                M0      = pars.M0;
-                R1      = pars.R1;
-                R2star  = pars.R2star;
-            else
-                % mask out voxels to reduce memory
-                M0          = utils.row_vector(pars.M0(mask));
-                R1          = utils.row_vector(pars.R1(mask));
-                R2star      = utils.row_vector(pars.R2star(mask));
-            end
+            M0      = pars.M0;
+            R1      = pars.R1;
+            R2star  = pars.R2star;
             % R2star(R1>R2star) = R1(R1>R2star);
             
             s = this.model_jointR1R2s(M0, R2star, R1, TE,this.tr,trueFlipAngle);
             % vectorise to match maksed measurement data
-            s = utils.vectorise_NDto2D(s,ones(size(M0,1:3),'logical')).';
-            % s = s(:);
+            s = utils.reshape_ND2AD(s,[]);
                 
         end
         
@@ -410,6 +435,7 @@ classdef gpuJointR1R2starMapping < handle
             if ~isfield(fitting,'weightMethod');        fitting2.weightMethod   = '1stecho';        end
             if ~isfield(fitting,'isWeighted');          fitting2.isWeighted     = false;            end
             if ~isfield(fitting,'weightPower');         fitting2.weightPower    = 2;                end
+            if ~isfield(fitting,'start');               fitting2.start          = 'prior';          end
 
         end
 

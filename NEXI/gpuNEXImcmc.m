@@ -11,11 +11,11 @@ classdef gpuNEXImcmc < handle
         % ra        : exchange rate from intra- to extra-neurite compartment
         % p2        : dispersion index (if fitting.lax=2)
         % default model parameters and estimation boundary
-        model_params    = { 'fa';   'Da';   'De';   'ra';'p2'; 'noise'};
+        modelParams     = { 'fa';   'Da';   'De';   'ra';'p2'; 'noise'};
         ub              = [    1;      3;      3;      1;   1;     0.1];
         lb              = [    0;  0.002;  0.001;  1/250;   0;    0.01];
         step            = [  0.05;  0.15;   0.15;  0.005;0.05;   0.005];
-        startpoint      = [  0.2;      2;    0.5;   0.05; 0.2;    0.05];
+        startPoint      = [  0.2;      2;    0.5;   0.05; 0.2;    0.05];
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -64,11 +64,11 @@ classdef gpuNEXImcmc < handle
         function this = updateProperty(this, fitting)
 
             if fitting.lmax == 0
-                idx = find(ismember(this.model_params,'p2'));
-                this.model_params(idx)    = [];
+                idx = find(ismember(this.modelParams,'p2'));
+                this.modelParams(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startpoint(idx)      = [];
+                this.startPoint(idx)      = [];
                 this.step(idx)            = [];
             end
 
@@ -77,18 +77,16 @@ classdef gpuNEXImcmc < handle
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('================================================');
-            disp('NEXI with Markov Chain Monte Carlo (MCMC) solver');
-            disp('================================================');
-            
+            disp('========================');
+            disp('NEXI with askAdam solver');
+            disp('========================');
+
             disp('----------------')
             disp('Data Information');
             disp('----------------')
             fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
-            fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
-
-            fprintf('\n')
-
+            fprintf('Diffusion time (ms)            : [%s] \n',num2str(this.Delta.',' %i'));
+            disp('----------------');
         end
 
         %% higher-level data fitting functions
@@ -135,7 +133,7 @@ classdef gpuNEXImcmc < handle
             % convert datatype to single
             dwi     = single(dwi);
             mask    = mask >0;
-            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+            if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
@@ -144,7 +142,7 @@ classdef gpuNEXImcmc < handle
             out.mask = mask;
 
             % save the estimation results if the output filename is provided
-            mcmc.save_mcmc_output(fitting.output_filename,out)
+            mcmc.save_mcmc_output(fitting.outputFilename,out)
 
         end
 
@@ -179,17 +177,17 @@ classdef gpuNEXImcmc < handle
             % set initial tarting points
             if nargin < 5; pars0 = []; % no initial starting points
             else
-                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
             end
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
             % determine fitting parameters
             this                    = this.updateProperty(fitting);
-            fitting.model_params    = this.model_params;
+            fitting.modelParams     = this.modelParams;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.modelParams)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.modelParams)); end
             fitting.xStepSize = this.step;
 
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
@@ -199,18 +197,22 @@ classdef gpuNEXImcmc < handle
             w = this.compute_optimisation_weights(mask,fitting.lmax); % This is a customised funtion
 
             % You may add more dispay messages here
-            disp('Model:')
-            disp(['lmax                     = ' num2str(fitting.lmax)]);
-            % additional message(s)
-            if ischar(fitting.start); disp(['Starting points   : ', fitting.start ]); end; fprintf('\n');
+            disp('---------------------------');
+            disp('Additional model parameters');
+            disp('---------------------------');
+            disp(['NEXI rotational invariant model, lmax = ' num2str(fitting.lmax)]);
+            disp('---------------------------');
+            
             % set starting points
             if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
             
             % 2.3 askAdam optimisation main
             mcmcObj = mcmc();
-            out = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
+            out     = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
+
+            disp('The estimation is completed.');
 
             % clear GPU
             reset(gpool)
@@ -224,11 +226,14 @@ classdef gpuNEXImcmc < handle
         % 
         % Output
         % ------
-        % w         : 1D signal masked wegiths
+        % w         : ND signal masked wegiths
         %
+
+            dims = size(mask,1:3);
+            
             % lmax dependent weights
             l = 0:2:lmax;
-            w = zeros([size(mask) numel(this.b)*numel(l)],'single');
+            w = zeros([dims numel(this.b)*numel(l)],'single');
             % w = zeros(dims,'single');
             for kl = 1:(lmax/2+1)
                 for kb = 1:numel(this.b)
@@ -263,6 +268,12 @@ classdef gpuNEXImcmc < handle
         % determine how the starting points will be set up
         function x0 = determine_x0(this,y,mask,fitting) 
 
+            disp('---------------');
+            disp('Starting points');
+            disp('---------------');
+
+            dims = size(mask,1:3);
+
             if ischar(fitting.start)
                 switch lower(fitting.start)
                     case 'likelihood'
@@ -271,23 +282,24 @@ classdef gpuNEXImcmc < handle
     
                     case 'default'
                         % use fixed points
-                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n\n',mcmc.cell2str(this.model_params),replace(num2str(this.startpoint.',' %.2f'),' ',','));
-                        fitting.start = this.startpoint;
-                        x0 = mcmc.initialise_start(size(mask,1:3),fitting);
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n\n',cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
+                        fitting.start = this.startPoint;
+                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
                     
                 end
             else
                 % user defined starting point
                 x0 = fitting.start(:);
-                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n\n',mcmc.cell2str(this.model_params),replace(num2str(x0.',' %.2f'),' ',','));
-                x0 = mcmc.initialise_start(dims,fitting);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
+                x0 = mcmc.initialise_x0(dims,this.modelParams,this.startPoint);
 
             end
-            fprintf('Estimation lower bound [%s]: [%s]\n',      mcmc.cell2str(this.model_params),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
-            fprintf('Estimation upper bound [%s]: [%s]\n',      mcmc.cell2str(this.model_params),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
             if strcmpi(fitting.algorithm,'mh')
-                fprintf('MCMC step size [%s]: [%s]\n\n',            mcmc.cell2str(this.model_params),replace(num2str(this.step.',' %.2f'),'  ',','));
+                fprintf('MCMC step size [%s]: [%s]\n\n',        cell2str(this.modelParams),replace(num2str(this.step(:).',' %.2f'),'  ',','));
             end
+            ('---------------');
         end
 
         % using maximum likelihood method to estimate starting points
@@ -301,10 +313,12 @@ classdef gpuNEXImcmc < handle
             % manage pool
             pool            = gcp('nocreate');
             isDeletepool    = false;
-            if isempty(pool)
-                Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                pool    = parpool('Processes',Nworker);
-                isDeletepool = true;
+            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
+                if isempty(pool)
+                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                    pool    = parpool('Processes',Nworker);
+                    isDeletepool = true;
+                end
             end
 
             if nargin < 4 || isempty(Nsample)
@@ -327,9 +341,16 @@ classdef gpuNEXImcmc < handle
             end
 
             pars0_mask  = zeros(Nparam,length(ind));
-            parfor kvol = 1:length(ind)
-                pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
+            if ~isempty(pool)
+                parfor kvol = 1:length(ind)
+                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
+                end
+            else
+                for kvol = 1:length(ind)
+                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train,lmax);
+                end
             end
+
             pars           = zeros(Nparam,size(dwi,2));
             pars(:,ind)    = pars0_mask;
 
@@ -341,9 +362,7 @@ classdef gpuNEXImcmc < handle
             idx             = gather(this.b) <= bval_thres;
             D0              = real(this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:)));
             D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
-            D0(isnan(D0))   = 0;
-            D0(isinf(D0))   = 0;
-            D0(D0<0)        = 0;
+            D0              = max(utils.set_nan_inf_zero(D0),0);
             mask_CSF        = D0>1.5;
             
             % ratio to modulate pars0 estimattion
@@ -351,7 +370,7 @@ classdef gpuNEXImcmc < handle
             for k = 1:size(pars,4)
                 tmp                 = pars(:,:,:,k);
                 tmp(mask_CSF==1)    = tmp(mask_CSF==1).*pars0_csf(k);
-                pars(:,:,:,k)      = tmp;
+                pars(:,:,:,k)       = tmp;
             end
 
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
@@ -361,11 +380,11 @@ classdef gpuNEXImcmc < handle
             end
 
             for km = 1:size(pars,4)
-                pars0.(this.model_params{km}) = pars(:,:,:,km); 
+                pars0.(this.modelParams{km}) = pars(:,:,:,km); 
             end
 
             % noise
-            pars0.(this.model_params{end}) = single(ones(size(mask)) * this.startpoint(end));
+            pars0.(this.modelParams{end}) = single(ones(size(mask)) * this.startPoint(end));
 
         end
 
@@ -463,33 +482,25 @@ classdef gpuNEXImcmc < handle
         %% NEXI signal related functions
         % compute the forward model
         function [s] = FWD(this, pars, lmax)
-            % make sure the first dimension is 1
+            % make sure the first dimension is 1 where all measuremnts will be calculated
             if size(pars.fa,1) ~= 1
-                fa   = shiftdim(pars.fa,-1);
+                fa   = max(shiftdim(pars.fa,-1), utils.epsilon); % avoid division by zeros in computing re
                 Da   = shiftdim(pars.Da,-1);
                 De   = shiftdim(pars.De,-1);
                 ra   = shiftdim(pars.ra,-1);
             else
-                % mask out voxels to reduce memory
-                fa   = pars.fa;
+                fa   = max(pars.fa, utils.epsilon); % avoid division by zeros in computing re
                 Da   = pars.Da;
                 De   = pars.De;
                 ra   = pars.ra;
             end
-
-            % avoid division by zeros in computing re
-            fa = min(fa,1-askadam.epsilon);
-                
-            % Forward model
             if lmax == 2
-                if size(pars.fa,1) ~= 1
-                    p2 = shiftdim(pars.p2,-1);
-                else
-                    p2 = pars.p2;
-                end
+                if size(pars.p2,1) ~= 1; p2 = shiftdim(pars.p2,-1); else; p2 = pars.p2; end
             else
                 p2 = [];
             end
+                
+            % Forward model
             s = this.Slmax2(fa, Da, De, ra, p2);
 
             % make sure s cannot be greater than 1
@@ -614,9 +625,8 @@ classdef gpuNEXImcmc < handle
             fitting2 = mcmc.check_set_default_basic(fitting);
 
             % get customised fitting setting check
-            if ~isfield(fitting,'lmax')
-                fitting2.lmax = 0;
-            end
+            if ~isfield(fitting,'lmax');        fitting2.lmax = 0; end
+            if ~isfield(fitting,'start');       fitting2.start = 'likelihood'; end
 
         end
 

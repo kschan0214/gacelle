@@ -21,10 +21,10 @@ classdef gpuGREMWI < handle
         % freqIW    : frequency IW [ppm]
         % dfreqBKG  : background frequency in addition to the one provided [ppm]
         % dpini     : B1 phase offset in addition to the one provided [rad]
-        model_params    = { 'S0';   'MWF';  'IWF';  'R2sMW';'R2sIW';'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
+        modelParams     = { 'S0';   'MWF';  'IWF';  'R2sMW';'R2sIW';'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
         ub              = [    2;     0.3;      1;      200;     50;     50;     0.25;    0.05;       0.4;   pi/2];
-        lb              = [    0;       0;      0;       50;      2;      2;    -0.05;    -0.1;      -0.4;  -pi/2];
-        startpoint      = [    1;     0.1;    0.8;      100;     15;     21;     0.04;       0;         0;      0];
+        lb              = [ 1e-8;    1e-8;   1e-8;       50;      2;      2;    -0.05;    -0.1;      -0.4;  -pi/2];
+        startPoint      = [    1;     0.1;    0.6;      100;     15;     21;     0.04;       0;         0;      0];
 
     end
 
@@ -88,45 +88,45 @@ classdef gpuGREMWI < handle
 
             if fitting.isComplex == 0
                 for kpar = {'dfreqBKG','dpini'}
-                    idx = find(ismember(this.model_params,kpar));
-                    this.model_params(idx)    = [];
+                    idx = find(ismember(this.modelParams,kpar));
+                    this.modelParams(idx)    = [];
                     this.lb(idx)              = [];
                     this.ub(idx)              = [];
-                    this.startpoint(idx)      = [];
+                    this.startPoint(idx)      = [];
                 end
             end
 
             % DIMWI
             if fitting.DIMWI.isFitFreqIW == 0
-                idx = find(ismember(this.model_params,'freqIW'));
-                this.model_params(idx)    = [];
+                idx = find(ismember(this.modelParams,'freqIW'));
+                this.modelParams(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startpoint(idx)      = [];
+                this.startPoint(idx)      = [];
             end
 
             if fitting.DIMWI.isFitFreqMW == 0
-                idx = find(ismember(this.model_params,'freqMW'));
-                this.model_params(idx)    = [];
+                idx = find(ismember(this.modelParams,'freqMW'));
+                this.modelParams(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startpoint(idx)      = [];
+                this.startPoint(idx)      = [];
             end
 
             if fitting.DIMWI.isFitIWF == 0
-                idx = find(ismember(this.model_params,'IWF'));
-                this.model_params(idx)    = [];
+                idx = find(ismember(this.modelParams,'IWF'));
+                this.modelParams(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startpoint(idx)      = [];
+                this.startPoint(idx)      = [];
             end
 
             if fitting.DIMWI.isFitR2sEW == 0
-                idx = find(ismember(this.model_params,'R2sEW'));
-                this.model_params(idx)    = [];
+                idx = find(ismember(this.modelParams,'R2sEW'));
+                this.modelParams(idx)    = [];
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
-                this.startpoint(idx)      = [];
+                this.startPoint(idx)      = [];
             end
 
         end
@@ -151,8 +151,7 @@ classdef gpuGREMWI < handle
             disp(['Myelin isotropic susceptibility (ppm)    : ' num2str(this.x_i)]);
             disp(['Myelin anisotropic susceptibility (ppm)  : ' num2str(this.x_a)]);
             disp(['Exchange term (ppm)                      : ' num2str(this.E)]);
-
-            fprintf('\n')
+            disp('---------------------')
 
         end
 
@@ -205,7 +204,7 @@ classdef gpuGREMWI < handle
             g = gpuDevice; reset(g);
             memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
             memoryDynamicPerVoxel   = 0.0001;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
             out = [];
@@ -231,7 +230,7 @@ classdef gpuGREMWI < handle
                 [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp);
 
                 % restore 'out' structure from segment
-                out = askadam.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
 
             end
             out.mask = mask;
@@ -240,7 +239,7 @@ classdef gpuGREMWI < handle
             out.min.S0      = out.min.S0 *scaleFactor;
 
             % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.output_filename,out)
+            askadam.save_askadam_output(fitting.outputFilename,out)
 
         end
 
@@ -299,16 +298,17 @@ classdef gpuGREMWI < handle
             if nargin < 4; fitting = struct(); end
 
             % get all fitting algorithm parameters 
-            fitting                 = this.check_set_default(fitting,data);
+            fitting             = this.check_set_default(fitting,data);
             % determine fitting parameters
-            this                    = this.updateProperty(fitting);
-            fitting.model_params    = this.model_params;
+            this                = this.updateProperty(fitting);
+            fitting.modelParams = this.modelParams;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.model_params)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.model_params)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.modelParams)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.modelParams)); end
             
             % set initial starting points
-            pars0 = this.estimate_prior(data);
+            pars0 = this.determine_x0(data,fitting);
+            % pars0 = this.estimate_prior(data);
             
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
@@ -323,14 +323,12 @@ classdef gpuGREMWI < handle
             this.display_algorithm_info(fitting)
 
             % 3. askAdam optimisation main
-            % mask out data to reduce memory load
-            data = utils.vectorise_NDto2D(data,mask).';
-            if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
-            fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
-            
-            disp('##############################################')
-            disp('Runnning optimisation on all voxels...')
             askadamObj  = askadam();
+            % % mask out data to reduce memory load
+            % data = utils.vectorise_NDto2D(data,mask).';
+            % if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
+            % fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
+            extraData   = utils.masking_ND2AD_preserve_struct(extraData,mask) ;
             out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
@@ -342,36 +340,44 @@ classdef gpuGREMWI < handle
             
         end
 
-        % compute weights for optimisation
-        function w = compute_optimisation_weights(this,data,fitting)
-        % 
-        % Output
-        % ------
-        % w         : ND signal masked wegiths that matches the arrangement in masked data later on
-        %
-            if fitting.isWeighted
-                switch lower(fitting.weightMethod)
-                    case 'norm'
-                       % weights using echo intensity, as suggested in Nam's paper
-                        w = sqrt(abs(data));
-                    case '1stecho'
-                        p = fitting.weightPower;
-                        % weights using the 1st echo intensity of each flip angle
-                        w = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1)).^p);
+        %% Prior estimation related functions
+
+        % determine how the starting points will be set up
+        function x0 = determine_x0(this,y,fitting) 
+
+            disp('---------------');
+            disp('Starting points');
+            disp('---------------');
+
+            dims = size(y,1:3);
+
+            if ischar(fitting.start)
+                switch lower(fitting.start)
+                    case 'prior'
+                        % using maximum likelihood method to estimate starting points
+                        x0 = this.estimate_prior(y);
+    
+                    case 'default'
+                        % use fixed points
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n', cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
+                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
                 end
             else
-                w = ones(size(data));
-            end
+                % user defined starting point
+                x0 = fitting.start(:);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
 
-            w(w>1) = 1; w(w<0) = 0;
+            end
             
-            % separate real/imaginary parts into 6th dim
-            if fitting.isComplex
-                w = repmat(w,1,1,1,1,2);
-            end
-        end
+            % make sure the input is bounded
+            x0 = askadam.set_boundary(x0,fitting.ub,fitting.lb);
 
-        %% Prior estimation related functions
+            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            ('---------------');
+        end
 
         % using maximum likelihood method to estimate starting points
         function pars0 = estimate_prior(this,data)
@@ -385,9 +391,7 @@ classdef gpuGREMWI < handle
             dims = size(data,1:3);
 
             % initiate starting point of all parameters
-            for k = 1:numel(this.model_params)
-                pars0.(this.model_params{k}) = single(this.startpoint(k)*ones(dims));
-            end
+            pars0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
             
             disp('Estimate starting points based on hybrid fixed points/prior information ...')
 
@@ -397,92 +401,60 @@ classdef gpuGREMWI < handle
             pars0.S0 = single(S0);
 
             % R2*IW
-            idx = find(ismember(this.model_params,'R2sIW'));
+            idx = find(ismember(this.modelParams,'R2sIW'));
             R2sIW = R2s - 3;
-            R2sIW(isnan(R2sIW)) = single(this.startpoint(idx)); R2sIW(isinf(R2sIW)) = single(this.startpoint(idx)); 
+            R2sIW(isnan(R2sIW)) = single(this.startPoint(idx)); R2sIW(isinf(R2sIW)) = single(this.startPoint(idx)); 
             R2sIW(R2sIW < this.lb(idx)) = single(this.lb(idx)); R2sIW(R2sIW > this.ub(idx)) = single(this.ub(idx));
             pars0.R2sIW = single(R2sIW);
 
             % R2*EW
-            idx = find(ismember(this.model_params,'R2sEW'));
+            idx = find(ismember(this.modelParams,'R2sEW'));
             if ~isempty(idx)
                 % if R2*EW is a free parameter then set it
                 R2sEW = R2s + 3;
-                R2sEW(isnan(R2sEW)) = single(this.startpoint(idx)); R2sEW(isinf(R2sEW)) = single(this.startpoint(idx)); 
+                R2sEW(isnan(R2sEW)) = single(this.startPoint(idx)); R2sEW(isinf(R2sEW)) = single(this.startPoint(idx)); 
                 R2sEW(R2sEW < this.lb(idx)) = single(this.lb(idx)); R2sEW(R2sEW > this.ub(idx)) = single(this.ub(idx));
                 pars0.R2sEW = single(R2sEW);
             % else
             %     % if R2*EW is not a free parameter then reset R2*EW
-            %     idx = find(ismember(this.model_params,'R2sIW'));
-            %     pars0.(this.model_params{idx}) = single(this.startpoint(idx)*ones(dims));
+            %     idx = find(ismember(this.modelParams,'R2sIW'));
+            %     pars0.(this.modelParams{idx}) = single(this.startpoint(idx)*ones(dims));
             end
 
             % [~,mwf] = this.superfast_mwi_2m_standard(abs(data),this.te,[]);
             % mwf(mwf>0.15)                   = 0.15;         
             % mwf(and(mwf>=0.05,mwf<=0.1))    = 0.1;   
             % mwf(mwf<0.015)                  = 0.03;
-            % pars0.(this.model_params{2})    = single(mwf);
+            % pars0.(this.modelParams{2})    = single(mwf);
             
 
         end
 
         %% Signal related functions
 
-        % compute the forward model
-        function [s] = FWD(this, pars, mask, fitting, extraData)
         % Forward model to generate GRE-MWI signal
-            if nargin < 5
-                S0   = pars.S0;
-                mwf  = pars.MWF;
-                if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
-                r2sMW   = pars.R2sMW;
-                r2sIW   = pars.R2sIW;
-    
-                if fitting.DIMWI.isFitR2sEW;    r2sEW   = pars.R2sEW;   end
-                if fitting.DIMWI.isFitFreqMW;   freqMW  = pars.freqMW;  end
-                if fitting.DIMWI.isFitFreqIW;   freqIW  = pars.freqIW;  end
-                % external effects
-                if ~fitting.isComplex % magnitude fitting
-                    freqBKG = 0;                          
-                    pini    = 0;
-                else    % other fittings
-                    freqBKG = pars.dfreqBKG + extraData.freqBKG; 
-                    pini    = pars.dpini + extraData.pini;
-                end
+        function [s] = FWD(this, pars, fitting, extraData)
 
-                % move fibre oreintation to the 5th dimension
-                extraData.ff    = permute(extraData.ff,[1 2 3 5 4]);
-                extraData.theta = permute(extraData.theta,[1 2 3 5 4]);
+            TE = gpuArray(dlarray( permute(this.te, [2 3 4 1] )));              % TE always on 4th dim
 
-                TE = permute(this.te,[2 3 4 1]);
-    
-            else
-                
-                % mask out voxels to reduce memory
-                S0   = utils.row_vector( pars.S0(mask) );
-                mwf  = utils.row_vector( pars.MWF(mask));
-                if fitting.DIMWI.isFitIWF;      iwf = utils.row_vector( pars.IWF(mask)); else; iwf = extraData.IWF; end
-                r2sMW   = utils.row_vector( pars.R2sMW(mask));
-                r2sIW   = utils.row_vector( pars.R2sIW(mask));
+            S0   = pars.S0;
+            mwf  = pars.MWF;
+            if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
+            r2sMW   = pars.R2sMW;
+            r2sIW   = pars.R2sIW;
 
-                if fitting.DIMWI.isFitR2sEW;    r2sEW   = utils.row_vector( pars.R2sEW(mask));  end
-                if fitting.DIMWI.isFitFreqMW;   freqMW  = utils.row_vector( pars.freqMW(mask)); end
-                if fitting.DIMWI.isFitFreqIW;   freqIW  = utils.row_vector( pars.freqIW(mask)); end
-                % external effects
-                if ~fitting.isComplex % magnitude fitting
-                    freqBKG = 0;                          
-                    pini    = 0;
-                else    % other fittings
-                    freqBKG = utils.row_vector( pars.dfreqBKG(mask)) + extraData.freqBKG; 
-                    pini    = utils.row_vector( pars.dpini(mask)) + extraData.pini;
-                end
-
-                extraData.ff    = permute(extraData.ff.',[3 1 2]);
-                extraData.theta = permute(extraData.theta.',[3 1 2]);
-
-                TE = gpuArray(dlarray( this.te ));
+            if fitting.DIMWI.isFitR2sEW;    r2sEW   = pars.R2sEW;   end
+            if fitting.DIMWI.isFitFreqMW;   freqMW  = pars.freqMW;  end
+            if fitting.DIMWI.isFitFreqIW;   freqIW  = pars.freqIW;  end
+            % external effects
+            if ~fitting.isComplex % magnitude fitting
+                freqBKG = 0;                          
+                pini    = 0;
+            else    % other fittings
+                freqBKG = pars.dfreqBKG + extraData.freqBKG; 
+                pini    = pars.dpini + extraData.pini;
             end
-                
+        
             %%%%%%%%%%%%%%%%%%%% Compartmental Signals %%%%%%%%%%%%%%%%%%%%
             S0MW = S0 .* mwf;
             S0IW = S0 .* (1-mwf) .* iwf;
@@ -530,34 +502,22 @@ classdef gpuGREMWI < handle
 
             freqEW = 0;
 
-            %%%%%%%%%%%%%%%%%%%% Forward model %%%%%%%%%%%%%%%%%%%%
-            if nargin < 5
-                % Image-based operation
-                Sreal = sum((   S0MW .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0IW .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0EW .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,5);
+            Sreal = sum((   S0MW .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                            S0IW .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                            S0EW .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,5);
 
-                Simag = sum((   S0MW .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0IW .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0EW .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,5);
-                
-                s = cat(5,Sreal,Simag);
+            Simag = sum((   S0MW .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                            S0IW .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
+                            S0EW .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,5);
+
+            if ~fitting.isComplex
+                s = sqrt(Sreal.^2 + Simag.^2);
             else
-                % voxel-based operation
-                Sreal = sum((   S0MW .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0IW .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0EW .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,3);
-    
-                Simag = sum((   S0MW .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0IW .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0EW .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini) .* exp(-decayEW) ).*extraData.ff,3);
-
-                if ~fitting.isComplex
-                    s = sqrt(Sreal.^2 + Simag.^2);
-                else
-                    s = cat(1,Sreal,Simag);
-                end
+                s = cat(5,Sreal,Simag);
             end
+
+            % vectorise to match maksed measurement data
+            s = utils.reshape_ND2AD(s,[]);
 
         end
         
@@ -637,6 +597,35 @@ classdef gpuGREMWI < handle
     end
 
     methods(Static)
+
+        % compute weights for optimisation
+        function w = compute_optimisation_weights(data,fitting)
+        % 
+        % Output
+        % ------
+        % w         : ND signal masked wegiths that matches the arrangement in masked data later on
+        %
+            if fitting.isWeighted
+                switch lower(fitting.weightMethod)
+                    case 'norm'
+                       % weights using echo intensity, as suggested in Nam's paper
+                        w = sqrt(abs(data));
+                    case '1stecho'
+                        p = fitting.weightPower;
+                        % weights using the 1st echo intensity of each flip angle
+                        w = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1)).^p);
+                end
+            else
+                w = ones(size(data));
+            end
+
+            w(w>1) = 1; w(w<0) = 0;
+            
+            % separate real/imaginary parts into 6th dim
+            if fitting.isComplex
+                w = repmat(w,1,1,1,1,2);
+            end
+        end
        
         %% signal
         % simple 2-pool matrix inversion
@@ -741,6 +730,7 @@ classdef gpuGREMWI < handle
 
             % get customised fitting setting check
             if ~isfield(fitting,'regmap');      fitting2.regmap = 'MWF'; end
+            if ~isfield(fitting,'start');       fitting2.start  = 'prior'; end
 
             if ~isfield(fitting,'isComplex');   fitting2.isComplex = true; end
             if isreal(data);                    fitting.isComplex = false;  end

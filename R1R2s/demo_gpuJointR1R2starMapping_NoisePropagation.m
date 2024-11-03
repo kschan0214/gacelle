@@ -33,7 +33,7 @@ pars.R2star = R2star_GT;
 
 b1      = ones(size(M0_GT)); extraData.b1 = b1;
 objGPU  = gpuJointR1R2starMapping(t,tr,fa);
-s       = gather(extractdata(objGPU.FWD(pars, [], extraData)));
+s       = gather(extractdata(objGPU.FWD(pars, extraData)));
 s       = permute(reshape(s,[Nt, Nfa, Nsample]),[3 4 5 1 2]);
 mask    = ones(size(s,1:3),'logical');
 
@@ -48,9 +48,9 @@ fitting.iteration           = 4000;
 fitting.initialLearnRate    = 0.001;
 fitting.convergenceValue    = 1e-8;
 fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-3;
+fitting.tol                 = 1e-8;
 fitting.isdisplay           = false;
-fitting.isPrior             = 1;   
+fitting.start               = 'prior';   
 extraData                   = [];
 extraData.b1                = b1.';
 
@@ -64,9 +64,9 @@ fitting.iteration           = 4000;
 fitting.initialLearnRate    = 0.001;
 fitting.convergenceValue    = 1e-8;
 fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-3;
+fitting.tol                 = 1e-8;
 fitting.isdisplay           = false;
-fitting.isPrior             = 1;   
+fitting.start               = 'prior';   
 fitting.isWeighted          = true;
 fitting.weightMethod        = '1stecho';
 fitting.weightPower         = 2;
@@ -99,7 +99,7 @@ for k = 1:numel(field)
     scatter(pars.(field{k}),out_weighted.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
-    title([field{k} ' weighted']);
+    title([field{k} ' w-P2']);
     xlabel('GT');ylabel('Fitted');
 end
 

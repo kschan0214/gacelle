@@ -175,7 +175,7 @@ classdef gpuMODEL
             out.mask = mask;
 
             % save the estimation results if the output filename is provided
-            this.askadamObj.save_askadam_output(fitting.output_filename,out)
+            this.askadamObj.save_askadam_output(fitting.outputFilename,out)
 
         end
 

@@ -10,10 +10,10 @@ classdef gpuAxCaliberSMT < handle
         % f     : neurite fraction (f=fa/(fa+fe)), 
         % fcsf  : CSF fraction
         % DeR   : hindered diffusion diffusivity [um2/ms]
-        model_params    = {'a';                   'f';'fcsf';                'DeR'};
+        modelParams     = {'a';                   'f';'fcsf';                'DeR'};
         ub              = [ 20;                     1;     1;                    3];
         lb              = [0.1;                     0;     0;                 0.01];
-        startpoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895];
+        startPoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895];
 
     end
 
@@ -113,8 +113,7 @@ classdef gpuAxCaliberSMT < handle
             disp(['Diffusivity intra-cellular axial (um2/ms)    : ' num2str(this.Da,'%.2f')]);
             disp(['Diffusivity extra-cellular axial (um2/ms)    : ' num2str(this.DeL,'%.2f')]);
             disp(['Diffusivity CSF (um2/ms)                     : ' num2str(this.Dcsf,'%.2f')]);
-
-            fprintf('\n')
+            disp('----------------')
 
         end
 
@@ -164,7 +163,7 @@ classdef gpuAxCaliberSMT < handle
             % convert datatype to single or logical
             dwi     = single(dwi);
             mask    = mask >0;
-            if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+            if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
@@ -173,7 +172,7 @@ classdef gpuAxCaliberSMT < handle
             gpool = gpuDevice;  reset(gpool);
             memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
             memoryDynamicPerVoxel   = 0.01;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = askadam.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
             
             % parameter estimation
             out = [];
@@ -190,20 +189,20 @@ classdef gpuAxCaliberSMT < handle
                 
                 dwi_tmp     = dwi(:,:,slice,:);
                 mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0_tmp.(this.model_params{km}) = pars0.(this.model_params{km})(:,:,slice); end
+                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end
                 else;                                                    pars0_tmp = [];                 end
                 
                 [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
 
                 % restore 'out' structure from segment
-                out = askadam.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
 
             end
             out.mask = mask;
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.output_filename,out)
+            askadam.save_askadam_output(fitting.outputFilename,out)
 
         end
 
@@ -270,15 +269,15 @@ classdef gpuAxCaliberSMT < handle
             % set initial tarting points
             if nargin < 5; pars0 = []; % no initial starting points
             else
-                if ~isempty(pars0); for km = 1:numel(this.model_params); pars0.(this.model_params{km}) = single(pars0.(this.model_params{km})); end; end
+                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
             end
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
-            fitting.model_params    = this.model_params;
+            fitting.modelParams     = this.modelParams;
             % set fitting boundary if no input from user
-            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.model_params)); end
-            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.model_params)); end
+            if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.modelParams)); end
+            if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.modelParams)); end
 
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
@@ -287,18 +286,15 @@ classdef gpuAxCaliberSMT < handle
             w = this.compute_optimisation_weights(mask,fitting.lossFunction,0); % This is a customised funtion
 
             % 2.2 estimate prior if neede
-            if and(fitting.isPrior,isempty(pars0)); pars0 = this.estimate_prior(dwi, mask); end
-
-            dwi    = utils.vectorise_NDto2D(dwi,mask).';
-            if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
+            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
 
             % 2.3 askAdam optimisation main
-            askadamObj  = askadam(); model = fitting.model;
-            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, model);
+            askadamObj  = askadam(); 
+            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.model);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
-            disp('The process is completed.')
+            disp('The estimation is completed.');
             
             % clear GPU
             reset(gpool)
@@ -355,6 +351,43 @@ classdef gpuAxCaliberSMT < handle
 
         %%%%% Prior estimation related functions %%%%%
 
+        % determine how the starting points will be set up
+        function x0 = determine_x0(this,y,mask,fitting) 
+
+            disp('---------------');
+            disp('Starting points');
+            disp('---------------');
+
+            dims = size(mask,1:3);
+
+            if ischar(fitting.start)
+                switch lower(fitting.start)
+                    case 'likelihood'
+                        % using maximum likelihood method to estimate starting points
+                        x0 = this.estimate_prior(y,mask,[]);
+    
+                    case 'default'
+                        % use fixed points
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n', cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
+                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
+                end
+            else
+                % user defined starting point
+                x0 = fitting.start(:);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
+            end
+
+            % make sure the input is bounded
+            x0 = askadam.set_boundary(x0,fitting.ub,fitting.lb);
+            
+            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            ('---------------');
+        end
+
         % using maximum likelihood method to estimate starting points
         function pars0 = estimate_prior(this,dwi,mask, Nsample)
         % Estimation starting points for NEXI using likehood method
@@ -368,10 +401,12 @@ classdef gpuAxCaliberSMT < handle
             % manage pool
             pool            = gcp('nocreate');
             isDeletepool    = false;
-            if isempty(pool)
-                Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                pool    = parpool('Processes',Nworker);
-                isDeletepool = true;
+            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
+                if isempty(pool)
+                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                    pool    = parpool('Processes',Nworker);
+                    isDeletepool = true;
+                end
             end
 
             if nargin < 4 || isempty(Nsample)
@@ -391,8 +426,14 @@ classdef gpuAxCaliberSMT < handle
             Nparam = 4;
 
             pars0_mask  = zeros(Nparam,length(ind),'single');
-            parfor kvol = 1:length(ind)
-                pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train);
+            if ~isempty(pool)
+                parfor kvol = 1:length(ind)
+                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train);
+                end
+            else
+                for kvol = 1:length(ind)
+                    pars0_mask(:,kvol) = this.likelihood(dwi(:,ind(kvol)), x_train, S_train);
+                end
             end
             pars           = zeros(Nparam,size(dwi,2),'single');
             pars(:,ind)    = pars0_mask;
@@ -405,9 +446,7 @@ classdef gpuAxCaliberSMT < handle
             idx                 = bval < bval_thres;
             Dint                = bval(idx)\-log(dwi(cat(1,idx,false(size(idx))),:));
             Dint                = permute(reshape(Dint,[size(Dint,1) dims(1:3)]),[2 3 4 1]);
-            Dint(isnan(Dint))   = 0;
-            Dint(isinf(Dint))   = 0;
-            Dint(Dint<0)        = 0;
+            Dint                = max(utils.set_nan_inf_zero(Dint),0);
             mask_CSF            = Dint>1.5;
             
             % ratio to modulate pars0 estimattion
@@ -425,7 +464,7 @@ classdef gpuAxCaliberSMT < handle
             end
 
             for km = 1:size(pars,4)
-                pars0.(this.model_params{km}) = pars(:,:,:,km); ...
+                pars0.(this.modelParams{km}) = pars(:,:,:,km); ...
             end
 
         end
@@ -461,7 +500,7 @@ classdef gpuAxCaliberSMT < handle
                 params.fcsf = pars(3,:);
                 params.DeR  = pars(4,:);
 
-                Sl0 = this.FWD(params, [], model);
+                Sl0 = this.FWD(params, model);
 
                 % remaining signals (dot, soma)
                 x_train(:,:,k) = pars;
@@ -505,24 +544,14 @@ classdef gpuAxCaliberSMT < handle
         end
     
         %%  Signal related functions
-        % copmpute the forward model
-        function s = FWD(this, pars, mask, model)
-
-            mask  = mask>0;
-            
+        
         % Forward model to generate AxCaliberSMT signal
-            if isempty(mask)
-                r       = pars.a/2;
-                f       = pars.f;
-                fcsf    = pars.fcsf;
-                DeR     = pars.DeR;
-            else
-                % mask out voxels to reduce memory
-                r       = utils.row_vector(pars.a(mask))/2;
-                f       = utils.row_vector(pars.f(mask));
-                fcsf    = utils.row_vector(pars.fcsf(mask));
-                DeR     = utils.row_vector(pars.DeR(mask));
-            end
+        function s = FWD(this, pars, model)
+
+            r       = pars.a/2;
+            f       = pars.f;
+            fcsf    = pars.fcsf;
+            DeR     = pars.DeR;
                 
             % Forward model
             % 1. Intra-cellular signal
@@ -585,12 +614,9 @@ classdef gpuAxCaliberSMT < handle
             fitting2 = askadam.check_set_default_basic(fitting);
 
             % get customised fitting setting check
-            if ~isfield(fitting,'model')
-                fitting2.model = 'VanGelderen';
-            end
-            if ~isfield(fitting,'regmap')
-                fitting2.regmap = {'a'};
-            end
+            if ~isfield(fitting,'model');       fitting2.model  = 'VanGelderen';    end
+            if ~isfield(fitting,'regmap');      fitting2.regmap = {'a'};            end
+            if ~isfield(fitting,'start');       fitting2.start  = 'likelihood';     end
 
             if ~iscell(fitting2.regmap)
                 fitting2.regmap = cellstr(fitting2.regmap);

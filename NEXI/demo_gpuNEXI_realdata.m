@@ -2,7 +2,7 @@ addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/askadam'))
 clear
 
 %% basic I/O
-subj_label  ='NEXI_C2_HC_006';
+subj_label  ='sub-NEXIC2HC006';
 sess_label  = 'ses-C2';
 reco_label  = 'recon-ORIG';
 acq         = {'D13ms_64dirs', 'D21ms_64dirs', 'D30ms_64dirs'};
@@ -16,10 +16,6 @@ bids_dir        = fullfile(project_dir,'bids');
 derivatives_dir = fullfile(bids_dir,'derivatives');
 preprocessed_dir= fullfile(derivatives_dir,'preprocessed');
 nexi_dir        = fullfile(derivatives_dir,'NEXI');
-
-output_dir      = fullfile(nexi_dir,subj_label,'dwi');
-mkdir(output_dir)
-output_prefix   = strcat(subj_label,'_',sess_label,'_',reco_label,'_','dwi','_',model_label,'_',solver_label,'_',lmax_label);
 
 %% load data
 data_dir = fullfile(preprocessed_dir,subj_label,'dwi');
@@ -76,18 +72,20 @@ dwi_bgt1 = dwi_bgt1(:,:,:,1:numel(bval_fit)*2);
 nexi_obj = gpuNEXI(bval_fit, BDELTA_fit);
 
 %% Model fitting
-fitting                     = [];
-fitting.Nepoch              = 4000;         % number of maximum optimisation iterations
-fitting.initialLearnRate    = 0.001;        % initial gradient step for optimisation
-fitting.decayRate           = 0.0001;       % adaptive rate of gradient step    
-fitting.convergenceValue    = 1e-8;         % tolerance of loss gradient
-fitting.tol                 = 1e-3;         % tolerance of loss
-fitting.display             = false;        % display the optimisation progress 
-fitting.lmax                = 2;            % using both S10 and Sl2 for NEXI model fitting
-fitting.isPrior             = 1;            % use likelihood method to estimate optimisation starting points
-% fitting.lambda              = 0.001;      % Total variation regularisation parameter
-% fitting.TVmode              = '2D';       % TV dimension
-% fitting.voxelSize           = [2,2,2];    % voxel size of the data
+fitting = [];
+fitting.iteration           = 4000;
+fitting.initialLearnRate    = 0.001;
+fitting.decayRate           = 0.0001;
+fitting.convergenceValue    = 1e-8;
+fitting.lossFunction        = 'l1';
+fitting.tol                 = 1e-4;
+fitting.patience            = 5;    
+fitting.isDisplay           = false;
+fitting.lmax                = 2;
+fitting.start               = 'likelihood'; 
+% fitting.lambda              = 0.001;
+% fitting.TVmode              = '2D';
+% fitting.voxelSize           = [2,2,2];
 
 % Optional, in case the input dwi is full dataset
 extradata.bval      = bvals_bgt1;
