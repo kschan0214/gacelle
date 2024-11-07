@@ -6,7 +6,7 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'askadam-documentation'
+project = 'GACELLE-documentation'
 copyright = '2024, Kwok-Shing Chan'
 author = 'Kwok-Shing Chan'
 release = '0.1.0'
@@ -27,7 +27,7 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
-html_theme = 'alabaster'
+html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 
 # The master toctree document.
@@ -37,7 +37,7 @@ master_doc = 'index'
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (master_doc, 'askAdam.tex', 'askAdam Documentation',
+    (master_doc, 'gacelle.tex', 'GACELLE Documentation',
      'Kwok-Shing Chan', 'manual'),
 ]
 

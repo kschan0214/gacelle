@@ -1,2 +1,2 @@
-# askAdam.documentation
-Here contains all documents related to askAdam
+# GACELLE.documentation
+Here contains all documents related to GACELLE

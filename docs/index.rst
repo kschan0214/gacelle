@@ -1,12 +1,12 @@
-.. askadam-documentation documentation master file, created by
+.. gacelle-documentation documentation master file, created by
    sphinx-quickstart on Tue Sep 24 13:55:36 2024.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-askAdam Documentation
+GACELLE Documentation
 =====================
 
-Welcome to the askAdam documentation! Here you can find all the documents related to askAdam.
+Welcome to the GACELLE documentation! Here you can find all the documents related to askAdam.
 
 Table of Contents
 =================
