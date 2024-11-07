@@ -56,7 +56,6 @@ mcmc_obj    = mcmc;
 xPosterior  = mcmc_obj.goodman_weare(y,pars0,weights,fitting,modelFWD,t);
 
 %% plot the estimation results
-
 % compute the mean values of the posterior distribution
 % xPosterior.({model_params{k}}) is organised in [Nvoxel,Nwalker,Nmcmcsample]
 S0_mean     = mean(reshape(xPosterior.S0    ,[Nsample, prod(size(xPosterior.S0,2:3))]),2);

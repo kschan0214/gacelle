@@ -1,4 +1,4 @@
-addpath('/autofs/space/linen_001/users/kwokshing/tools/askadam/')
+addpath(genpath('../../gacelle/'))
 clear
 
 %% generate some signal based on monoexponential decay
@@ -26,7 +26,6 @@ S                     = Example_monoexponential_FWD_mcmc(pars,t);
 % realistic signal with certain SNR
 noise   = mean(S0) / SNR;           % estimate noise level
 y       = S + noise*randn(size(S)); % add Gaussian noise
-y       = permute(y, [2 3 4 1]);    % make sure spatial info in the first 3 dimensions while measurements in 4th dimension
 
 %% set up fitting algorithm
 % set up starting point
@@ -58,7 +57,6 @@ mcmc_obj    = mcmc;
 out         = mcmc_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %% plot the estimation results
-
 figure;
 nexttile;scatter(S0,pars0.(modelParams{1}));hold on; scatter(S0,out.mean.S0);refline(1);
 xlabel('GT'); ylabel('S0')

@@ -55,7 +55,6 @@ mcmc_obj    = mcmc;
 xPosterior  = mcmc_obj.metropolis_hastings(y,pars0,weights,fitting,modelFWD,t);
 
 %% plot the estimation results
-
 % compute the mean values of the posterior distribution
 S0_mean     = mean(reshape(xPosterior.S0    ,[Nsample, prod(size(xPosterior.S0,2:3))]),2);
 R2star_mean = mean(reshape(xPosterior.R2star,[Nsample, prod(size(xPosterior.R2star,2:3))]),2);

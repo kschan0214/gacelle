@@ -13,7 +13,7 @@ Usage
 .. code-block::
 
     obj = mcmc;
-    out = obj.optimisation( data, mask, weights, parameters, fitting, FWDfunc);
+    out = obj.optimisation( data, mask, weights, parameters, fitting, FWDfunc, varargin);
 
 I/O overview
 ------------

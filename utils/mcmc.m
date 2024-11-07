@@ -43,8 +43,11 @@ classdef mcmc < handle
             this.display_basic_algorithm_parameters(fitting);
 
             % mask data to reduce memory load
-            data = utils.reshape_ND2AD(data,mask);
-            if ~isempty(weights); weights = utils.reshape_ND2AD(weights,mask); else; weights = ones(size(data), 'like', data); end
+            mask_idx = find(mask>0);
+            if ~ismatrix(data);     data    = utils.reshape_ND2AD(data,      mask_idx); else; data = data(:,mask_idx);     end
+            if ~ismatrix(weights);  weights = utils.reshape_ND2AD(weights,   mask_idx); elseif ~isempty(weights); weights = weights(:,mask_idx);  end
+            % data = utils.reshape_ND2AD(data,mask);
+            % if ~isempty(weights); weights = utils.reshape_ND2AD(weights,mask); else; weights = ones(size(data), 'like', data); end
             pars0 = utils.reshape_ND2AD_struct(pars0,mask);
 
             % MCMC
@@ -288,7 +291,7 @@ classdef mcmc < handle
             xPosterior = this.array2struct(xPosterior,fitting.modelParams);
             for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
         
-            disp('The affline invariant ensemble MCMC sampling is completed.')
+            disp('The affine-invariant ensemble MCMC sampling is completed.')
         
         end
 

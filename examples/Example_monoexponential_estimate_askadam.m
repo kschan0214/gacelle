@@ -1,10 +1,9 @@
-addpath('/autofs/space/linen_001/users/kwokshing/tools/askadam/')
+addpath(genpath('../../gacelle/'))
 clear
 
 %% generate some signal based on monoexponential decay
 % reproducibility
-% seed = 5438973; rng(seed); gpurng(seed);
-
+seed = 5438973; rng(seed); gpurng(seed);
 
 % set up estimation parameters; must be the same as in FWD function
 modelParams = {'S0','R2star'};
@@ -57,7 +56,6 @@ askadam_obj = askadam;
 out         = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %% plot the estimation results
-
 figure;
 nexttile;scatter(S0,pars0.(modelParams{1}));hold on; scatter(S0,out.final.S0);refline(1);
 xlabel('GT'); ylabel('S0')

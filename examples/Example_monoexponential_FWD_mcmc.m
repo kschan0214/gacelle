@@ -2,7 +2,7 @@
 %
 % Input
 % --------------
-% pars          : input model parameter structure (do not modified or change position)
+% pars          : input model parameter structure (This is ALWAYS the first input variable)
 % t             : [1xNt] sampling time
 %
 % Output

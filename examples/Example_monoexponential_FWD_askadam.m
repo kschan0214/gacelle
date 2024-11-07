@@ -2,9 +2,8 @@
 %
 % Input
 % --------------
-% pars          : input model parameter structure (do not modified or change position)
-% mask          : mask  (do not modified or change position)
-% t             : [1xNt] sampling time
+% pars          : input model parameter structure (This is ALWAYS the first input variable)
+% t             : [1xNt] sampling time (could be any extra input)
 %
 % Output
 % --------------
@@ -15,7 +14,7 @@
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 24 September 2024
-% Date last modified:
+% Date last modified: 7 Nov 2024
 %
 %
 function S = Example_monoexponential_FWD_askadam( pars, t)
