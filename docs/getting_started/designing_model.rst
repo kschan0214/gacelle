@@ -19,7 +19,7 @@ To take advantage of the automatic gradient computation (i.e., ``dlgradient``) f
 What input do I need for my model function?
 ###########################################
 
-At the most basic form, we will need at least two input variables for the forward model function. The first variable is ALWAYS a structure array that contains all estimation parameters. The second variable could be the measurement parameter.
+In the most basic setting, we will need at least two input variables for the forward model function. The first variable is ALWAYS a structure array that contains all estimation parameters. The second variable could be any measurement parameter.
 
 Here is an example for a simple monoexponential fitting:
 

@@ -6,7 +6,9 @@
 GACELLE Documentation
 =====================
 
-Welcome to the GACELLE documentation! Here you can find all the documents related to askAdam.
+Welcome to the GACELLE documentation! Here you can find all the documents related to *GACELLE*.
+
+*GACELLE* is a Matlab package that combines the flexibility of either conventional voxel-wise nonlinear-least-square(NLLS) optimization(askAdam) or Markov-chain-Monte-Carlo(MCMC) sampling with the high computational efficiency of GPU processing, for high throughput estimation tasks.
 
 Table of Contents
 =================

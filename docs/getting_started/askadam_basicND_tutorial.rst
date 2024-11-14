@@ -2,8 +2,8 @@
 .. role::  raw-html(raw)
     :format: html
 
-askAdam basic ND tutorial
-=========================
+askAdam basic tutorial for N-D data
+===================================
 
 This tutorial demonstrates an example of how to use the askAdam solver in this package for model parameter estimation on N-D data (N>2). 
 

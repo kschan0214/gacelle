@@ -19,7 +19,7 @@
 %
 function S = Example_monoexponential_FWD_askadam_3D_Strategy1( pars, t, mask)
     
-% In this example we preserve the put the time in the 4th dimension
+% In this example we put the time in the 4th dimension
 t = reshape(t(:),1,1,1,numel(t));
 
 % S0 and R2tar are N-D array (1<=N<=3)

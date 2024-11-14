@@ -6,7 +6,7 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'GACELLE-documentation'
+project = 'GACELLE documentation'
 copyright = '2024, Kwok-Shing Chan'
 author = 'Kwok-Shing Chan'
 release = '0.1.0'
