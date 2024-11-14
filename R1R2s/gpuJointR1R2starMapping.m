@@ -210,7 +210,7 @@ classdef gpuJointR1R2starMapping < handle
             % 3. askAdam optimisation main
             askadamObj  = askadam();
             % 3.1. initial global optimisation
-            extraData   = utils.gpu_reshape_ND2AD_struct(extraData,mask);
+            extraData   = utils.gpu_reshape_ND2GD_struct(extraData,mask);
             out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData);
 
             disp('The process is completed.')
@@ -322,7 +322,7 @@ classdef gpuJointR1R2starMapping < handle
             
             s = this.model_jointR1R2s(M0, R2star, R1, TE,this.tr,trueFlipAngle);
             % vectorise to match maksed measurement data
-            s = utils.reshape_ND2AD(s,[]);
+            s = utils.reshape_ND2GD(s,[]);
                 
         end
         

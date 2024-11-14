@@ -358,7 +358,7 @@ classdef gpuNEXI < handle
             mask_valid         = and(and(mask, max(dwi,[],4)<=1.01),~mask_naninf);
 
             % check signal similarity
-            dwi_2D          = utils.reshape_ND2AD(dwi,mask_valid);
+            dwi_2D          = utils.reshape_ND2GD(dwi,mask_valid);
             signalTemplate  = mean(dwi_2D,2,"omitmissing");         % assuming the majority of the signal are from tissues
             signalTemplate  = (signalTemplate - mean(signalTemplate)) ./ std(signalTemplate);
             Rcorr           = zeros(1,size(dwi_2D,2));
@@ -367,7 +367,7 @@ classdef gpuNEXI < handle
                 signalVoxel = (signalVoxel - mean(signalVoxel)) ./ std(signalVoxel);
                 Rcorr(k)    = corr(signalTemplate,signalVoxel);
             end
-            Rcorr            = utils.reshape_AD2ND(Rcorr,mask_valid);
+            Rcorr            = utils.reshape_GD2ND(Rcorr,mask_valid);
             mask_dissimilar  = Rcorr < 0.1;
             mask_valid       = and(mask_valid,~mask_dissimilar);
 

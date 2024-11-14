@@ -360,7 +360,7 @@ classdef gpuMCRMWI < handle
 
             % askadam.optimisation does not see extractData so we have to manually mask the data inside here, make sure the voxel is on the second dimension
             % extraData   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
-            extraData   = utils.masking_ND2AD_preserve_struct(extraData,mask) ;
+            extraData   = utils.masking_ND2GD_preserve_struct(extraData,mask) ;
             
             % run optimisation
             out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
@@ -761,7 +761,7 @@ classdef gpuMCRMWI < handle
                 end
 
                 % vectorise to match maksed measurement data
-                s = utils.reshape_ND2AD(s,[]);
+                s = utils.reshape_ND2GD(s,[]);
             
         end
         

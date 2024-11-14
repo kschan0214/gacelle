@@ -44,11 +44,11 @@ classdef mcmc < handle
 
             % mask data to reduce memory load
             mask_idx = find(mask>0);
-            if ~ismatrix(data);     data    = utils.reshape_ND2AD(data,      mask_idx); else; data = data(:,mask_idx);     end
-            if ~ismatrix(weights);  weights = utils.reshape_ND2AD(weights,   mask_idx); elseif ~isempty(weights); weights = weights(:,mask_idx);  end
-            % data = utils.reshape_ND2AD(data,mask);
-            % if ~isempty(weights); weights = utils.reshape_ND2AD(weights,mask); else; weights = ones(size(data), 'like', data); end
-            pars0 = utils.reshape_ND2AD_struct(pars0,mask);
+            if ~ismatrix(data);     data    = utils.reshape_ND2GD(data,      mask_idx); else; data = data(:,mask_idx);     end
+            if ~ismatrix(weights);  weights = utils.reshape_ND2GD(weights,   mask_idx); elseif ~isempty(weights); weights = weights(:,mask_idx);  end
+            % data = utils.reshape_ND2GD(data,mask);
+            % if ~isempty(weights); weights = utils.reshape_ND2GD(weights,mask); else; weights = ones(size(data), 'like', data); end
+            pars0 = utils.reshape_ND2GD_struct(pars0,mask);
 
             % MCMC
             if strcmpi(fitting.algorithm,'mh')

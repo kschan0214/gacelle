@@ -23,7 +23,10 @@ Table of Contents
    :caption: Getting started
    :name: sec-getstart
 
+   getting_started/introduction
+   getting_started/designing_model
    getting_started/askadam_basic_tutorial
+   getting_started/askadam_basicND_tutorial
    getting_started/mcmc_basic_tutorial
    getting_started/mcmc_metropolishastings_tutorial
    getting_started/mcmc_affineinvariantensemble_tutorial

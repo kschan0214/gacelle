@@ -22,7 +22,7 @@ classdef utils < handle
 
     methods(Static)
 
-        function [data_masked] = masking_ND2AD_preserve(data,mask)
+        function [data_masked] = masking_ND2GD_preserve(data,mask)
         % this function concatenate the first 3 dimension of data and stored in the second dim, while preserving the 4th onward dim
         % data: [x,y,z,a,b,c] -> data_masked: [1,x*y*z,1,a,b,c]
             dims            = size(data,1:3);
@@ -44,7 +44,7 @@ classdef utils < handle
 
         end
 
-        function data_struct = masking_ND2AD_preserve_struct(data_struct,mask)
+        function data_struct = masking_ND2GD_preserve_struct(data_struct,mask)
             % get fields
             fieldname = fieldnames(data_struct); 
 
@@ -52,19 +52,19 @@ classdef utils < handle
             for km = 1:numel(fieldname)
                 dims = size(data_struct.(fieldname{km}),1:3);
                 if all(dims == size(mask,1:3))
-                    data_struct.(fieldname{km}) = utils.masking_ND2AD_preserve(data_struct.(fieldname{km}),mask); 
+                    data_struct.(fieldname{km}) = utils.masking_ND2GD_preserve(data_struct.(fieldname{km}),mask); 
                 end
             end
 
         end
 
-        function [data] = undo_masking_ND2AD_preserve(data_masked,mask)
+        function [data] = undo_masking_ND2GD_preserve(data_masked,mask)
 
             dims            = size(mask,1:3);
             dims_nonspatial = size(data_masked,4:ndims(data_masked));
 
             if isempty(dims_nonspatial)
-                data = utils.reshape_AD2ND(data_masked,mask);
+                data = utils.reshape_GD2ND(data_masked,mask);
             else
 
                 mask_idx = find(mask>0);
@@ -77,18 +77,18 @@ classdef utils < handle
 
         end
 
-        function data_struct = undo_masking_ND2AD_preserve_struct(data_struct,mask)
+        function data_struct = undo_masking_ND2GD_preserve_struct(data_struct,mask)
             % get fields
             fieldname = fieldnames(data_struct); 
 
             % loop all fields
             for km = 1:numel(fieldname)
-                data_struct.(fieldname{km}) = utils.undo_masking_ND2AD_preserve(data_struct.(fieldname{km}),mask); 
+                data_struct.(fieldname{km}) = utils.undo_masking_ND2GD_preserve(data_struct.(fieldname{km}),mask); 
             end
         end
 
-        % this function reshape ND data into askAdam 2D (i.e.AD) input specific for this package, ie..[Nmeas,Nvoxel]
-        function [data, mask_idx] = reshape_ND2AD(data,mask)
+        % this function reshape ND data into GACELLE 2D (i.e.GD) input specific for this package, ie..[Nmeas,Nvoxel]
+        function [data, mask_idx] = reshape_ND2GD(data,mask)
 
             [data, mask_idx] = utils.vectorise_NDto2D(data,mask);
 
@@ -97,47 +97,47 @@ classdef utils < handle
         end
 
         % this function reshape ND data stored in a structure array into askAdam 2D (i.e.AD) input specific for this package, ie..[Nmeas,Nvoxel]
-        function data_struct = reshape_ND2AD_struct(data_struct,mask)
+        function data_struct = reshape_ND2GD_struct(data_struct,mask)
 
             % get fields
             fieldname = fieldnames(data_struct); 
             
             % loop all fields
             for km = 1:numel(fieldname)
-                data_struct.(fieldname{km}) = utils.reshape_ND2AD(data_struct.(fieldname{km}),mask); 
+                data_struct.(fieldname{km}) = utils.reshape_ND2GD(data_struct.(fieldname{km}),mask); 
             end
 
         end
 
         % this function reshape ND data stored in a structure array into askAdam 2D (i.e.AD) input specific for this package, ie..[Nmeas,Nvoxel]
-        function data_struct = gpu_reshape_ND2AD_struct(data_struct,mask)
+        function data_struct = gpu_reshape_ND2GD_struct(data_struct,mask)
 
             % get fields
             fieldname = fieldnames(data_struct); 
             
             % loop all fields
             for km = 1:numel(fieldname)
-                data_struct.(fieldname{km}) = gpuArray(single( utils.reshape_ND2AD(data_struct.(fieldname{km}),mask) )); 
+                data_struct.(fieldname{km}) = gpuArray(single( utils.reshape_ND2GD(data_struct.(fieldname{km}),mask) )); 
             end
 
         end
 
-        % undo reshape_ND2AD
-        function data = reshape_AD2ND(data,mask)
+        % undo reshape_ND2GD
+        function data = reshape_GD2ND(data,mask)
 
             data = utils.reshape_ND2image(data.',mask);
 
         end
 
-        % undo reshape_ND2AD_struct
-        function data_struct = reshape_AD2ND_struct(data_struct,mask)
+        % undo reshape_ND2GD_struct
+        function data_struct = reshape_GD2ND_struct(data_struct,mask)
 
             % get fields
             fieldname = fieldnames(data_struct);
 
             % loop all fields
             for km = 1:numel(fieldname)
-                data_struct.(fieldname{km}) = utils.reshape_AD2ND(data_struct.(fieldname{km}),mask); 
+                data_struct.(fieldname{km}) = utils.reshape_GD2ND(data_struct.(fieldname{km}),mask); 
             end
             
 

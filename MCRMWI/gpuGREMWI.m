@@ -328,7 +328,7 @@ classdef gpuGREMWI < handle
             % data = utils.vectorise_NDto2D(data,mask).';
             % if ~isempty(w); w = utils.vectorise_NDto2D(w,mask).'; end
             % fieldname = fieldnames(extraData); for km = 1:numel(fieldname); extraData.(fieldname{km}) = gpuArray(single( utils.vectorise_NDto2D(extraData.(fieldname{km}),mask) ).'); end
-            extraData   = utils.masking_ND2AD_preserve_struct(extraData,mask) ;
+            extraData   = utils.masking_ND2GD_preserve_struct(extraData,mask) ;
             out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
@@ -517,7 +517,7 @@ classdef gpuGREMWI < handle
             end
 
             % vectorise to match maksed measurement data
-            s = utils.reshape_ND2AD(s,[]);
+            s = utils.reshape_ND2GD(s,[]);
 
         end
         

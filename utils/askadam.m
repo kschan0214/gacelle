@@ -39,7 +39,7 @@ classdef askadam < handle
             % Forward signal simulation
             signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),varargin{:});
             % masking Forward signal if the 'signal_FWD' is not 2D
-            if ~ismatrix(signal_FWD); signal_FWD = utils.reshape_ND2AD(signal_FWD, mask); end
+            if ~ismatrix(signal_FWD); signal_FWD = utils.reshape_ND2GD(signal_FWD, mask); end
             % ensure numerical output
             signal_FWD = utils.set_nan_inf_zero(signal_FWD);
 
@@ -65,7 +65,7 @@ classdef askadam < handle
                 for kreg = 1:numel(fitting.lambda)
                     Nsample     = numel(mask(mask ~= 0));
 
-                    cost        = this.reg_TV(utils.reshape_AD2ND(parameters.(fitting.regmap{kreg}),mask),mask,fitting.TVmode,fitting.voxelSize);
+                    cost        = this.reg_TV(utils.reshape_GD2ND(parameters.(fitting.regmap{kreg}),mask),mask,fitting.TVmode,fitting.voxelSize);
                     loss_reg    = sum(abs(cost),"all")/Nsample *fitting.lambda{kreg} + loss_reg;
                 end
             end
@@ -112,8 +112,8 @@ classdef askadam < handle
             %%%%%%%%%%%%%%%%%%%%%%%%%% 1. I/O Setup %%%%%%%%%%%%%%%%%%%%%%%%%%
             % data can be either 2D or ND, if ND then convert to 2D here
             % masking if the input data are not 2D
-            if ~ismatrix(data);     data    = utils.reshape_ND2AD(data,      mask_idx); else; data = data(:,mask_idx);     end
-            if ~ismatrix(weights);  weights = utils.reshape_ND2AD(weights,   mask_idx); elseif ~isempty(weights); weights = weights(:,mask_idx);  end
+            if ~ismatrix(data);     data    = utils.reshape_ND2GD(data,      mask_idx); else; data = data(:,mask_idx);     end
+            if ~ismatrix(weights);  weights = utils.reshape_ND2GD(weights,   mask_idx); elseif ~isempty(weights); weights = weights(:,mask_idx);  end
                 
             % the first dimension must be 'measurement' and second dimension 'voxel'
             [Nmeas,Nvol] = size(data);
@@ -335,8 +335,8 @@ classdef askadam < handle
             parameters         = this.set_boundary01(parameters);
             parameters_minLoss = this.set_boundary01(parameters_minLoss);
 
-            parameters          = utils.undo_masking_ND2AD_preserve_struct(parameters,mask);
-            parameters_minLoss  = utils.undo_masking_ND2AD_preserve_struct(parameters_minLoss,mask);
+            parameters          = utils.undo_masking_ND2GD_preserve_struct(parameters,mask);
+            parameters_minLoss  = utils.undo_masking_ND2GD_preserve_struct(parameters_minLoss,mask);
             
             % rescale the network parameters
             parameters          = this.unscale_parameters(parameters,           fitting.lb,fitting.ub,fitting.modelParams);
@@ -393,7 +393,7 @@ classdef askadam < handle
             end
 
             % masking
-            parameters = utils.masking_ND2AD_preserve_struct(parameters,mask); %parameters = utils.reshape_ND2AD_struct(parameters,mask);% structfun(@transpose,utils.vectorise_NDto2D_struct(parameters,mask),'UniformOutput',false);
+            parameters = utils.masking_ND2GD_preserve_struct(parameters,mask); %parameters = utils.reshape_ND2GD_struct(parameters,mask);% structfun(@transpose,utils.vectorise_NDto2D_struct(parameters,mask),'UniformOutput',false);
             
         end
    

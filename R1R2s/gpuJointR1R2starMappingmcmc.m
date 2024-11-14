@@ -182,7 +182,7 @@ classdef gpuJointR1R2starMappingmcmc < handle
             % 3. askAdam optimisation main
             mcmcObj     = mcmc();
             % 3.1. initial global optimisation
-            extraData   = utils.gpu_reshape_ND2AD_struct(extraData,mask);
+            extraData   = utils.gpu_reshape_ND2GD_struct(extraData,mask);
             out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
 
             % disp('The process is completed.')
@@ -290,7 +290,7 @@ classdef gpuJointR1R2starMappingmcmc < handle
             s = arrayfun(@model_jointR1R2s_singlecompartment,M0, R2star, R1, TE,this.tr,trueFlipAngle);
             
             % vectorise to match masked measurement data
-            s = utils.reshape_ND2AD(s,[]);
+            s = utils.reshape_ND2GD(s,[]);
             % reshape s for GW
             if ~isempty(fitting)
                 if strcmpi(fitting.algorithm,'gw')

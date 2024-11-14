@@ -298,7 +298,7 @@ classdef gpuNEXIrice < handle
 
             % askadam.optimisation does not see extractData so we have to manually mask the data inside here, make sure the voxel is on the second dimension
             % extraData   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
-            extraData   = utils.masking_ND2AD_preserve_struct(extraData,mask) ;
+            extraData   = utils.masking_ND2GD_preserve_struct(extraData,mask) ;
 
             % initiate starting points arrays
             out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, extraData);
@@ -381,7 +381,7 @@ classdef gpuNEXIrice < handle
             mask_valid  = and(mask_valid,~mask_LowSNR);
             
             % check signal similarity
-            dwi_2D          = utils.reshape_ND2AD(dwi,mask_valid);
+            dwi_2D          = utils.reshape_ND2GD(dwi,mask_valid);
             signalTemplate  = mean(dwi_2D,2,"omitmissing");         % assuming the majority of the signal are from tissues
             signalTemplate  = (signalTemplate - mean(signalTemplate)) ./ std(signalTemplate);
             Rcorr           = zeros(1,size(dwi_2D,2));
@@ -390,7 +390,7 @@ classdef gpuNEXIrice < handle
                 signalVoxel = (signalVoxel - mean(signalVoxel)) ./ std(signalVoxel);
                 Rcorr(k)    = corr(signalTemplate,signalVoxel);
             end
-            Rcorr            = utils.reshape_AD2ND(Rcorr,mask_valid);
+            Rcorr            = utils.reshape_GD2ND(Rcorr,mask_valid);
             mask_dissimilar  = Rcorr < 0.1;
             mask_valid       = and(mask_valid,~mask_dissimilar);
             
@@ -475,8 +475,8 @@ classdef gpuNEXIrice < handle
 
             % reshape input data,  put DWI dimension to 1st dim
             % dims    = size(dwi);
-            dwi     = utils.reshape_ND2AD(dwi,mask);
-            % sigma   = utils.reshape_ND2AD(extradata.sigma,mask);
+            dwi     = utils.reshape_ND2GD(dwi,mask);
+            % sigma   = utils.reshape_ND2GD(extradata.sigma,mask);
             % dwi     = permute(dwi,[4 1 2 3]);
             % dwi     = reshape(dwi,[dims(4), prod(dims(1:3))]);
 
@@ -499,7 +499,7 @@ classdef gpuNEXIrice < handle
                     pars0_mask(:,kvol) = this.likelihood(dwi(:,kvol), x_train, S_train);
                 end
             end
-            pars = utils.reshape_AD2ND(pars0_mask,mask);        
+            pars = utils.reshape_GD2ND(pars0_mask,mask);        
             % pars           = zeros(Nparam,size(dwi,2));
             % pars(:,ind)    = pars0_mask;
             % 
@@ -510,7 +510,7 @@ classdef gpuNEXIrice < handle
             bval_thres      = max(min(gather(this.b)),1.1);
             idx             = gather(this.b) <= bval_thres;
             D0              = real(this.b(idx)\-log(dwi(cat(1,idx,false(size(idx))),:)));
-            D0              = utils.reshape_AD2ND(D0,mask);
+            D0              = utils.reshape_GD2ND(D0,mask);
             % D0              = permute(reshape(D0,[size(D0,1) dims(1:3)]),[2 3 4 1]);
             D0              = max(utils.set_nan_inf_zero(D0),1e-8);
             mask_CSF        = D0>1.5;

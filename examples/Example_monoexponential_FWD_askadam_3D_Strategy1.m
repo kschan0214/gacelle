@@ -28,12 +28,12 @@ R2star  = pars.R2star;
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % to maximise the GPU memory efficiency, pars.S0 and pars.R2star are masked inside askAdam.m by default, therefore they have size of [1*Nvoxel]
 % therefore, we need to store the 1D arrays to their unmasked shape
-% the utility function 'reshape_AD2ND' can convert the masked 1D array back to its original ND shape given the signal mask
+% the utility function 'reshape_GD2ND' can convert the masked 1D array back to its original ND shape given the signal mask
 if any(size(S0,1:3) ~= size(mask,1:3))  % if the size doesn't match then the input is masked
-    S0 = utils.reshape_AD2ND(S0,mask);  % restore original shape
+    S0 = utils.reshape_GD2ND(S0,mask);  % restore original shape
 end
 if any(size(R2star,1:3) ~= size(mask,1:3))
-    R2star = utils.reshape_AD2ND(R2star,mask);
+    R2star = utils.reshape_GD2ND(R2star,mask);
 end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 

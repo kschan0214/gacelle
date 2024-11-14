@@ -64,7 +64,7 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc_MH.m
     :language: matlab
-    :lines: 51-42
+    :lines: 51-52
 
 6. Start the optimisation
 
@@ -73,8 +73,6 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
     :lines: 54-55
 
 7. Plot the estimation results
-
-.. code-block:: matlab
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc_MH.m
     :language: matlab

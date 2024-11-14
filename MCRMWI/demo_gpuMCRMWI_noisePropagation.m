@@ -94,7 +94,7 @@ mask        = ones(size(M0_GT,1:3),'logical');
 
 objGPU     = gpuMCRMWI(te,tr,fa,fixed_params);
 Sgpu_GT       = gather(extractdata(objGPU.FWD(pars, fitting, extraData,dlnet_phase.dlnet,dlnet_magn.dlnet)));
-Sgpu_GT       = reshape(utils.reshape_AD2ND(Sgpu_GT,mask),[1 Nsample 1 Nt Nfa 2]); 
+Sgpu_GT       = reshape(utils.reshape_GD2ND(Sgpu_GT,mask),[1 Nsample 1 Nt Nfa 2]); 
 Sgpu_GT       = Sgpu_GT(:,:,:,:,:,1) + 1i*Sgpu_GT(:,:,:,:,:,2);
 
 Smax = mean(M0_GT);
