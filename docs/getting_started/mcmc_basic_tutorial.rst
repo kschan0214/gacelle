@@ -72,5 +72,10 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
     :language: matlab
     :lines: 59-65
 
+.. figure:: _images/mcmc_basic_scatter.png
+   :align: center
+
+   Scatterplots of the ground truth, starting points and estimation values
+
 The full example script can be found in `here <../../examples/Example_monoexponential_estimate_mcmc.m>`_.
     

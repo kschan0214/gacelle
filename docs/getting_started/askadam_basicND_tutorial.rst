@@ -95,6 +95,16 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
     :language: matlab
     :lines: 61-74
 
+.. figure:: _images/strategy1_image.png
+   :align: center
+
+   Center slice of the ground truth, starting points and estimation values
+
+.. figure:: _images/strategy1_scatter.png
+   :align: center
+
+   Scatterplots of the ground truth, starting points and estimation values
+
 The full example script can be found in `here <../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m>`_.
     
 .. _strategy2:
@@ -178,5 +188,17 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
     :lines: 61-74
+
+.. figure:: _images/strategy2_image.png
+   :align: center
+
+   Center slice of the ground truth, starting points and estimation values
+
+.. figure:: _images/strategy2_scatter.png
+   :align: center
+
+   Scatterplots of the ground truth, starting points and estimation values
+
+These results are exactly the same as Strategy 1 because we used the same seed and mask.
 
 The full example script can be found in `here <../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m>`_.

@@ -1,21 +1,21 @@
-%% S = Example_monoexponential_FWD_askadam( pars, t, mask)
+%% S = Example_monoexponential_FWD_askadam_3D_Strategy1( pars, t, mask)
 %
 % Input
 % --------------
 % pars          : input model parameter structure (This is ALWAYS the first input variable)
 % t             : [1xNt] sampling time (could be any extra input)
+% mask          : 3D signal mask
 %
 % Output
 % --------------
-% S             : monoexponential decay signal, [NtxNvoxel] matrix
+% S             : monoexponential decay signal, [Nx*Ny*Nz*Nvoxel] matrix
 %
 % Description: example forward function for askadam solver
 %
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 24 September 2024
-% Date last modified: 7 Nov 2024
-%
+% Date created: 14 Nov 2024
+% Date last modified: 
 %
 function S = Example_monoexponential_FWD_askadam_3D_Strategy1( pars, t, mask)
     
