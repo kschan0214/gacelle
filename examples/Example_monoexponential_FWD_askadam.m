@@ -1,4 +1,4 @@
-%% S = Example_monoexponential_FWD_askadam( pars, mask, t)
+%% S = Example_monoexponential_FWD_askadam( pars, t)
 %
 % Input
 % --------------

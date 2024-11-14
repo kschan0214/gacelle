@@ -38,6 +38,8 @@ classdef askadam < handle
 
             % Forward signal simulation
             signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),varargin{:});
+            % masking Forward signal if the 'signal_FWD' is not 2D
+            if ~ismatrix(signal_FWD); signal_FWD = utils.reshape_ND2AD(signal_FWD, mask); end
             % ensure numerical output
             signal_FWD = utils.set_nan_inf_zero(signal_FWD);
 
