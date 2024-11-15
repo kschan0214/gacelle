@@ -226,10 +226,10 @@ classdef mcmc < handle
             
             % initiate an ensemble of walkers around the starting position (0.1% full range) with Gaussian distribution
             % 1st: Nvar;2nd: Nv; 3rd: Nwalker
-            xCurr   = this.struct2array(x0,fitting.modelParams);       % extract parameter structure to numeric array for faster computation
-            xCurr   = xCurr + (ub-lb)*0.001.*randn(size(ub));           % initiate starting position for all walkers
-            xCurr   = max(xCurr,lb); xCurr = min(xCurr,ub);             % set boundary
-            x0      = this.array2struct(xCurr,fitting.modelParams);    % convert array back to structure for FWD function
+            xCurr   = this.struct2array(x0,fitting.modelParams);                % extract parameter structure to numeric array for faster computation
+            xCurr   = xCurr + (ub-lb)*fitting.startRadius.*randn(size(ub));     % initiate starting position for all walkers
+            xCurr   = max(xCurr,lb); xCurr = min(xCurr,ub);                     % set boundary
+            x0      = this.array2struct(xCurr,fitting.modelParams);             % convert array back to structure for FWD function
             % compute likelihood at starting points
             logP0   = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0, varargin{:})-y).^2, 1 ), x0.noise, Nm);
         
@@ -328,6 +328,7 @@ classdef mcmc < handle
             if ~isfield(fitting,'Nwalker');             fitting2.Nwalker        = 50;               end 
             if ~isfield(fitting,'ub');                  fitting2.ub             = [];               end
             if ~isfield(fitting,'lb');                  fitting2.lb             = [];               end
+            if ~isfield(fitting,'startRadius');         fitting2.startRadius    = 0.001;            end
 
             if any(ismember(fitting2.metric,'mode'))
                 if ~isfield(fitting,'Nbin');            fitting2.Nbin     = 1001;                end 
