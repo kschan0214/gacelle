@@ -17,12 +17,12 @@
 % Date last modified: 7 Nov 2024
 %
 %
-function S = Example_monoexponential_FWD_askadam( pars, t)
+function S = Example_monoexponential_FWD_GD( pars, t)
     
 % columnised t
 t = t(:);
 
-% convert S0 and R2star into row vectors for matrix multiplication
+% S0 and R2star here are [1xNvoxel] arrays
 S0      = pars.S0;
 R2star  = pars.R2star;
 

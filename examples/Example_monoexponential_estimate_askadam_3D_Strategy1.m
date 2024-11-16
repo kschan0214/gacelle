@@ -37,7 +37,7 @@ pars0.(modelParams{2}) = 20 + 10*randn(Nx,Ny,Nz);   % R2*
 % set up fitting algorithm
 fitting                     = [];
 % define model parameter name and fitting boundary
-fitting.modelParams         = modelParams;
+fitting.modelParams         = {'S0','R2star'}; % modelParams;
 fitting.lb                  = [0, 0];   % lower bound 
 fitting.ub                  = [2, 50];  % upper bound
 % Estimation algorithm setting

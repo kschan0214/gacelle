@@ -5,7 +5,10 @@
 askAdam basic tutorial
 ======================
 
-This tutorial demonstrates an example of how to use the askAdam solver in this package for model parameter estimation. 
+This tutorial demonstrates an example of how to use the askAdam solver in this package for model parameter estimation, based on the G-D input option shown in here:
+
+.. figure:: _images/data_flow_askadam_GD.png
+   :align: center
 
 Let's say we have a simple monoexponential decay model:
 
@@ -17,8 +20,11 @@ In this model, we have two parameters to be estimated: :math:`S0` and :math:`R_{
 
 The first thing is to create a function to generate the forward signal. Here is an example:
 
-.. literalinclude:: ../../examples/Example_monoexponential_FWD_askadam.m
+.. literalinclude:: ../../examples/Example_monoexponential_FWD_GD.m
     :language: matlab
+    :lines: 20-32
+
+Note that this function takes in two input variables: **pars** and **t**, where **pars** is a structure variable stored 2 fields: **S0** and **R2star**, with a size of [1*Nvoxel], and **t** are the echo times of the measurments. The output variable **S** is a time decay signal with a size of [Nt*Nvoxel].
 
 We can simulate the measurements using this function
 
@@ -26,18 +32,20 @@ We can simulate the measurements using this function
     :language: matlab
     :lines: 4-28
 
+Now **y** is our 'realistic' noisy data for the estimation.
+
 .. note::
-    The dimenion and arrangement of y must be the same as the output of the forward function.
+    The dimenion and arrangement of **y** must be the same as the output **S** of the forward function.
 
-To estimate :math:`S0` and :math:`R_{2}^{*}` from y, 
+To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**, 
 
-1. Set up the starting point for the estimation
+1. Set up the starting point (**pars0**) for the estimation. **pars0** has the same input format as **pars** of the forward function. In this example, we just use random values
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
     :lines: 31-32
 
-2. Set up the model parameters and fitting boundary
+2. Set up the model parameters and fitting boundary.
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab

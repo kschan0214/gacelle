@@ -5,7 +5,7 @@ clear
 % reproducibility
 seed = 5438973; rng(seed); gpurng(seed);
 
-% set up estimation parameters; must be the same as in FWD function
+% set up estimation parameter name; must be the same as the fields of 'pars' in the forward function
 modelParams = {'S0','R2star'};
 
 % define number of voxels and SNR
@@ -20,7 +20,7 @@ R2star      = 30 + 5*randn(1,Nsample);
 % forward signal generation
 pars.(modelParams{1}) = S0; 
 pars.(modelParams{2}) = R2star;
-S           = Example_monoexponential_FWD_askadam(pars,t);
+S = Example_monoexponential_FWD_GD(pars,t);
 
 % realistic signal with certain SNR
 noise   = mean(S0) / SNR;           % estimate noise level
@@ -34,7 +34,7 @@ pars0.(modelParams{2}) = 20 + 10*randn(1,Nsample);   % R2*
 % set up fitting algorithm
 fitting                     = [];
 % define model parameter name and fitting boundary
-fitting.modelParams         = modelParams;
+fitting.modelParams         = {'S0','R2star'}; % modelParams;
 fitting.lb                  = [0, 0];   % lower bound 
 fitting.ub                  = [2, 50];  % upper bound
 % Estimation algorithm setting
@@ -44,10 +44,10 @@ fitting.lossFunction        = 'l1';
 fitting.tol                 = 1e-4;
 fitting.convergenceValue    = 1e-8;
 fitting.convergenceWindow   = 20;
-fitting.isDisplay          = false;
+fitting.isDisplay           = false;
 
 % define your forward model
-modelFWD = @Example_monoexponential_FWD_askadam;
+modelFWD = @Example_monoexponential_FWD_GD;
 
 % equal weights
 weights = [];

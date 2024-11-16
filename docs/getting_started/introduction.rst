@@ -37,7 +37,17 @@ Throughout the documentation, we will see a lot references to the terms **G-D** 
 
 In contrast, we define **N-D** as the multi-dimension array with N>=3. The first 3 dimensions of an **N-D** variable are preserved for spatial (x-,y-,z-) information, while the 4th dimension (and onwards) is for measurements. For example, :math:`S_{meas}` can be a 3D image with 10 voxels on each dimension and 5 time point measurements. Then :math:`S_{meas}` will be a 4D array with a size of [10*10*10*5]. If there is more than 1 mesaurement dimension (e.g. 2D spectrum), the dimenionality of :math:`S_{meas}` can be expanded to 5D and so on.
 
-Introducing the concept of **G-D** lies on the fact that ``askadam.m`` takes the losses of the entire input volumn into account in the optimisation. For imaging data, we often only focus on specific tissues/organs (e.g., the brain). This requires us to apply a signal mask to exclude non-tissues-of-interest in the loss computation. **G-D** simplifies this by reducing the dimensionality of the input data into the most bacis form: all spatial information is concatenated in a single dimension (i.e., masked voxels) and the corresponding measurements in another dimension.
+.. figure:: _images/dataformat.png
+   :align: center
 
-The utilisation of **G-D** and **N-D** is mostly relevant when it comes to designing a new forward model function. Example can be found in :doc:`the next section <designing_model>`.
+   An illustration of N-D imaging data and G-D data format for *GACELLE*
+
+Introducing the concept of **G-D** lies on the fact that ``askadam.m`` takes the losses of the entire input volumn into account in the optimisation. For imaging data, we often only focus on specific tissues/organs (e.g., the brain), or the microstructure model is only valid for specific tissue types (e.g., grey matter or white matter). This requires us to apply a signal mask to exclude non-tissues-of-interest in the loss computation. **G-D** simplifies this by reducing the dimensionality of the input data into the most bacis form: all spatial information is concatenated in a single dimension (i.e., masked voxels) and the corresponding measurements in another dimension.
+
+.. figure:: _images/ND2GD.png
+   :align: center
+
+   An illustration of converting an N-D imaging data into G-D format.
+
+Most of the time *GACELLE* takes care of the data format conversion internally. The utilisation of **G-D** and **N-D** is mostly relevant when it comes to designing a new forward model function. Example can be found in :doc:`this tutorial <askadam_basicND_tutorial>`.
 
