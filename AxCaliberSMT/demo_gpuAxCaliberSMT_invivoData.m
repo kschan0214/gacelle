@@ -11,7 +11,7 @@
 % Date modified: 24 September 2024
 %
 %% add paths
-addpath(genpath('../askadam')); % this is the path to 'askadam' package
+addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
 clear;
 
 %% I/O: Load data

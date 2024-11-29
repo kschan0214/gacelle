@@ -21,7 +21,7 @@ R2star      = 30 + 5*randn(1,Nsample);
 % forward signal generation
 pars.(modelParams{1}) = S0; 
 pars.(modelParams{2}) = R2star;
-S                     = Example_monoexponential_FWD_mcmc(pars,t);
+S                     = Example_monoexponential_FWD_GD(pars,t);
 
 % realistic signal with certain SNR
 noise   = mean(S0) / SNR;           % estimate noise level
@@ -48,7 +48,7 @@ fitting.StepSize     = 2;
 fitting.Nwalker      = 50;
 
 % define your forward model
-modelFWD = @Example_monoexponential_FWD_mcmc;
+modelFWD = @Example_monoexponential_FWD_GD;
 
 % equal weights
 weights = [];

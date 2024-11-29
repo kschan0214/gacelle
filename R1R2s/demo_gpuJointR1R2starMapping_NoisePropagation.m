@@ -1,5 +1,5 @@
 
-addpath(genpath('../../askadam/'));
+addpath(genpath('../../gacelle/'));
 clear;
 
 %% Simulate data

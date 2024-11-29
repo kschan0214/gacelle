@@ -10,7 +10,7 @@
 % Date modified: 14 June 2024
 %
 %% add paths
-addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/askadam')); % this path should be accessible to the group
+addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/gacelle')); % this path should be accessible to the group
 clear;
 
 %% I/O: Load data
