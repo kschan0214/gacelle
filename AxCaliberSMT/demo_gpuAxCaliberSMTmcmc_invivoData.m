@@ -49,7 +49,7 @@ fitting             = [];
 fitting.algorithm   = 'MH';     % Metropolis-Hastings
 fitting.iteration   = 2e4;      % 2e4 for demo purpose. Original implementation used 2e5.
 fitting.thinning    = 100;
-fitting.method      = 'median';
+fitting.metric      = {'median','mean'};
 fitting.start       = 'default';
 
 % get the GPU device
