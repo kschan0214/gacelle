@@ -7,6 +7,7 @@ classdef askadam < handle
 % Date created: 4 April 2024 
 % Date modified: 21 August 2024
 % Date modified: 3 October 2024
+% Date modified: 11 April 2025
 
     properties (Constant)
         epsilon = 1e-8;
@@ -18,7 +19,7 @@ classdef askadam < handle
 
     methods
 
-        function [gradients,loss,loss_fidelity,loss_reg,residuals] = model_gradient(this, parameters, data, mask, weights, fitting, FWDfunc, varargin)
+        function [gradients,loss,loss_fidelity,loss_reg,residuals] = model_gradient(this, parameters, data, mask, weights, fitting, userfuncCell, varargin)
         % Input
         % ----------
         % parameters    : Structure variable containing all parameters to be estimated
@@ -26,7 +27,7 @@ classdef askadam < handle
         % mask          : M-D signal mask (M=[1,3])
         % weights       : N-D weights for optimisaiton
         % fitting       : Structure variable containing all fitting algorithm setting
-        % FWDfunc       : function handle of forward model
+        % userfuncCell  : cell array containing the forward model and optional regularisation function handles 
         % varargin      : contains additional input requires for FWDfunc
         % 
         % Output
@@ -36,8 +37,37 @@ classdef askadam < handle
         % loss_fidelity : loss associated with data fidelity (consistancy)
         % loss_reg      : loss associated with (TV) regularisation
 
+            
+            
+            % Obatin user forwsrd model function and regularisation function
+            if ~iscell(userfuncCell)
+                % for legacy input format
+                userfuncCell    = {userfuncCell}; 
+                modelInput      = varargin;
+            else
+                % get extra input for the forward mdoel
+                modelInput = varargin{:}{1};
+            end
+
+            FWDfunc = userfuncCell{1};
+            if numel(userfuncCell) > 1
+                % user defined regularisation function handle
+                REGfunc = userfuncCell{2};
+
+                % get extra input for the forward mdoel
+                regulInput = varargin{:}{2};
+            else
+                % use default TV regularisation handle
+                REGfunc = @spatial_total_variation;
+
+                % regularisation input
+                regulInput = {mask,fitting.lambda,fitting.regmap,fitting.TVmode,fitting.voxelSize};
+
+            end
+
             % Forward signal simulation
-            signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),varargin{:});
+            % signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),varargin{:});
+            signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),modelInput{:});
             % masking Forward signal if the 'signal_FWD' is not 2D
             if ~ismatrix(signal_FWD); signal_FWD = utils.reshape_ND2GD(signal_FWD, mask); end
             % ensure numerical output
@@ -60,15 +90,7 @@ classdef askadam < handle
             loss_fidelity = mean(residuals);
 
             % regularisation term
-            loss_reg = 0;
-            if fitting.lambda{1} > 0
-                for kreg = 1:numel(fitting.lambda)
-                    Nsample     = numel(mask(mask ~= 0));
-
-                    cost        = this.reg_TV(utils.reshape_GD2ND(parameters.(fitting.regmap{kreg}),mask),mask,fitting.TVmode,fitting.voxelSize);
-                    loss_reg    = sum(abs(cost),"all")/Nsample *fitting.lambda{kreg} + loss_reg;
-                end
-            end
+            loss_reg = REGfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),regulInput{:});
             
             % compute loss
             loss = loss_fidelity + loss_reg;
@@ -79,7 +101,8 @@ classdef askadam < handle
         end
 
         % askAdam optimisation loop
-        function out = optimisation(this, data, mask, weights, parameters, fitting, FWDfunc, varargin)
+        % function out = optimisation(this, data, mask, weights, parameters, fitting, FWDfunc, varargin)
+        function out = optimisation(this, data, mask, weights, parameters, fitting, userfuncCell, varargin)
         % Input
         % -----
         % data                  : 2-D (vectorised imaging) data
@@ -99,7 +122,7 @@ classdef askadam < handle
         %   .lambda             : regularisation parameter(s)
         %   .regmap             : model parameter(s) in which regularisation is applied
         %   .lossFunction       : loss function, 'L1'|'L2'|'huber'|'mse'
-        % FWDfunc               : function handle for forward signal generation
+        % userfuncCell          : cell array containing the forward model and optional regularisation function handles 
         % varargin              : additional input for FWDfunc other than 'parameter' and 'mask' (same order as FWDfunc)
         %
         % Output
@@ -131,6 +154,7 @@ classdef askadam < handle
             %%%%%%%%%%%%%%%%%%%%%%%%%% 2. Initialisation %%%%%%%%%%%%%%%%%%%%%%%%%%
             % check and set fitting default
             fitting = this.check_set_default_basic(fitting);
+            if numel(userfuncCell) > 1; fitting.defaultRegularisation = false; end
             
             % initiate starting points arrays
             parameters = this.set_boundary01(this.initialise_parameter(dims,parameters,fitting,mask));    % the parameter maps here are normalised to [0,1] using their boundary values
@@ -155,7 +179,7 @@ classdef askadam < handle
             if fitting.isDisplay; lineLoss = this.setup_display; end
 
             % compute the loss and residual at the starting point
-            [~,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:});
+            [~,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:});
             lossAll0                = extractdata(mean(reshape(residuals,Nmeas,Nvol),1));
             loss                    = double(utils.dlarray2single(loss));
             minLoss                 = loss;
@@ -184,7 +208,7 @@ classdef askadam < handle
                     %%%%%%%%%%%%%%%%%%%% 3.1. Model evaluation module %%%%%%%%%%%%%%%%%%%%
                     parameters = this.set_boundary01(parameters); % make sure the parameters are [0,1]
                     
-                    [gradients,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,FWDfunc,varargin{:}); % Evaluate the model gradients and loss using dlfeval and the modelGradients function
+                    [gradients,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:}); % Evaluate the model gradients and loss using dlfeval and the modelGradients function
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
                     if fitting.debug; isNaNInf = this.check_nan_in_gradients(gradients, mask_idx); if isNaNInf; disp(num2str(epoch));end; end % DEBUG module
@@ -416,7 +440,7 @@ classdef askadam < handle
         %   .tol                : stop criteria on metric value, default = 1e-3
         %   .lambda             : regularisation parameter, default = 0 (no regularisation)
         %   .TVmode             : mode for TV regulariation, '2D'|'3D', default = '2D'
-        %   .regmap             : parameter map used for regularisation, 'fa'|'ra'|'Da'|'De', default = 'fa'
+        %   .regmap             : parameter map used for regularisation, default = [];
         %   .voxelSize          : voxel size in mm
         %   .lossFunction       : loss for data fidelity term, 'L1'|'L2'|'MSE', default = 'L1'
         %   .display            : online display the fitting process on figure, true|false, defualt = false
@@ -424,28 +448,29 @@ classdef askadam < handle
         % 
             fitting2 = fitting;
 
+            fitting2.defaultRegularisation = true;
+
             % get fitting algorithm setting
-            if ~isfield(fitting,'iteration');           fitting2.iteration = 4000;          end
-            if isfield(fitting,'Nepoch') % legacy
-                fitting2.iteration  = fitting.Nepoch; fitting2            = rmfield(fitting2,'Nepoch');
-            end
+            if ~isfield(fitting,'iteration');           fitting2.iteration = 4000;              end     % stopping criteria
+            if isfield(fitting,'Nepoch');               fitting2.iteration  = fitting.Nepoch; fitting2 = rmfield(fitting2,'Nepoch'); end % legacy
             if ~isfield(fitting,'initialLearnRate');    fitting2.initialLearnRate   = 0.001;    end
             if ~isfield(fitting,'decayRate');           fitting2.decayRate          = 0;        end
             if ~isfield(fitting,'optimiser');           fitting2.optimiser          = 'adam';   end
-            if ~isfield(fitting,'tol');                 fitting2.tol                = 1e-3;     end
-            if ~isfield(fitting,'lambda');              fitting2.lambda             = {0};      end
-            if ~isfield(fitting,'TVmode');              fitting2.TVmode             = '2D';     end
-            if ~isfield(fitting,'voxelSize');           fitting2.voxelSize          = [2,2,2];  end
-            if ~isfield(fitting,'isDisplay');           fitting2.isDisplay          = 0;        end
-            if ~isfield(fitting,'randomness');          fitting2.randomness         = 0;        end
-            if ~isfield(fitting,'convergenceValue');    fitting2.convergenceValue   = 1e-8;     end
-            if ~isfield(fitting,'convergenceWindow');   fitting2.convergenceWindow  = 20;       end
             if ~isfield(fitting,'lossFunction');        fitting2.lossFunction       = 'L1';     end
+            if ~isfield(fitting,'tol');                 fitting2.tol                = 1e-3;     end     % stopping criteria
+            if ~isfield(fitting,'convergenceValue');    fitting2.convergenceValue   = 1e-8;     end     % stopping criteria
+            if ~isfield(fitting,'convergenceWindow');   fitting2.convergenceWindow  = 20;       end     % stopping criteria
+            if ~isfield(fitting,'patience');            fitting2.patience           = 5;        end     % stopping criteria
+            if ~isfield(fitting,'lambda');              fitting2.lambda             = {0};      end     % built-in regularisation
+            if ~isfield(fitting,'TVmode');              fitting2.TVmode             = '2D';     end     % built-in regularisation
+            if ~isfield(fitting,'regmap');              fitting2.regmap             = [];       end     % built-in regularisation
+            if ~isfield(fitting,'voxelSize');           fitting2.voxelSize          = [2,2,2];  end     % built-in regularisation
+            if ~isfield(fitting,'randomness');          fitting2.randomness         = 0;        end     % starting point
             if ~isfield(fitting,'outputFilename');      fitting2.outputFilename     = [];       end
             if ~isfield(fitting,'ub');                  fitting2.ub                 = [];       end
             if ~isfield(fitting,'lb');                  fitting2.lb                 = [];       end
             if ~isfield(fitting,'debug');               fitting2.debug              = false;    end
-            if ~isfield(fitting,'patience');            fitting2.patience           = 5;        end
+            if ~isfield(fitting,'isDisplay');           fitting2.isDisplay          = 0;        end
             if ~isfield(fitting,'isSampleConsistency'); fitting2.isSampleConsistency= false;    end
             if ~isfield(fitting,'isClipGradient');      fitting2.isClipGradient     = 0;        end
             if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres   = 1;        end
@@ -488,8 +513,10 @@ classdef askadam < handle
             disp(['Patience                 = ' num2str( fitting.patience)]);
             if fitting.lambda{1} > 0 
                 disp(['Regularisation parameter(s) = ' cell2num2str(fitting.lambda)]);
-                disp(['Regularisation Map(s)       = ' cell2str(fitting.regmap)]);
-                disp(['Total variation mode        = ' fitting.TVmode]);
+                if fitting.defaultRegularisation
+                    disp(['Regularisation Map(s)       = ' cell2str(fitting.regmap)]);
+                    disp(['Total variation mode        = ' fitting.TVmode]);
+                end
             end
             disp('-----------------------------');
             disp('Individual sample consistency');
