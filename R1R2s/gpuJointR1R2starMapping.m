@@ -54,12 +54,12 @@ classdef gpuJointR1R2starMapping < handle
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
         function  [out] = estimate(this, data, mask, extraData, fitting)
-        % Perform NEXI model parameter estimation based on askAdam
-        % Input data are expected in multi-dimensional image
+        % Perform joint R1 and R2* model parameter estimation using askAdam
+        % Input data are expected in multi-dimensional image format
         % 
         % Input
         % -----------
-        % dwi       : 4D DWI, [x,y,z,dwi]
+        % data      : 4D image data, [x,y,z,echoes]
         % mask      : 3D signal mask, [x,y,z]
         % extradata : Optional additional data
         %   .b1  : 3D B1 map, [x,y,z]
@@ -141,8 +141,8 @@ classdef gpuJointR1R2starMapping < handle
         %
         % Input
         % -----------
-        % dwi       : S0 normalised 4D dwi images, [x,y,slice,diffusion], 4th dimension corresponding to [Sl0_b1,Sl0_b2,Sl2_b1,Sl2_b2, etc.]; the order of bval must match the order in the constructor gpuNEXI
-        % mask      : 3D signal mask, [x,y,slice]
+        % data      : Variable flip angle data images, [x,y,z,TE,FA]
+        % mask      : 3D signal mask, [x,y,z]
         % fitting   : fitting algorithm parameters
         %   .Nepoch             : no. of maximum iterations, default = 4000
         %   .initialLearnRate   : initial gradient step size, defaulr = 0.01
@@ -166,7 +166,7 @@ classdef gpuJointR1R2starMapping < handle
         %   .min        : results with the minimum loss metric across all iterations
         %       .loss       : loss metric      
         %
-        % Description: askAdam Image-based NEXI model fitting
+        % Description: askAdam Image-based R1R2* model fitting
         %
         % Kwok-Shing Chan @ MGH
         % kchan2@mgh.harvard.edu
