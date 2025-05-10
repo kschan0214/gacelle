@@ -37,12 +37,12 @@ pars0.(modelParams{3}) = ones(1,Nsample)*0.001;     % noise
 fitting                     = [];
 % define model parameter name and fitting boundary
 fitting.modelParams        = modelParams;
-fitting.lb                  = [0, 0, 0.001];   % lower bound 
-fitting.ub                  = [2, 50, 0.1];  % upper bound
+fitting.lb                  = [0, 0, 0.001];    % lower bound 
+fitting.ub                  = [2, 50, 0.1];     % upper bound
 % Estimation algorithm setting
 fitting.iteration    = 1e4;
-fitting.algorithm    = 'GW';
-fitting.burnin       = 0.1;     % 10% iterations
+fitting.algorithm    = 'ensemble';
+fitting.burnin       = 0.1;                     % 10% iterations
 fitting.thinning     = 5;
 fitting.StepSize     = 2;
 fitting.Nwalker      = 50;

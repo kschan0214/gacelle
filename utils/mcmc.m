@@ -337,6 +337,8 @@ classdef mcmc < handle
             if ~iscell(fitting2.metric)
                 fitting2.metric = cellstr(fitting2.metric);
             end
+
+            if strcmpi(fitting2.algorithm ,'gw'); fitting2.algorithm = 'ensemble'; end % legacy
         end
 
         % display fitting algorithm parameters
