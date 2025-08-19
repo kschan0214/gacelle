@@ -23,7 +23,7 @@ R2star      = 30 + 5*randn(Nx,Ny,Nz);
 pars.(modelParams{1}) = S0; 
 pars.(modelParams{2}) = R2star;
 % S now is a 4D matrix
-S                     = Example_monoexponential_FWD_askadam_3D_Strategy1(pars,t,mask);
+S                     = Example_monoexponential_FWD_askadam_3D_Strategy1(pars,t);
 
 % realistic signal with certain SNR
 noise   = mean(S0(:)) / SNR;        % estimate noise level
@@ -47,7 +47,8 @@ fitting.lossFunction        = 'l1';
 fitting.tol                 = 1e-4;
 fitting.convergenceValue    = 1e-8;
 fitting.convergenceWindow   = 20;
-fitting.isDisplay          = false;
+fitting.isDisplay           = false;
+fitting.isOptimiseMemory    = false; 
 
 % define your forward model
 modelFWD = @Example_monoexponential_FWD_askadam_3D_Strategy1;
@@ -56,7 +57,7 @@ modelFWD = @Example_monoexponential_FWD_askadam_3D_Strategy1;
 weights = [];
 
 askadam_obj = askadam;
-out         = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t,mask);
+out         = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %% plot the estimation results
 figure;

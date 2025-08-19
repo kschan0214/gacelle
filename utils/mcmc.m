@@ -227,7 +227,7 @@ classdef mcmc < handle
             % initiate an ensemble of walkers around the starting position (0.1% full range) with Gaussian distribution
             % 1st: Nvar;2nd: Nv; 3rd: Nwalker
             xCurr   = this.struct2array(x0,fitting.modelParams);                % extract parameter structure to numeric array for faster computation
-            xCurr   = xCurr + (ub-lb)*fitting.startRadius.*randn(size(ub));     % initiate starting position for all walkers
+            xCurr   = xCurr + (ub-lb)*fitting.startRange.*randn(size(ub));     % initiate starting position for all walkers
             xCurr   = max(xCurr,lb); xCurr = min(xCurr,ub);                     % set boundary
             x0      = this.array2struct(xCurr,fitting.modelParams);             % convert array back to structure for FWD function
             % compute likelihood at starting points
@@ -328,7 +328,7 @@ classdef mcmc < handle
             if ~isfield(fitting,'Nwalker');             fitting2.Nwalker        = 50;               end 
             if ~isfield(fitting,'ub');                  fitting2.ub             = [];               end
             if ~isfield(fitting,'lb');                  fitting2.lb             = [];               end
-            if ~isfield(fitting,'startRadius');         fitting2.startRadius    = 0.001;            end
+            if ~isfield(fitting,'startRange');          fitting2.startRange    = 0.001;             end
 
             if any(ismember(fitting2.metric,'mode'))
                 if ~isfield(fitting,'Nbin');            fitting2.Nbin     = 1001;                end 
@@ -344,8 +344,8 @@ classdef mcmc < handle
         % display fitting algorithm parameters
         function display_basic_algorithm_parameters(fitting)
 
-            if strcmpi( fitting.algorithm, 'gw');   algorithm = 'Affine-Invariant Ensemble';
-            else;                                   algorithm = 'Metropolis-Hastings';          end
+            if strcmpi( fitting.algorithm, 'ensemble'); algorithm = 'Affine-Invariant Ensemble';
+            else;                                       algorithm = 'Metropolis-Hastings';          end
 
             disp('----------------------------------------------------');
             disp('Markov Chain Monte Carlo (MCMC) algorithm parameters');

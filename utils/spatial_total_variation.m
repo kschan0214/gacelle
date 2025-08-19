@@ -19,7 +19,7 @@
 % kchan2@mgh.harvard.edu
 %
 % Date created: 11 April 2025 
-% Date modified: 
+% Date modified: 19 July 2025
 %
 function loss_reg = spatial_total_variation(parameters, mask, lambda, regmap, TVmode, voxelSize)
 
@@ -29,8 +29,13 @@ if lambda{1} > 0
     Nsample     = numel(mask(mask ~= 0));
 
     for kreg = 1:numel(lambda)
-        cost        = reg_TV(utils.reshape_GD2ND(parameters.(regmap{kreg}),mask),mask,TVmode,voxelSize);
-        loss_reg    = sum(abs(cost),"all")/Nsample *lambda{kreg} + loss_reg;
+        if isequal(size(parameters.(regmap{kreg}),1:3), size(mask,1:3))
+            cost = reg_TV(parameters.(regmap{kreg}),mask,TVmode,voxelSize);
+        else
+            % if the dims are different then reshape the parameter map
+            cost = reg_TV(utils.reshape_GD2ND(parameters.(regmap{kreg}),mask),mask,TVmode,voxelSize);
+        end
+        loss_reg = sum(abs(cost),"all")/Nsample *lambda{kreg} + loss_reg;
     end
 end
 
@@ -41,6 +46,7 @@ function cost = reg_TV(img,mask,TVmode,voxelSize)
     % voxel_size = [1 1 1];
     % Vr      = 1./sqrt(abs(mask.*askadam.gradient_operator(img,voxel_size)).^2+eps);
     cost = sum(abs(mask.*gradient_operator(img,voxelSize,TVmode)),4);
+    % cost = sqrt(sum(abs(mask.*gradient_operator(img,voxelSize,TVmode)).^2,4));
 
     % cost    = divergence_operator(mask.*(Vr.*(mask.*askadam.gradient_operator(img,voxel_size))),voxel_size);
 end

@@ -157,10 +157,11 @@ classdef askadam < handle
             if numel(userfuncCell) > 1; fitting.defaultRegularisation = false; end
             
             % initiate starting points arrays
-            parameters = this.set_boundary01(this.initialise_parameter(dims,parameters,fitting,mask));    % the parameter maps here are normalised to [0,1] using their boundary values
+            parameters = this.set_boundary01(this.initialise_parameter(dims,parameters,fitting,mask),fitting.enableComplex);    % the parameter maps here are normalised to [0,1] using their boundary values
 
             % clear cache before running everthing
-            accfun = dlaccelerate(@this.model_gradient); clearCache(accfun)
+            if fitting.debug;   accfun = @this.model_gradient ;
+            else;               accfun = dlaccelerate(@this.model_gradient); clearCache(accfun); end
 
             % initiate optimiser parameters
             averageGrad = []; averageSqGrad = []; vel = [];
@@ -206,12 +207,12 @@ classdef askadam < handle
                 for epoch = 1:fitting.iteration
                     
                     %%%%%%%%%%%%%%%%%%%% 3.1. Model evaluation module %%%%%%%%%%%%%%%%%%%%
-                    parameters = this.set_boundary01(parameters); % make sure the parameters are [0,1]
+                    parameters = this.set_boundary01(parameters,fitting.enableComplex); % make sure the parameters are [0,1]
                     
                     [gradients,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:}); % Evaluate the model gradients and loss using dlfeval and the modelGradients function
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-                    if fitting.debug; isNaNInf = this.check_nan_in_gradients(gradients, mask_idx); if isNaNInf; disp(num2str(epoch));end; end % DEBUG module
+                    % if fitting.debug; isNaNInf = this.check_nan_in_gradients(gradients, mask_idx); if isNaNInf; disp(num2str(epoch));end; end % DEBUG module
                     
                     %%%%%%%%%%%%%%%%%%%% 3.2. Stopping criteria module %%%%%%%%%%%%%%%%%%%%
                     loss = double(utils.dlarray2single(loss)); % get loss
@@ -337,9 +338,9 @@ classdef askadam < handle
                             mask_outliers   = isoutlier(loss_nooutliers);
                             loss_nooutliers = gather( mean(loss_nooutliers(mask_outliers==0)));
 
-                            fprintf('Iteration #%4d,     Loss = %f,     Loss (w/o outliers) = %f,   Convergence = %e,     Elapsed:%s \n',epoch,loss,loss_nooutliers,convergenceCurr,string(D));
+                            fprintf('Iteration #%4d,   Loss = %f,     Loss (w/o outliers) = %f,   Convergence = %e,     Elapsed:%s \n',epoch,loss,loss_nooutliers,convergenceCurr,string(D));
                         else
-                            fprintf('Iteration #%4d,     Loss = %.3e,     Convergence = %.3e,       Learn rate = %.3e,     Elapsed:%s \n',epoch,loss,convergenceCurr, learningRate, string(D));
+                            fprintf('Iteration #%4d,   Total Loss = %.3e,   Consistency Loss = %.3e,   Regularisation Loss = %.3e,   Convergence = %.3e,   Learn rate = %.3e,   Elapsed:%s \n',epoch,loss,loss_fidelity,loss_reg,convergenceCurr, learningRate, string(D));
                         end
                     end
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -356,11 +357,13 @@ classdef askadam < handle
                 fprintf('Final #iterations  =  %d\n',epoch);
             end
             % make sure the final results stay within boundary
-            parameters         = this.set_boundary01(parameters);
-            parameters_minLoss = this.set_boundary01(parameters_minLoss);
+            parameters         = this.set_boundary01(parameters,fitting.enableComplex);
+            parameters_minLoss = this.set_boundary01(parameters_minLoss,fitting.enableComplex);
 
-            parameters          = utils.undo_masking_ND2GD_preserve_struct(parameters,mask);
-            parameters_minLoss  = utils.undo_masking_ND2GD_preserve_struct(parameters_minLoss,mask);
+            if fitting.isOptimiseMemory
+                parameters          = utils.undo_masking_ND2GD_preserve_struct(parameters,mask);
+                parameters_minLoss  = utils.undo_masking_ND2GD_preserve_struct(parameters_minLoss,mask);
+            end
             
             % rescale the network parameters
             parameters          = this.unscale_parameters(parameters,           fitting.lb,fitting.ub,fitting.modelParams);
@@ -416,8 +419,10 @@ classdef askadam < handle
                 parameters.(modelParams{k}) = gpuArray( dlarray( tmp ));
             end
 
-            % masking
-            parameters = utils.masking_ND2GD_preserve_struct(parameters,mask); %parameters = utils.reshape_ND2GD_struct(parameters,mask);% structfun(@transpose,utils.vectorise_NDto2D_struct(parameters,mask),'UniformOutput',false);
+            % masking if optimise memory usgae
+            if fitting.isOptimiseMemory
+                parameters = utils.masking_ND2GD_preserve_struct(parameters,mask); 
+            end
             
         end
    
@@ -474,6 +479,8 @@ classdef askadam < handle
             if ~isfield(fitting,'isSampleConsistency'); fitting2.isSampleConsistency= false;    end
             if ~isfield(fitting,'isClipGradient');      fitting2.isClipGradient     = 0;        end
             if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres   = 1;        end
+            if ~isfield(fitting,'enableComplex');       fitting2.enableComplex      = true;     end
+            if ~isfield(fitting,'isOptimiseMemory');    fitting2.isOptimiseMemory   = true;     end    
             
             if ~iscell(fitting2.lambda);                fitting2.lambda = num2cell(fitting2.lambda); end
 
@@ -503,6 +510,7 @@ classdef askadam < handle
             disp(['Initial learning rate    = ' num2str(fitting.initialLearnRate)]);
             disp(['Learning rate decay rate = ' num2str( fitting.decayRate)]);
             disp(['Max. #iterations         = ' num2str(fitting.iteration)]);
+            disp(['Allow complex-valued?    = ' utils.logical2string(fitting.enableComplex)]);
             disp('--------------------------');
             disp('Loss and stopping criteria');
             disp('--------------------------');
@@ -556,6 +564,7 @@ classdef askadam < handle
             % voxel_size = [1 1 1];
             % Vr      = 1./sqrt(abs(mask.*askadam.gradient_operator(img,voxel_size)).^2+eps);
             cost = sum(abs(mask.*askadam.gradient_operator(img,voxelSize,TVmode)),4);
+            % cost = sqrt(sum(abs(mask.*askadam.gradient_operator(img,voxelSize,TVmode).^2),4));
 
             % cost    = this.divergence_operator(mask.*(Vr.*(mask.*askadam.gradient_operator(img,voxel_size))),voxel_size);
         end
@@ -624,12 +633,18 @@ classdef askadam < handle
         end
 
         % make sure all network parameters stay between 0 and 1
-        function parameters = set_boundary01(parameters)
+        function parameters = set_boundary01(parameters,enableComplex)
 
+            % TODO: separate real and complex value
             field = fieldnames(parameters);
             for k = 1:numel(field)
-                parameters.(field{k})   = max(parameters.(field{k}),0); % Lower bound     
-                parameters.(field{k})   = min(parameters.(field{k}),1); % upper bound
+                if enableComplex
+                    parameters.(field{k})   = max(parameters.(field{k}),0); % Lower bound     
+                    parameters.(field{k})   = min(parameters.(field{k}),1); % upper bound
+                else
+                    parameters.(field{k})   = max(real(parameters.(field{k})),0); % Lower bound     
+                    parameters.(field{k})   = min(real(parameters.(field{k})),1); % upper bound
+                end
 
             end
 

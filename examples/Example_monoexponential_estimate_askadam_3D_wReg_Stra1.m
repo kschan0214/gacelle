@@ -23,7 +23,7 @@ R2star      = 30 + 5*randn(Nx,Ny,Nz);
 pars.(modelParams{1}) = S0; 
 pars.(modelParams{2}) = R2star;
 % S now is a 4D matrix
-S                     = Example_monoexponential_FWD_askadam_3D_Strategy1(pars,t,mask);
+S                     = Example_monoexponential_FWD_askadam_3D_Strategy1(pars,t);
 
 % realistic signal with certain SNR
 noise   = mean(S0(:)) / SNR;        % estimate noise level
@@ -52,6 +52,7 @@ fitting.regmap              = fitting.modelParams(2);
 fitting.lambda              = {0.002};
 fitting.TVmode              = '2D';
 fitting.voxelSize           = [1,1,1];
+fitting.isOptimiseMemory    = false; 
 
 % define your forward model
 modelFWD    = @Example_monoexponential_FWD_askadam_3D_Strategy1;
@@ -60,7 +61,7 @@ modelFWD    = @Example_monoexponential_FWD_askadam_3D_Strategy1;
 weights = [];
 
 askadam_obj = askadam;
-out_builtin = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t,mask);
+out_builtin = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %% using user defined regularisation function on R2*
 % set up fitting algorithm
@@ -77,6 +78,7 @@ fitting.tol                 = 1e-4;
 fitting.convergenceValue    = 1e-8;
 fitting.convergenceWindow   = 20;
 fitting.isDisplay           = false;
+fitting.isOptimiseMemory    = false; 
 
 % define your forward model
 modelFWD    = @Example_monoexponential_FWD_askadam_3D_Strategy1;
@@ -84,7 +86,7 @@ regFcn      = @spatial_total_variation;
 userFcn     = {modelFWD; regFcn};       % Position #1: forward model function; Position #2: regularisation function
 
 % specify your model input
-modelInput  = {t,mask};  % following the same order as specified in the forward function, except the first input
+modelInput  = {t};  % following the same order as specified in the forward function, except the first input
 regmap      = fitting.modelParams(2);
 lambda      = {0.002};
 TVmode      = '2D';
@@ -142,6 +144,7 @@ fitting.regmap              = fitting.modelParams;
 fitting.lambda              = {0.15,0.002};
 fitting.TVmode              = '2D';
 fitting.voxelSize           = [1,1,1];
+fitting.isOptimiseMemory    = false; 
 
 % define your forward model
 modelFWD    = @Example_monoexponential_FWD_askadam_3D_Strategy1;
@@ -150,7 +153,7 @@ modelFWD    = @Example_monoexponential_FWD_askadam_3D_Strategy1;
 weights = [];
 
 askadam_obj = askadam;
-out_builtin = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t,mask);
+out_builtin = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %%  using user defined regularisation function on both parameters
 % set up fitting algorithm
@@ -167,6 +170,7 @@ fitting.tol                 = 1e-4;
 fitting.convergenceValue    = 1e-8;
 fitting.convergenceWindow   = 20;
 fitting.isDisplay           = false;
+fitting.isOptimiseMemory    = false; 
 
 % define your forward model
 modelFWD    = @Example_monoexponential_FWD_askadam_3D_Strategy1;
@@ -174,7 +178,7 @@ regFcn      = @spatial_total_variation;
 userFcn     = {modelFWD; regFcn};       % Position #1: forward model function; Position #2: regularisation function
 
 % specify your model input
-modelInput  = {t,mask};  % following the same order as specified in the forward function, except the first input
+modelInput  = {t};  % following the same order as specified in the forward function, except the first input
 regmap      = fitting.modelParams;
 lambda      = {0.15,0.002};
 TVmode      = '2D';

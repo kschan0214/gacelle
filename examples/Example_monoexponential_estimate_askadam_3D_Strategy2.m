@@ -47,7 +47,8 @@ fitting.lossFunction        = 'l1';
 fitting.tol                 = 1e-4;
 fitting.convergenceValue    = 1e-8;
 fitting.convergenceWindow   = 20;
-fitting.isDisplay          = false;
+fitting.isDisplay           = false;
+fitting.isOptimiseMemory    = true; 
 
 % define your forward model
 modelFWD = @Example_monoexponential_FWD_askadam_3D_Strategy2;

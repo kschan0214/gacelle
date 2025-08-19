@@ -22,6 +22,10 @@ classdef utils < handle
 
     methods(Static)
 
+        function data = vectorise(data)
+            data = data(:);
+        end
+
         function [data_masked] = masking_ND2GD_preserve(data,mask)
         % this function concatenate the first 3 dimension of data and stored in the second dim, while preserving the 4th onward dim
         % data: [x,y,z,a,b,c] -> data_masked: [1,x*y*z,1,a,b,c]
@@ -344,6 +348,39 @@ classdef utils < handle
             if NSegment ~= 1
                 fprintf('Data is divided into %d segments\n',NSegment);
             end
+        end
+
+        % compute masked statistics
+        function val = min_masked(img,mask)
+            if size(mask,ndims(mask)) ~= size(img,ndims(img))
+                mask = repmat(mask,[ones(1,ndims(img)-1) ndims(img)]);
+            end
+            val = min(img(mask>0));
+        end
+
+        function val = max_masked(img,mask)
+            if size(mask,ndims(mask)) ~= size(img,ndims(img))
+                mask = repmat(mask,[ones(1,ndims(img)-1) ndims(img)]);
+            end
+            val = max(img(mask>0));
+        end
+
+        function val = prctile_masked(img,mask,percentile)
+            if size(mask,ndims(mask)) ~= size(img,ndims(img))
+                mask = repmat(mask,[ones(1,ndims(img)-1) ndims(img)]);
+            end
+            val = prctile(img(mask>0),percentile);
+        end
+
+        function val = mean_masked(img,mask)
+            if size(mask,ndims(mask)) ~= size(img,ndims(img))
+                mask = repmat(mask,[ones(1,ndims(img)-1) size(img,ndims(img))]);
+            end
+            val = mean(img(mask>0));
+        end
+
+        function val = nnz(img)
+            val = numel(img(img~=0));
         end
 
         % This function create a full out structure variable if the data is divided into multiple segments
