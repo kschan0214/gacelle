@@ -1,20 +1,21 @@
 classdef gpuSANDI < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 20 June 2025
+% Date created: 13 Nov 2025
 % Date modified: 
     properties
         % default model parameters and estimation boundary
         % Rs        : soma radius, in um
         % fs        : soma signal fraction
-        % fa        : Neurite volume fraction
+        % f         : Neurite fraction; f = fa / (fa+fe)
         % Da        : longitudinal diffusivity of neurite [ms/us^2]
         % De        : diffusivity of extracellular water [ms/us^2]
-        % p2        : non-linear neurite dispersion index
-        modelParams     = {'Rs';'fs';'fa';'Da';'De';'p2'};
-        ub              = [  20;   1;   1;   3;   3;  1];
-        lb              = [ eps; eps; eps; eps; eps; eps];
-        startPoint      = [   7; 0.2; 0.4;   2;   1; 0.2];
+        % noise     : noise
+        modelParams     = {'Rs';'fs'; 'f';'Da';'De';'noise'};
+        ub              = [  15;   1;   1;   3;   3;    0.1];
+        lb              = [1e-6;1e-6;1e-6;1e-6;1e-6;  0.001];
+        startPoint      = [   7; 0.2; 0.4;   2;   1;  0.005];
+        step            = [0.79;0.05;0.05;0.15;0.15;  0.005];
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -23,19 +24,22 @@ classdef gpuSANDI < handle
         ldelta;
         Nav;
         Ds;
+        g;
     end
     
     methods
 
         % constructuor
         function this = gpuSANDI(b, ldelta, BDelta, Ds, varargin)
-        % NEXI Exchange rate estimation using NEXI model
-        % obj = gpuNEXI(b, Delta, Nav)
+        % SANDI from Palombo M, Ianus A, Guerreri M, et al.: SANDI: A compartment-based model for non-invasive apparent soma and neurite imaging by diffusion MRI. Neuroimage 2020; 215:116835.
+        % this = gpuSANDI(b, ldelta, BDelta, Ds, varargin)
         %
         % Input
         % ----------
         % b         : b-value [ms/um2]
-        % Delta     : gradient seperation [ms]
+        % ldelta    : gradient pulse duration [ms]
+        % BDelta    : diffusion time [ms]
+        % Ds        : intrinsic diffusivity of soma [um2/ms]
         % Nav       : # gradient direction for each b-shell (optional)
         %
         % Output
@@ -44,7 +48,7 @@ classdef gpuSANDI < handle
         %
         % Usage
         % ----------
-        % obj                   = NEXI(b, Delta, Nav);
+        % obj                   = gpuSANDI(b, Delta, Nav);
         % [out, fa, Da, De, r]  = obj.fit(S, mask, fitting,);
         % Sfit                  = smt.FWD([fa, Da, De, r]);
         % [x_train, S_train]    = obj.traindata(1e4);
@@ -53,58 +57,61 @@ classdef gpuSANDI < handle
         %
         % Author:
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu) 
-        %  Hong-Hsi Lee (hlee84@mgh.harvard.edu)
-        %  Copyright (c) 2023 Massachusetts General Hospital
-        %
-        %  Adapted from the code of
-        %  Dmitry Novikov (dmitry.novikov@nyulangone.org)
-        %  Copyright (c) 2023 New York University
-            
-            this.b      = b(:) ;
-            this.ldelta = ldelta(:);
-            this.BDelta = BDelta(:) ;
-            this.Ds     = Ds;           % intrinsic diffusivity of soma 
+        %  
+            this.Ds     = single(Ds);           % intrinsic diffusivity of soma 
+
+            this.b      = single(b(:)) ;
+            this.ldelta = single(ldelta(:));
+            this.BDelta = single(BDelta(:)) ;
+            this.g      = sqrt(this.b./this.ldelta.^2./(this.BDelta-this.ldelta/3));
+
             if nargin > 4
                 this.Nav = varargin{1} ;
+                this.Nav = this.Nav(:) ;
             else
                 this.Nav =  ones(size(b)) ;
             end
-            this.Nav = this.Nav(:) ;
+            
         end
         
-        % update properties according to lmax
+        % update properties 
         function this = updateProperty(this, fitting)
 
-            % DIMWI
-            if fitting.lmax == 0
-                idx = find(ismember(this.modelParams,'p2'));
-                this.modelParams(idx)     = [];
-                this.lb(idx)              = [];
-                this.ub(idx)              = [];
-                this.startPoint(idx)      = [];
+            % property change in related to solver
+            if ~strcmpi(fitting.solver,'mcmc')
+                idx = find(ismember(this.modelParams,'noise'));
+                this.modelParams(idx)       = [];
+                this.lb(idx)                = [];
+                this.ub(idx)                = [];
+                this.startPoint(idx)        = [];
+                this.step(idx)              = [];
             end
+            this.b      = gpuArray(this.b);
+            this.ldelta = gpuArray(this.ldelta);
+            this.BDelta = gpuArray(this.BDelta);
+            this.g      = gpuArray(this.g);
 
         end
 
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('=========================');
-            disp('SANDI with askAdam solver');
-            disp('=========================');
+            disp('========================================');
+            disp('Soma and Neurite Density Imaging (SANDI)');
+            disp('========================================');
 
             disp('----------------')
             disp('Data Information');
             disp('----------------')
-            fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
-            fprintf('Gradient duration (ms)         : [%s] \n',num2str(this.ldelta.',' %.2f'));
-            fprintf('Diffusion time (ms)            : [%s] \n',num2str(this.BDelta.',' %i'));
+            fprintf('b-shells [ms/um2]              : [%s] \n',num2str(this.b.',' %.2f'));
+            fprintf('Gradient duration [ms]         : [%s] \n',num2str(this.ldelta.',' %.2f'));
+            fprintf('Diffusion time [ms]            : [%s] \n',num2str(this.BDelta.',' %i'));
             disp('----------------');
         end
 
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out] = estimate(this, dwi, mask, extradata, fitting, pars0)
+        function  [out] = estimate(this, dwi, mask, fitting, extradata,  pars0)
         % Perform NEXI model parameter estimation based on askAdam
         % Input data are expected in multi-dimensional image
         % 
@@ -117,18 +124,12 @@ classdef gpuSANDI < handle
         %   .bvec       : 2D b-table, [3,dwi]                       (Optional, only needed if dwi is full acquisition)
         %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
         %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
-        %   .sigma      : 3D noise map, [x,y,z]                     (Optional, only needed for NEXIrice model)
         % fitting   : fitting algorithm parameters (see fit function)
         % pars0     : (Optional) initial starting points for model parameters
         % 
         % Output
         % -----------
         % out       : output structure contains all estimation results
-        % fa        : Intraneurite volume fraction
-        % Da        : Intraneurite diffusivity (um2/ms)
-        % De        : Extraneurite diffusivity (um2/ms)
-        % ra        : exchange rate from intra- to extra-neurite compartment
-        % p2        : dispersion index (if fitting.lax=2)
         % 
             
             % display basic info
@@ -142,7 +143,7 @@ classdef gpuSANDI < handle
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [dwi,mask] = this.prepare_dwi_data(dwi,mask,extradata,fitting.lmax);
+            [this,dwi] = this.prepare_dwi_data(dwi,extradata,fitting.lmax);
 
             % mask sure no nan or inf
             [dwi,mask] = utils.remove_img_naninf(dwi,mask);
@@ -159,9 +160,9 @@ classdef gpuSANDI < handle
 
             %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
             % determine if we need to divide the data to fit in GPU
-            g = gpuDevice; reset(g);
-            memoryFixPerVoxel       = 0.0013;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.05;     % get this number based on mdl fit
+            % g = gpuDevice; reset(g);
+            memoryFixPerVoxel       = 0.00;   % get this number based on mdl fit
+            memoryDynamicPerVoxel   = 0.0;     % get this number based on mdl fit
             [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
@@ -196,8 +197,14 @@ classdef gpuSANDI < handle
             out.mask = mask;
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
-            % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.outputFilename,out)
+            % % save the estimation results if the output filename is provided
+            % askadam.save_askadam_output(fitting.outputFilename,out)
+            switch fitting.solver
+                case 'askadam'
+                    askadam.save_askadam_output(fitting.outputFilename,out)
+                case 'mcmc'
+                    mcmc.save_mcmc_output(fitting.outputFilename,out)
+            end
 
         end
 
@@ -209,44 +216,12 @@ classdef gpuSANDI < handle
         % dwi       : S0 normalised 4D dwi images, [x,y,slice,diffusion], 4th dimension corresponding to [Sl0_b1,Sl0_b2,Sl2_b1,Sl2_b2, etc.]; the order of bval must match the order in the constructor gpuNEXI
         % mask      : 3D signal mask, [x,y,slice]
         % fitting   : fitting algorithm parameters
-        %   .Nepoch             : no. of maximum iterations, default = 4000
-        %   .initialLearnRate   : initial gradient step size, defaulr = 0.01
-        %   .decayRate          : decay rate of gradient step size; learningRate = initialLearnRate / (1+decayRate*epoch), default = 0.0005
-        %   .convergenceValue   : convergence tolerance, based on the slope of last 'convergenceWindow' data points on loss, default = 1e-8
-        %   .convergenceWindow  : number of data points to check convergence, default = 20
-        %   .tol                : stop criteria on metric value, default = 1e-3
-        %   .lambda             : regularisation parameter, default = 0 (no regularisation)
-        %   .TVmode             : mode for TV regulariation, '2D'|'3D', default = '2D'
-        %   .regmap             : parameter map used for regularisation, 'fa'|'ra'|'Da'|'De', default = 'fa'
-        %   .lmax               : Order of rotational invariant, 0|2, default = 0
-        %   .lossFunction       : loss for data fidelity term, 'L1'|'L2'|'MSE', default = 'L1'
-        %   .display            : online display the fitting process on figure, true|false, defualt = false
         % pars0     : 4D parameter starting points of fitting, [x,y,slice,param], 4th dimension corresponding to fitting  parameters with order [fa,Da,De,ra,p2] (optional)
         % 
         % Output
         % -----------
         % out       : output structure
-        %   .final      : final results
-        %       .fa         : Intraneurite volume fraction
-        %       .Da         : Intraneurite diffusivity (um2/ms)
-        %       .De         : Extraneurite diffusivity (um2/ms)
-        %       .ra         : exchange rate from intra- to extra-neurite compartment
-        %       .p2         : dispersion index (if fitting.lax=2)
-        %       .loss       : final loss metric
-        %   .min        : results with the minimum loss metric across all iterations
-        %       .fa         : Intraneurite volume fraction
-        %       .Da         : Intraneurite diffusivity (um2/ms)
-        %       .De         : Extraneurite diffusivity (um2/ms)
-        %       .ra         : exchange rate from intra- to extra-neurite compartment
-        %       .p2         : dispersion index (if fitting.lax=2)
-        %       .loss       : loss metric      
-        % fa        : final Intraneurite volume fraction
-        % Da        : final Intraneurite diffusivity (um2/ms)
-        % De        : final Extraneurite diffusivity (um2/ms)
-        % ra        : final exchange rate from intra- to extra-neurite compartment
-        % p2        : final dispersion index (if fitting.lax=2)
-        %
-        % Description: askAdam Image-based NEXI model fitting
+        % Description: GACELLE's implementation of SANDI
         %
         % Kwok-Shing Chan @ MGH
         % kchan2@mgh.harvard.edu
@@ -296,9 +271,15 @@ classdef gpuSANDI < handle
             disp('---------------------------');
 
             % 2.3 askAdam optimisation main
-            askadamObj = askadam();
-            % initiate starting points arrays
-            out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD);
+            switch fitting.solver
+                case 'askadam'
+                    askadamObj  = askadam();
+                    out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
+                case 'mcmc'
+                    mcmcObj     = mcmc(); 
+                    out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
+            end
+            
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
@@ -337,47 +318,30 @@ classdef gpuSANDI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [dwi, mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        function [this,dwi] = prepare_dwi_data(this,dwi,extradata,lmax)
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
-                % compute spherical mean signal
-                fprintf('Computing rotationally invariant signal...')
 
-                % if the inout little delta is one value then create a vector
+                % compute rotationally invariant signal
                 if isscalar(extradata.ldelta)
-                    extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
+                    extradata.ldelta = ones(size(extradata.bval))*extradata.ldelta;
                 end
-                DWIutilityObj = DWIutility();
-                [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
-
-                fprintf('done.\n');
+                if isscalar(extradata.BDELTA)
+                    extradata.BDELTA = ones(size(extradata.bval))*extradata.BDELTA;
+                end
+                DWIutils                        = DWIutility();
+                [dwi,bval_sorted,BDELTA_sorted,ldelta_sorted] = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,[],lmax);
+                
+                % update obj
+                this = gpuSANDI(bval_sorted,ldelta_sorted,BDELTA_sorted,this.Ds,this.Nav);
 
             elseif size(dwi,4) < numel(this.b)
                 error('There are more b-shells in the class object than available in the input data. Please check your input data.');
             end
 
-            % make sure no NaN/Inf in signal
-            [dwi, mask_naninf] = utils.set_nan_inf_zero(dwi); mask_naninf = max(mask_naninf,[],4);
-            mask_valid         = and(and(mask, max(dwi,[],4)<=1.01),~mask_naninf);
+            % normalised by the first volume
+            dwi = dwi ./ dwi(:,:,:,1);
 
-            % check signal similarity
-            dwi_2D          = utils.reshape_ND2GD(dwi,mask_valid);
-            signalTemplate  = mean(dwi_2D,2,"omitmissing");         % assuming the majority of the signal are from tissues
-            signalTemplate  = (signalTemplate - mean(signalTemplate)) ./ std(signalTemplate);
-            Rcorr           = zeros(1,size(dwi_2D,2));
-            for k = 1:size(dwi_2D,2)
-                signalVoxel = dwi_2D(:,k);
-                signalVoxel = (signalVoxel - mean(signalVoxel)) ./ std(signalVoxel);
-                Rcorr(k)    = corr(signalTemplate,signalVoxel);
-            end
-            Rcorr            = utils.reshape_GD2ND(Rcorr,mask_valid);
-            mask_dissimilar  = Rcorr < 0.1;
-            mask_valid       = and(mask_valid,~mask_dissimilar);
-
-            if numel(mask_valid(mask_valid)) ~= numel(mask(mask)) 
-                disp('Signal mask is updated! Please use the fitted mask in your subsequent analysis.');
-                mask = mask_valid;
-            end
         end
 
         %%%%% Prior estimation related functions %%%%%
@@ -412,7 +376,7 @@ classdef gpuSANDI < handle
             end
             
             % make sure the input is bounded
-            x0 = askadam.set_boundary(x0,fitting.ub,fitting.lb);
+            x0 = utils.set_boundary(x0,fitting.ub,fitting.lb);
 
             fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
             fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
@@ -483,7 +447,7 @@ classdef gpuSANDI < handle
             mask_CSF        = D0>1.5;
             
             % ratio to modulate pars0 estimattion
-            pars0_csf = [0.1,0,0.01,1,1,0.01];
+            pars0_csf = [1,0.01,0.01,0.01,1,0.01];
             for k = 1:size(pars,4)
                 tmp                 = pars(:,:,:,k);
                 tmp(mask_CSF==1)    = tmp(mask_CSF==1).*pars0_csf(k);
@@ -496,6 +460,15 @@ classdef gpuSANDI < handle
                 delete(pool);
             end
 
+            % smooth out outliers
+            for kp = 1:size(pars,4)
+                if size(pars,1) > 1 && size(pars,2) > 1
+                    for kz = 1:size(pars,3)
+                        pars(:,:,kz,kp) = medfilt2(pars(:,:,kz,kp), [3 3]);
+                    end
+                end
+            end
+
             for km = 1:size(pars,4)
                 pars0.(this.modelParams{km}) = pars(:,:,:,km); ...
             end
@@ -505,11 +478,11 @@ classdef gpuSANDI < handle
         % create training data for likelihood
         function [x_train, S_train, intervals] = traindata(this, N_samples, lmax, varargin)
             if nargin < 4
-                intervals = [   5 15    ;   % Rs
-                             0.01 0.4   ;   % fs
+                intervals = [   5 10    ;   % Rs
+                             0.01 0.5   ;   % fs
                              0.01 0.99  ;   % fa
-                              1.5 3     ;   % Da
-                              0.5 1.5   ;   % De
+                              1.5 2.2   ;   % Da
+                              0.5 3     ;   % De
                              0.01 0.99 ];   % p2
             else
                 intervals = varargin{1};
@@ -596,185 +569,102 @@ classdef gpuSANDI < handle
 
         %% SANDI signal related functions
 
-        % Forward model to generate NEXI signal
-        % function [s] = FWD(this, pars, lmax)
-        function [s] = FWD(this, pars)
-        
-            Rs   = pars.Rs;
-            fs   = max(pars.fs, askadam.epsilon);
-            fa   = max(pars.fa, askadam.epsilon); % avoid division by zeros when computing re
-            Da   = pars.Da;
-            De   = pars.De;
-            % ra   = pars.ra;
-            % ra = 0;
-            pulseType = 'wide';
-    
-            % Sl0
-            s = this.Sl0(Rs, fs, fa, Da, De, pulseType);
-            
-            % % Sl2
-            % if lmax == 2
-            %     p2  = pars.p2;
-            %     s   = cat(1,s,this.Sl2(Rs, fs, fa, Da, De, ra, p2));
-            % end
+        % Forward model to generate SANDI signal
+        function [s] = FWD(this, pars, pulseType, solver)
 
+            if nargin < 3 || isempty(pulseType)
+                pulseType = 'wide';
+            end
+            if nargin < 4 || isempty(solver)
+                solver = [];
+            end
+        
+            % Sl0
+            s = this.Sl0(pars.Rs, pars.fs, pars.f, pars.Da, pars.De, pulseType, solver);
+            % potential to add Sl2
+            
             % make sure s cannot be greater than 1
             s = min(s,1);   % s = [Nb, Nvoxel]
                 
         end
         
-        % 0th order rotational invariant
-        function S = Sl0(this, Rs, fs, fa, Da, De, pulseType)
+        % 0th order rotationally invariant
+        function S = Sl0(this, Rs, fs, f, Da, De, pulseType, solver)
 
-            if isgpuarray(fa)
-                bval    = gpuArray(single(this.b));
-                BDELTA  = gpuArray(single(this.BDelta));
-                delta   = gpuArray(single(this.ldelta));
+            if nargin < 8
+                solver = [];
+            end
+
+            % combine all compartments
+            if strcmpi(solver,'mcmc') 
+                % use arrayfun to speed up computation for MCMC
+
+                % 1. Soma signal, restricted diffusion
+                switch pulseType
+                    case 'wide'
+                        Ssoma = diffusion_sphere_restricted_wide_Sl0_arrayfun(this.ldelta,this.g,this.BDelta,Rs,this.Ds);
+                    case 'narrow'
+                        Ssoma = arrayfun(@diffusion_sphere_restricted_narrow_Sl0,this.ldelta,this.g,Rs,this.Ds);
+                end
+                % 2. Isotropic extracellular signal, hindered diffusion
+                Sextra = arrayfun(@diffusion_sphere_Sl0,this.b,De);
+    
+                % 3. Stick-like intraneurite signal
+                Sneurite = arrayfun(@diffusion_stick_Sl0,this.b,Da);
+
+                % combine all compartments
+                S = arrayfun(@signal_SANDI,fs,f,Ssoma,Sneurite,Sextra);
+
             else
-                bval     = this.b;
-                BDELTA   = this.BDelta;
-                delta    = this.ldelta;
-            end
-            g = sqrt(bval./delta.^2./(BDELTA-delta/3));
+                % 1. Soma signal, restricted diffusion
+                switch pulseType
+                    case 'wide'
+                        Ssoma = diffusion_sphere_restricted_wide_Sl0(this.ldelta,this.g,this.BDelta,Rs,this.Ds);
+                    case 'narrow'
+                        Ssoma = diffusion_sphere_restricted_narrow_Sl0(this.ldelta,this.g,Rs,this.Ds);
+                end
+                % 2. Isotropic extracellular signal, hindered diffusion
+                Sextra = diffusion_sphere_Sl0(this.b,De);
+    
+                % 3. Stick-like intraneurite signal
+                Sneurite = diffusion_stick_Sl0(this.b,Da);
 
-            % 1. Intra-soma signal
-            switch pulseType
-                case 'wide'
-                    % Murday and Cotts, JCP, 1968
-                    C  = this.widepulse(Rs, this.Ds, g, delta, BDELTA);    % less memory efficient but faster
-                case 'narrow'
-                    C = this.narrowpulse(delta, g, r, this.Ds);
+                % combine all compartments
+                S = signal_SANDI(fs,f,Ssoma,Sneurite,Sextra);
             end
-            SSoma = exp(-C);
+
+            % normalised to 1st data point
+            S = S ./ S(1,:,:,:,:);
             
-            % 2. Isotropic extracellular signal
-            Sextra = exp(-bval*De);
-
-            % 3. Stick-like intraneurite signal
-            Sneurite = this.GaussRotinv_l0(bval,Da, 0);
-
-            S = fs.*SSoma + (1-fs).*fa.*Sneurite + (1-fs).*(1-fa).*Sextra;
-
-
         end
         
-        % % 2nd order rotational invariant
-        % function S = Sl2(this, Rs, fs, fa, Da, De, ra, p2)
-        % 
-        %     if isgpuarray(fa)
-        %         bval    = gpuArray(single(this.b));
-        %         DELTA   = gpuArray(single(this.BDelta));
-        %     else
-        %         bval = this.b;
-        %         DELTA   = this.BDelta;
-        %     end
-        % 
-        %     Da = bval.*Da;
-        %     De = bval.*De;
-        %     ra = DELTA.*ra;
-        %     re = ra.*fa./(1-fa);
-        % 
-        %     % Trapezoidal's rule replacement
-        %     Nx  = 14;    % NRMSE<0.5% for Nx=14
-        %     x   = zeros([ones(1,ndims(fa)), Nx],'like',bval); x(:) = linspace(0,1,Nx);
-        %     S   = trapz(x(:),this.M(x, fa, Da, De, ra, re).*(3*x.^2-1)/2,ndims(x));
-        %     S   = p2.*abs(S);
-        % 
-        % end
-
     end
 
     methods(Static)
-        %% SANDI signal related
-        % function M = M(x, fa, Da, d2, r1, r2)
-        %     d1 = Da.*x.^2;
-        %     l1 = (r1+r2+d1+d2)/2;
-        %     l2 = sqrt( (r1-r2+d1-d2).^2 + 4*r1.*r2 )/2; l2 = max(l2, askadam.epsilon);  % avoid division by zeros
-        %     lm = l1-l2;
-        %     Pp = (fa.*d1 + (1-fa).*d2 - lm)./(l2*2);
-        %     M  = Pp.*exp(-(l1+l2)) + (1-Pp).*exp(-lm); 
-        % end
-
-        function s = widepulse(r, Ds, g, delta, Delta)
-            bm2 = [2.0816    5.9404    9.2058    12.4044   15.5792 ...
-                   18.7426   21.8997   25.0528   28.2034   31.3521].^2;
-            bm2 = permute(bm2(:), [2 3 4 1]);
-        
-            td          = r.^2/Ds;
-            bardelta    = delta./td ;
-            barDelta    = Delta./td ;
-            bm2bardelta = bm2.*bardelta;
-            bm2barDelta = bm2.*barDelta;
-            s = (2./(bm2.^3.*(bm2-2))).*(-2 ...
-                        + 2*bm2bardelta ...
-                        + 2*exp(-bm2bardelta) ...
-                        + 2*exp(-bm2barDelta) ...
-                        - exp(-bm2barDelta-bm2bardelta)...
-                        - exp(-bm2barDelta+bm2bardelta));
-            s = sum(s,4).*Ds.*g.^2.*td.^3;
-        end
-
-        function s = narrowpulse(delta, q, r, D0)
-            s = (16/175)*q.^2.*delta*r^4/D0;
-        end
-
-        function [Sl] = GaussRotinv_l0(b, Da, Dr)
-            Dd = b*(Da-Dr);
-            Dr = b*Dr;
-
-            myfun   = @(x) exp(-Dd.*x.^2);
-            Nx      = 14;    % NRMSE<0.05% for Nx=14
-            x       = zeros([ones(1,ndims(Da)), Nx],'like',b); x(:) = linspace(0,1,Nx);
-            Sl      = trapz(x(:),myfun(x),ndims(x)) .* exp(-Dr);
-
-        end
-
-        function y = mylegendreP(l,x)
-            switch l
-                case 0
-                    y = 1;
-                case 2
-                    y = (3*x.^2)/2 - 1/2;
-                case 4
-                    y = (35*x.^4)/8 - (15*x.^2)/4 + 3/8;
-                case 6
-                    y = (231*x.^6)/16 - (315*x.^4)/16 + (105*x.^2)/16 - 5/16;
-                case 8
-                    y = (6435*x.^8)/128 - (3003*x.^6)/32 + (3465*x.^4)/64 - (315*x.^2)/32 + 35/128;
-                case 10
-                    y = (46189*x.^10)/256 - (109395*x.^8)/256 + (45045*x.^6)/128 - (15015*x.^4)/128 + (3465*x.^2)/256 - 63/256;
-                case 12
-                    y = (676039*x.^12)/1024 - (969969*x.^10)/512 + (2078505*x.^8)/1024 - (255255*x.^6)/256 + (225225*x.^4)/1024 - (9009*x.^2)/512 + 231/1024;
-                case 14
-                    y = (5014575*x.^14)/2048 - (16900975*x.^12)/2048 + (22309287*x.^10)/2048 - (14549535*x.^8)/2048 + (4849845*x.^6)/2048 - (765765*x.^4)/2048 + (45045*x.^2)/2048 - 429/2048;
-                case 16
-                    y = (300540195*x.^16)/32768 - (145422675*x.^14)/4096 + (456326325*x.^12)/8192 - (185910725*x.^10)/4096 + (334639305*x.^8)/16384 - (20369349*x.^6)/4096 + (4849845*x.^4)/8192 - (109395*x.^2)/4096 + 6435/32768;
-                case 18
-                    y = (2268783825*x.^18)/65536 - (9917826435*x.^16)/65536 + (4508102925*x.^14)/16384 - (4411154475*x.^12)/16384 + (5019589575*x.^10)/32768 - (1673196525*x.^8)/32768 + (156165009*x.^6)/16384 - (14549535*x.^4)/16384 + (2078505*x.^2)/65536 - 12155/65536;
-                case 20
-                    y = (34461632205*x.^20)/262144 - (83945001525*x.^18)/131072 + (347123925225*x.^16)/262144 - (49589132175*x.^14)/32768 + (136745788725*x.^12)/131072 - (29113619535*x.^10)/65536 + (15058768725*x.^8)/131072 - (557732175*x.^6)/32768 + (334639305*x.^4)/262144 - (4849845*x.^2)/131072 + 46189/262144;
-                
-                otherwise
-                    y = legendreP(l,x);
-            end
-        end
 
         %% Utilities
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting)
             % get basic fitting setting check
-            fitting2 = askadam.check_set_default_basic(fitting);
+            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
+            
+            if strcmpi(fitting.solver,'askadam')
+                fitting2 = askadam.check_set_default_basic(fitting);
 
-            % get customised fitting setting check
-            if ~isfield(fitting,'regmap');          fitting2.regmap     = 'fa';             end
-            % if ~isfield(fitting,'lmax');            fitting2.lmax       = 0;                end
-            if ~isfield(fitting,'start');           fitting2.start      = 'likelihood';     end
-            % No lmax = 2 for now
-            fitting2.lmax = 0;
+                if ~isfield(fitting,'regmap');      fitting2.regmap = {'fs'};       end
 
-            if ~iscell(fitting2.regmap)
-                fitting2.regmap = cellstr(fitting2.regmap);
+                if ~iscell(fitting2.regmap)
+                    fitting2.regmap = cellstr(fitting2.regmap);
+                end
+
+            else
+                fitting2 = mcmc.check_set_default_basic(fitting);
+                fitting2.lossFunction = [];
             end
+
+            fitting2.lmax = 0; % No lmax = 2 for now
+            if ~isfield(fitting,'start');       fitting2.start      = 'likelihood';     end
+            if ~isfield(fitting,'pulseType');   fitting2.pulseType  = 'wide';           end
 
         end
 

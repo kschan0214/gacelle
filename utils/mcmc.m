@@ -50,11 +50,27 @@ classdef mcmc < handle
             % if ~isempty(weights); weights = utils.reshape_ND2GD(weights,mask); else; weights = ones(size(data), 'like', data); end
             pars0 = utils.reshape_ND2GD_struct(pars0,mask);
 
+            isGlobal = false;
+            for k = 1:numel(fitting.modelParams)
+                if k == 1
+                    N = numel(pars0.(fitting.modelParams{k}));
+                else
+                    if N ~= numel(pars0.(fitting.modelParams{k}))
+                        isGlobal = true;
+                        break;
+                    end
+                end
+            end
+
             % MCMC
             if strcmpi(fitting.algorithm,'mh')
                 xPosterior = this.metropolis_hastings(data, pars0, weights, fitting, FWDfunc ,varargin{:});
             else
-                xPosterior = this.goodman_weare(data, pars0, weights, fitting, FWDfunc ,varargin{:});
+                if ~isGlobal
+                    xPosterior = this.goodman_weare(data, pars0, weights, fitting, FWDfunc ,varargin{:});
+                else
+                    xPosterior = this.goodman_weare_wglobal_constant(data, pars0, weights, fitting, FWDfunc ,varargin{:});
+                end
             end
 
             % finish up
@@ -295,6 +311,153 @@ classdef mcmc < handle
         
         end
 
+        function xPosterior = goodman_weare_wglobal_constant(this,y,x0,weights,fitting,modelFWD,varargin)
+        % Input
+        % ----------
+        % y         : measurements, [Nmeas,Nvoxels]
+        % x0        : structure array, starting points, N fields, each field 1xNvoxel
+        % weights   : weighting for non-linear least square fitting, same dimension as y
+        % pars0         : Structure variable containing all parameters to be estimated
+        % fitting       : Structure variable containing all fitting algorithm setting
+        %   .modelParams       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
+        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'modelParams', e.g. [0.5, 0, 0.001];
+        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];
+        %   .iteration          : # MCMC iterations
+        %   .thinning           : sampling interval between iterations
+        %   .burnin             : iterations at the beginning to be discarded, if burnin>1, then the exact number will  be used; if 0<burnin<1 then actual burnin = iteration*burnin
+        %   .repetition         : # repetition of MCMC proposal
+        %   .StepSize           : step size for 'GW' in MCMC proposal ('GW' only)
+        %   .Nwalker            : # random walkers ('GW' only)
+        % FWDfunc       : function handle of forward model
+        % varargin      : contains additional input requires for FWDfunc
+        % 
+        % ENSEMBLE SAMPLERS WITH AFFINE INVARIANCE (2010) JONATHAN GOODMAN AND JONATHAN WEARE
+        % Other references:
+        % emcee: The MCMC Hammer (2013) https://arxiv.org/pdf/1202.3665
+        % https://github.com/grinsted/gwmcmc/tree/master
+        % 
+
+            fitting = this.check_set_default_basic(fitting);
+            if isempty(weights); weights = ones(size(y), 'like', y); end
+
+            % Nm: # measurements; Nv: # voxels
+            [Nm, Nv] = size(y);
+            % Nvar: # estimation parameters
+            Nvar     = numel(fitting.modelParams);
+            Nburnin  = this.get_number_burnin(fitting);
+            % Ns: # samples in posterior distribution
+            Ns       = numel(Nburnin+1:fitting.thinning:fitting.iteration);
+            Nwalker  = fitting.Nwalker;
+            StepSize = fitting.StepSize;
+        
+            % convert data into single datatype for better performance
+            y       = gpuArray( single(y) );
+            weights = gpuArray( single(weights) );
+            for km = 1:Nvar; x0.(fitting.modelParams{km}) = gpuArray(single( x0.(fitting.modelParams{km}) ));end
+        
+            isGlobal = this.check_global_constant(x0,fitting.modelParams);
+
+            NGlobal = numel(isGlobal(isGlobal==1));
+            NND     = Nvar - NGlobal;
+
+            % setup boundary variables
+            lb          = gpuArray( single(repmat(fitting.lb(isGlobal==0),1,Nv,Nwalker)));
+            ub          = gpuArray( single(repmat(fitting.ub(isGlobal==0),1,Nv,Nwalker)));
+            lb_global   = gpuArray( single(repmat(fitting.lb(isGlobal==1),1,1,Nwalker)));  % global constant
+            ub_global   = gpuArray( single(repmat(fitting.ub(isGlobal==1),1,1,Nwalker)));  % global constant
+            % set up weight
+            weights     = repmat(weights,1,1,Nwalker);
+            % initialize array to staore all the samples
+            xPosterior_ND       = zeros(NND, Nv, Nwalker, Ns, fitting.repetition,'single');
+            xPosterior_global   = zeros(NGlobal, 1, Nwalker, Ns, fitting.repetition,'single');
+            
+            % initiate an ensemble of walkers around the starting position (0.1% full range) with Gaussian distribution
+            % 1st: Nvar;2nd: Nv; 3rd: Nwalker
+            [xCurr_ND,xCurr_global]     = this.struct2array_wglobal(x0,fitting.modelParams);                                    % extract parameter structure to numeric array for faster computation
+            xCurr_ND                    = xCurr_ND + (ub-lb)*fitting.startRange.*randn(size(ub));                               % initiate starting position for all walkers
+            xCurr_ND                    = max(xCurr_ND,lb); xCurr_ND = min(xCurr_ND,ub);                                        % set boundary
+            xCurr_global                = xCurr_global + (ub_global-lb_global)*fitting.startRange.*randn(size(ub_global));      % initiate starting position for all walkers
+            xCurr_global                = max(xCurr_global,lb_global); xCurr_global = min(xCurr_global,ub_global);              % set boundary
+            x0                          = this.array2struct_wglobal(xCurr_ND,xCurr_global,fitting.modelParams, isGlobal);       % convert array back to structure for FWD function
+         
+            % compute likelihood at starting points
+            logP0   = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0, varargin{:})-y).^2, 1 ), x0.noise, Nm);
+        
+            disp('-------------------------');
+            disp('MCMC optimisation process');
+            disp('-------------------------');
+        
+            for ii = 1:fitting.repetition
+            fprintf('Repetition #%i/%i \n',ii,fitting.repetition)
+        
+            logPCurr= logP0;
+            % xCurr   = this.struct2array(x0,fitting.modelParams);
+            [xCurr_ND,xCurr_global]     = this.struct2array_wglobal(x0,fitting.modelParams);
+        
+            counter = 0; start = tic;
+            for k = 1:fitting.iteration
+                % 1. make a proposal with normal distribution
+                % 1.1. find a unique partner for a walker k
+                partner         = this.find_partner(Nwalker);
+                % 1.2. stretch move
+                zz_ND           = ((StepSize-1)*rand(size(logP0),'like',xCurr_ND) + 1).^2 / StepSize;
+                zz_global       = ((StepSize-1)*rand(1,1,Nwalker,'like',xCurr_global) + 1).^2 / StepSize;
+                xProposed_ND    = xCurr_ND(:,:,partner) + (xCurr_ND - xCurr_ND(:,:,partner)).*zz_ND;
+                xProposed_global= xCurr_global(:,:,partner) + (xCurr_global - xCurr_global(:,:,partner)).*zz_global;
+                % find proposal that is out of bound for exclusion
+                isOutofbound_global = max(or(xProposed_global<lb_global, xProposed_global>ub_global),[],1);  
+                isOutofbound        = max(max(or(xProposed_ND<lb, xProposed_ND>ub),[],1), isOutofbound_global);   % combined
+                % replace boundary values so it does not give error when compting probability
+                xProposed_ND     = max(xProposed_ND,lb);            xProposed_ND        = min(xProposed_ND,ub);
+                xProposed_global = max(xProposed_global,lb_global); xProposed_global    = min(xProposed_global,ub_global);
+                % convert the proposal into structure array for FWD function
+                xProposed_struct = this.array2struct_wglobal(xProposed_ND,xProposed_global,fitting.modelParams, isGlobal);
+        
+                % 2. Metropolis sampling
+                % If the probability ratio of new to old > threshold, we take the new solution.
+                % 2.1 proposal probability
+                logPProposed                = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(xProposed_struct, varargin{:})-y).^2, 1 ), xProposed_struct.noise, Nm);
+                % 2.2 Compute acceptance ratio based on z^(Nd-1)*new/old probability
+                acceptanceRatio             = min(zz_ND.^(Nvar-1).*exp(logPProposed-logPCurr), 1);
+                % acceptanceRatio_ND          = min(zz_ND.^(NND-1).*exp(logPProposed-logPCurr), 1);
+                acceptanceRatioGlobal       = min(zz_global.^(Nvar-1).*exp(sum(logPProposed,2)-sum(logPCurr,2)), 1);   % summing all voxels
+                % acceptanceRatio             = min(acceptanceRatio_ND,acceptanceRatioGlobal);                                % combine both
+                isAccepted                  = acceptanceRatio > rand(1,Nv,Nwalker,'like',xCurr_ND);
+                isAccepted(isOutofbound)    = 0;    % reject out of bound proposal
+                isAcceptedGlobal            = acceptanceRatioGlobal > rand(1,1,Nwalker,'like',xProposed_global);
+                % isAcceptedGlobal            = min(mean(isAccepted,2)>0.5,isAcceptedGlobal);     % if the overall performance improve then take that, not optimal thought
+                isAcceptedGlobal(isOutofbound_global)= 0;    % reject out of bound proposal
+                % 2.3 update parameters
+                logPCurr(isAccepted)                = logPProposed(isAccepted);
+                xCurr_ND(:,isAccepted)              = xProposed_ND(:,isAccepted);           % not perfect
+                xCurr_global(:,isAcceptedGlobal)    = xProposed_global(:,isAcceptedGlobal); % not perfect
+
+                % 3. Maintain the independence between iterations
+                % 3.1 discard the first burnin*100% iterations
+                % 3.2 keep an iteration every N iterations
+                if ( k > Nburnin ) && mod(k-Nburnin+1, fitting.thinning) == 0 
+                    counter = counter+1;
+                    xPosterior_ND(:,:,:,counter,ii)     = gather(xCurr_ND);
+                    xPosterior_global(:,:,:,counter,ii) = gather(xCurr_global);
+                end
+        
+                % display message at 1000 ietration and every 2000 iterations
+                if mod(k,fitting.iteration/50) == 0 || k == min(1e2, fitting.iteration/100)
+                    ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
+                    ERT = ET / (k/fitting.iteration) - ET;
+                    fprintf('Iteration #%6d,    Elapsed time (hh:mm:ss):%s,     Estimated remaining time (hh:mm:ss):%s \n',k,string(ET),string(ERT));
+                end
+            end
+            end
+
+            % convert final posterior distribution into structure
+            xPosterior = this.array2struct_wglobal(xPosterior_ND,xPosterior_global,fitting.modelParams,isGlobal);
+            for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
+
+            disp('The affine-invariant ensemble MCMC sampling is completed.')
+        
+        end
+
     end
 
     methods(Static)
@@ -399,6 +562,54 @@ classdef mcmc < handle
             end
         end
 
+        function x_struct = array2struct_wglobal(x_ND,x_global,fields, isGlobal)
+
+            ctr_global = 1; ctr_ND = 1;
+            for k = 1:numel(fields)
+                if isGlobal(k)
+                     x_struct.(fields{k}) = x_global(ctr_global,:,:,:,:,:);
+                     ctr_global = ctr_global + 1;
+                else
+                    x_struct.(fields{k}) = x_ND(ctr_ND,:,:,:,:,:);
+                    ctr_ND = ctr_ND +1;
+                end
+            end
+        end
+
+        function [x_ND,x_global] = struct2array_wglobal(x_struct,fields)
+
+            % check if the fitting parameter is global or voxel
+            isGlobal = mcmc.check_global_constant(x_struct,fields);
+            nVol = 0; for k = 1:numel(fields); nVol = max(size(x_struct.(fields{k}),2),nVol); end
+       
+            nWalker     = size(x_struct.(fields{1}),3);
+            x_ND        = gpuArray(zeros(numel(isGlobal(isGlobal==0)),nVol,nWalker,"single"));
+            x_global    = gpuArray(zeros(numel(isGlobal(isGlobal==1)),1,nWalker,"single"));
+
+            ctr_global = 1; ctr_ND = 1;
+            for k = 1:numel(fields)
+                if isGlobal(k)
+                    x_global(ctr_global,1,:)    = x_struct.(fields{k});
+                    ctr_global                  = ctr_global +1;
+                else
+                    x_ND(ctr_ND,:,:)    = x_struct.(fields{k});
+                    ctr_ND              = ctr_ND +1;
+                end
+            end
+        end
+
+        function isGlobal = check_global_constant(x_struct,fields)
+            % check if the fitting parameter is global or voxel
+            isGlobal = zeros(numel(fields),1); 
+            for k = 1:numel(fields)
+                if size(x_struct.(fields{k}),2) > 1
+                    isGlobal(k) = false;
+                else
+                    isGlobal(k) = true;
+                end
+            end
+        end
+
         % compute the number of iteration requires for burn-in
         function Nburnin = get_number_burnin(fitting)
             if fitting.burnin < 1
@@ -426,7 +637,7 @@ classdef mcmc < handle
             % compute additional metric if specified
             fields = fieldnames(xPosterior);
 
-            Nvox    = size(xPosterior.(fields{1}),1);
+            % Nvox    = size(xPosterior.(fields{1}),1);
             Nsample = prod(size(xPosterior.(fields{1}),2:5));
 
             metrics = fitting.metric;
@@ -435,25 +646,25 @@ classdef mcmc < handle
                     switch lower(metrics{km})
                         case 'mean'
                             for kvar=1:numel(fields)
-                                tmp = mean( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
+                                tmp = mean( reshape( xPosterior.(fields{kvar}), [size(xPosterior.(fields{kvar}),1), Nsample]),2);
                                 tmp = utils.reshape_ND2image(tmp,mask);
                                 out.mean.(fields{kvar}) = tmp;
                             end
                         case 'median'
                             for kvar=1:numel(fields)
-                                tmp = median( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
+                                tmp = median( reshape( xPosterior.(fields{kvar}), [size(xPosterior.(fields{kvar}),1), Nsample]),2);
                                 tmp = utils.reshape_ND2image(tmp,mask);
                                 out.median.(fields{kvar}) = tmp;
                             end
                         case 'std'
                             for kvar=1:numel(fields)
-                                tmp = std( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),[],2);
+                                tmp = std( reshape( xPosterior.(fields{kvar}), [size(xPosterior.(fields{kvar}),1), Nsample]),[],2);
                                 tmp = utils.reshape_ND2image(tmp,mask);
                                 out.std.(fields{kvar}) = tmp;
                             end
                         case 'iqr'
                             for kvar=1:numel(fields)
-                                tmp = iqr( reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]),2);
+                                tmp = iqr( reshape( xPosterior.(fields{kvar}), [size(xPosterior.(fields{kvar}),1), Nsample]),2);
                                 tmp = utils.reshape_ND2image(tmp,mask);
                                 out.iqr.(fields{kvar}) = tmp;
                             end
@@ -465,7 +676,7 @@ classdef mcmc < handle
                                 idx     = find(ismember(fitting.modelParams,fields{kvar}));
                                 edges   = linspace(fitting.lb(idx)-1e-8,fitting.ub(idx)+1e-8,Nbin);
 
-                                tmp     = reshape( xPosterior.(fields{kvar}), [Nvox, Nsample]);
+                                tmp     = reshape( xPosterior.(fields{kvar}), [size(xPosterior.(fields{kvar}),1), Nsample]);
                                 tmp     = mode(discretize(tmp,edges),2);
                                 tmp     = (edges(tmp) + edges(tmp+1)) / 2;
                                 tmp     = utils.reshape_ND2image(tmp.',mask);
@@ -476,6 +687,17 @@ classdef mcmc < handle
             end
         end
 
+        % make sure all network parameters stay between 0 and 1
+        function parameters = set_boundary(parameters,ub,lb)
+
+            field = fieldnames(parameters);
+            for k = 1:numel(field)
+                parameters.(field{k})   = max(parameters.(field{k}),lb(k)); % Lower bound     
+                parameters.(field{k})   = min(parameters.(field{k}),ub(k)); % upper bound
+
+            end
+
+        end
 
     end
 end

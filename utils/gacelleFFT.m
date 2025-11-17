@@ -137,7 +137,7 @@ classdef gacelleFFT
             % normalisation factor
             fctr    = size(input,dim);
             % iFFT
-            output  = fftshift(ifft(ifftshift(input,dim),[],dim),dim)/ sqrt(fctr);
+            output  = fftshift(ifft(ifftshift(input,dim),[],dim),dim) * sqrt(fctr);
         
         end
 

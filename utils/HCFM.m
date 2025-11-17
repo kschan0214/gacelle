@@ -89,7 +89,7 @@ classdef HCFM
             % Eq.A9 Wharton.NI2013
             x_d   = obj.EffectiveSusceptibility(x_i,x_a,g);
 
-            dims    = size(alpha);
+            dims    = size(alpha,1:4);
             % find first dimension with length 1, which will be used as TE dimension
             idx     = find(dims == 1); idx = idx(1);
 

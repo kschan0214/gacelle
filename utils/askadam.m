@@ -98,6 +98,13 @@ classdef askadam < handle
             % Calculate gradients with respect to the learnable parameters.
             gradients = dlgradient(loss,parameters);
 
+            if ~fitting.enableComplex
+                fieldname = fieldnames(gradients);
+                for k = 1:numel(fieldname)
+                    gradients.(fieldname{k}) = real(gradients.(fieldname{k}));
+                end
+            end
+
         end
 
         % askAdam optimisation loop
@@ -370,12 +377,18 @@ classdef askadam < handle
             parameters_minLoss  = this.unscale_parameters(parameters_minLoss,   fitting.lb,fitting.ub,fitting.modelParams);
             for k = 1:numel(fitting.modelParams)
                 % final iteration result
-                tmp = utils.dlarray2single(parameters.(fitting.modelParams{k}) .* mask); 
+                % if ~isscalar(parameters.(fitting.modelParams{k}))
+                if isequal(size(parameters.(fitting.modelParams{k}),1:3),size(mask))
+                    tmp = utils.dlarray2single(parameters.(fitting.modelParams{k}) .* mask); 
+                    % minimum loss result
+                    tmp2 = utils.dlarray2single(parameters_minLoss.(fitting.modelParams{k}) .* mask); 
+                else
+                    tmp = utils.dlarray2single(parameters.(fitting.modelParams{k}));
+                    % minimum loss result
+                    tmp2 = utils.dlarray2single(parameters_minLoss.(fitting.modelParams{k}));
+                end
                 out.final.(fitting.modelParams{k}) = tmp;
-
-                % minimum loss result
-                tmp = utils.dlarray2single(parameters_minLoss.(fitting.modelParams{k}) .* mask); 
-                out.min.(fitting.modelParams{k}) = tmp;
+                out.min.(fitting.modelParams{k}) = tmp2;
             end
             out.final.loss          = loss;
             out.final.loss_fidelity = utils.dlarray2single(loss_fidelity);

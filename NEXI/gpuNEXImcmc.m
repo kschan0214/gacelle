@@ -77,9 +77,9 @@ classdef gpuNEXImcmc < handle
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('========================');
-            disp('NEXI with askAdam solver');
-            disp('========================');
+            disp('=======================');
+            disp('NEXI with mcmc.m solver');
+            disp('=======================');
 
             disp('----------------')
             disp('Data Information');

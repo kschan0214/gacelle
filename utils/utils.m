@@ -87,7 +87,9 @@ classdef utils < handle
 
             % loop all fields
             for km = 1:numel(fieldname)
-                data_struct.(fieldname{km}) = utils.undo_masking_ND2GD_preserve(data_struct.(fieldname{km}),mask); 
+                if ~isscalar(data_struct.(fieldname{km})) && ~isscalar(mask)
+                    data_struct.(fieldname{km}) = utils.undo_masking_ND2GD_preserve(data_struct.(fieldname{km}),mask); 
+                end
             end
         end
 
@@ -108,7 +110,9 @@ classdef utils < handle
             
             % loop all fields
             for km = 1:numel(fieldname)
-                data_struct.(fieldname{km}) = utils.reshape_ND2GD(data_struct.(fieldname{km}),mask); 
+                if ~isscalar(data_struct.(fieldname{km}))
+                    data_struct.(fieldname{km}) = utils.reshape_ND2GD(data_struct.(fieldname{km}),mask); 
+                end
             end
 
         end
@@ -234,15 +238,19 @@ classdef utils < handle
         % this utility function to convert the MCMC posterior distribution into 4D/5D image
         function img = reshape_ND2image(dist,mask)
             
-            imageDims = size(mask,1:3);
-            extraDims = size(dist,2:ndims(dist));
-
-            % find masked signal
-            mask_idx            = find(mask>0);
-            % reshape the input to an image         
-            img                     = zeros(numel(mask),extraDims,'like',dist); 
-            img(mask_idx,:,:,:,:,:) = dist; 
-            img                     = reshape(img, [imageDims, extraDims]);
+            if ~isscalar(dist)
+                imageDims = size(mask,1:3);
+                extraDims = size(dist,2:ndims(dist));
+    
+                % find masked signal
+                mask_idx            = find(mask>0);
+                % reshape the input to an image         
+                img                     = zeros(numel(mask),extraDims,'like',dist); 
+                img(mask_idx,:,:,:,:,:) = dist; 
+                img                     = reshape(img, [imageDims, extraDims]);
+            else
+                img = dist;
+            end
             
         end
 
@@ -438,6 +446,19 @@ classdef utils < handle
                  txt = 'false';
              end
          end
+    
+         % make sure all network parameters stay between 0 and 1
+        function parameters = set_boundary(parameters,ub,lb)
+
+            field = fieldnames(parameters);
+            for k = 1:numel(field)
+                parameters.(field{k})   = max(parameters.(field{k}),lb(k)); % Lower bound     
+                parameters.(field{k})   = min(parameters.(field{k}),ub(k)); % upper bound
+
+            end
+
+        end
+    
     end
 
 end

@@ -727,8 +727,8 @@ classdef gpuMCRMWI < handle
                     % [S0MW, S0IEW]   = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
                     [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
                     % [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    S0MW  = (S0MW  + Ss_diff(:,:,:,:,:,1)) .* totalVolume .* this.rho_mw;   S0MW  = max(S0MW, utils.epsilon);
-                    S0IEW = (S0IEW + Ss_diff(:,:,:,:,:,2)) .* totalVolume;                  S0IEW = max(S0IEW, utils.epsilon);
+                    S0MW  = (S0MW  + Ss_diff(:,:,:,:,:,2)) .* totalVolume .* this.rho_mw;   S0MW  = max(S0MW, utils.epsilon);    % 20250819: fix bug with wrong order
+                    S0IEW = (S0IEW + Ss_diff(:,:,:,:,:,1)) .* totalVolume;                  S0IEW = max(S0IEW, utils.epsilon);   % 20250819: fix bug with wrong order
                     % S0_mag          = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm) + Ss_diff ) .* totalVolume;
                 
                 else

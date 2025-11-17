@@ -7,6 +7,97 @@ classdef DWIutility
 
     methods
 
+        function [dwi,bval_sorted,BDELTA_sorted,ldelta_sorted,te_sorted] = compute_rotationally_invariant_signal(this,dwi,bval,bvec,ldelta,BDELTA,te,lmax)
+
+            if nargin < 8
+                lmax = 0;
+            end
+
+            % compute spherical mean signal
+            fprintf('Computing rotationally invariant signal...')
+
+            % if the input little delta is one value then create a vector
+            if isempty(ldelta)
+                ldelta = ones(size(bval));
+            elseif isscalar(ldelta)
+                ldelta = ones(size(bval)) * ldelta;
+            end
+            % if the input big delta is one value then create a vector
+            if isempty(BDELTA)
+                BDELTA = ones(size(bval));
+            elseif isscalar(BDELTA)
+                BDELTA = ones(size(bval)) * BDELTA;
+            end
+            % if the input TE is one value then create a vector
+            if isempty(te)
+                te = zeros(size(bval));
+            elseif isscalar(te)
+                te = ones(size(bval)) * te;
+            end
+
+            dwi                                                 = this.get_Sl_all_no_normalise(dwi,bval,bvec,ldelta,BDELTA,te,lmax);
+            [bval_sorted,ldelta_sorted,BDELTA_sorted,te_sorted] = this.unique_shell_keepb0(bval,ldelta,BDELTA,te);
+
+            fprintf('done.\n');
+
+            % sorting data
+            fprintf('Sorting data...')
+
+            % sort the order of the signal based on TE, Delta, delta and b, then normalise the signal by the smallest b-value and shortest TE
+            acqTable = [bval_sorted(:), te_sorted(:), BDELTA_sorted(:), ldelta_sorted(:), (1:numel(bval_sorted)).'];
+            
+            % Sort rows first by TE, Delta, delta and finally b
+            sorted_data = sortrows(acqTable, [2,3,4,1]);
+            idx         = uint16(sorted_data(:,end));
+
+            % sort b,te,Delta,delta
+            bval_sorted     = bval_sorted(idx);
+            te_sorted       = te_sorted(idx);
+            BDELTA_sorted   = BDELTA_sorted(idx);
+            ldelta_sorted   = ldelta_sorted(idx);
+            dwi             = dwi(:,:,:,idx);
+
+            fprintf('done.\n');
+
+        end
+
+        function [dwi,b_all] = get_Sl_all_no_normalise(this,dwi,bval,bvec,ldelta,BDELTA,te,lmax)
+            % [bval_sorted,ldelta_sorted,BDELTA_sorted] = this.unique_shell(bval,ldelta,BDELTA);
+            % dims    = size(dwi);
+            % tmp     = size([dims(1:3) size(bval_sorted)]);
+            dims = size(dwi);
+            tmp     = [];
+            b_all   = [];
+            % find unique te
+            te_unique = unique(te);
+            for kt = 1:numel(te_unique)
+
+                % for each little te, find unique little delta
+                idx_te = find(te == te_unique(kt));
+                % find unique little delta
+                ldelta_unique   = unique(ldelta(idx_te));
+                
+                for klde = 1:numel(ldelta_unique)
+                    % for each little delta, find unique big delta
+                    idx_ldel        = intersect(find(ldelta == ldelta_unique(klde)), idx_te);
+                    BDELTA_unique   = unique(BDELTA(idx_ldel));
+                    for kBDE = 1:numel(BDELTA_unique)
+                    
+                        % for each little delta and big delta, find unique b-values
+                        idx_BDEL= intersect(find(BDELTA == BDELTA_unique(kBDE)),idx_ldel);
+                        
+                        bval_tmp            = bval(idx_BDEL);
+                        bvec_tmp            = bvec(:,idx_BDEL);
+                        [dwi_Sl,b_unique]   = this.Sl_no_normalise(dwi(:,:,:,idx_BDEL),bval_tmp,bvec_tmp,lmax);
+                        dwi_Sl              = reshape(dwi_Sl,[dims(1:3) size(dwi_Sl,4)/(lmax/2+1) lmax/2+1]);
+                        b_all               = cat(2,b_all,b_unique);
+                        tmp                 = cat(4,tmp,dwi_Sl);
+                    end
+                end
+            end
+            dwi = reshape(tmp,[dims(1:3), size(tmp,4)*size(tmp,5)]);
+        end
+
         function [dwi,b_all] = get_Sl_all(this,dwi,bval,bvec,ldelta,BDELTA,lmax)
             % [bval_sorted,ldelta_sorted,BDELTA_sorted] = this.unique_shell(bval,ldelta,BDELTA);
             % dims    = size(dwi);
@@ -91,6 +182,48 @@ classdef DWIutility
             bval_unique = bval_unique(bval_unique ~= 0);
         end
 
+        % compute rotational invariant DWI images
+        function [dwi_Sl,bval_unique] = Sl_no_normalise(this,dwi,bval,bvec,lmax)
+        % [dwi_sh,bval_unique] = Slm(this,dwi,bval,bvec,lmax)
+        % Input
+        % -----------
+        % dwi        : 4D DWI data, [sx,sy,sz,sg]
+        % bval       : 1D b-value vector
+        % bvec       : 2D b-vector (gradient directions)
+        % lmax       : Spherical Harmonic Order
+        %
+        % Output
+        % -----------
+        % dwi_sh     : 4D Rotational invariant images, [sx,sy,sz,slm]
+        % bval_unique: unique b-value (no b0)
+        %
+
+            if size(bvec,1) == 3
+                bvec = bvec.';
+            end
+            
+            Nsh  = floor(lmax/2) + 1; 
+            % get image size
+            dims = size(dwi);
+            % get unique bval;
+            bval_unique = unique(bval);
+            
+            % compute rotational invariant signal
+            dwi_Sl       = zeros(numel(bval_unique), Nsh, prod(dims(1:3)));
+            for kb = 1:numel(bval_unique)
+
+                % counter = counter +1;
+                ind = bval == bval_unique(kb);
+
+                dwi_Sl(kb,:,:)   = this.SHrotinv(reshape( dwi(:,:,:,ind), prod(dims(1:3)),length(ind(ind>0))).', ...
+                                            bvec(ind,:), lmax);
+            end
+            
+            dwi_Sl      = permute(reshape(dwi_Sl,[numel(bval_unique), Nsh, dims(1:3)]),[3 4 5 1 2]);
+            dwi_Sl      = reshape(dwi_Sl(:,:,:,:,1:Nsh),[dims(1:3) numel(bval_unique)*Nsh]);
+            
+        end
+
         function F = SHrotinv(this, S, g, lmax)
             S       = cat(1, S, S);
             g       = cat(1, g,-g);
@@ -136,7 +269,7 @@ classdef DWIutility
         function bval_corr = rectify_bval_v2(bvals,thres)
 
             % maxi difference
-            if nargin < 3
+            if nargin < 2
                 thres = 0.05; % 5%
             end
             
@@ -219,6 +352,63 @@ classdef DWIutility
 
         end
 
+        % get unique b-values for each little delta and big delta
+        function [bval_sorted,ldelta_sorted,BDELTA_sorted,te_sorted] = unique_shell_keepb0(bval,ldelta,BDELTA,te)
+            if nargin < 4
+                te = ones(size(bval));
+            end
+            bval_sorted     = [];
+            ldelta_sorted   = [];
+            BDELTA_sorted   = [];
+            te_sorted       = [];
+
+            if isempty(ldelta)
+                ldelta = zeros(size(bval));
+            end
+            if isempty(BDELTA)
+                BDELTA = zeros(size(bval));
+            end
+            if isempty(te)
+                te = zeros(size(bval));
+            end
+
+            % find unique te
+            te_unique = unique(te);
+            for kt = 1:numel(te_unique)
+
+                % for each little te, find unique little delta
+                idx_te = find(te == te_unique(kt));
+                % find unique little delta
+                ldelta_unique   = unique(ldelta(idx_te));
+            
+                for klde = 1:numel(ldelta_unique)
+                    
+                    % for each little delta, find unique big delta
+                    idx_ldel        = intersect(find(ldelta == ldelta_unique(klde)), idx_te);
+                    BDELTA_unique   = unique(BDELTA(idx_ldel));
+                    for kBDE = 1:numel(BDELTA_unique)
+                    
+                        % for each little delta and big delta, find unique b-values
+                        idx_BDEL= intersect(find(BDELTA == BDELTA_unique(kBDE)),idx_ldel);
+    
+                        b_unique = unique(bval(idx_BDEL));
+                        % b_unique = b_unique(b_unique>0);
+                        
+                        bval_sorted     = cat(2,bval_sorted,b_unique);
+                        ldelta_sorted   = cat(2,ldelta_sorted,ones(size(b_unique))*ldelta_unique(klde));
+                        BDELTA_sorted   = cat(2,BDELTA_sorted,ones(size(b_unique))*BDELTA_unique(kBDE));
+                        te_sorted       = cat(2,te_sorted,ones(size(b_unique))*te_unique(kt));
+                    end
+                end
+                
+            end
+            bval_sorted     = bval_sorted(:);
+            ldelta_sorted   = ldelta_sorted(:);
+            BDELTA_sorted   = BDELTA_sorted(:);
+            te_sorted       = te_sorted(:);
+
+        end
+        
         % permute the 4th dimension of input data to 1st dimension
         function data = permute_dwi_dimension(data)
             if isstruct(data)
