@@ -134,6 +134,7 @@ classdef gpuAxCaliberSMT < handle
         %   .bvec       : 2D b-table, [3,dwi]                       (Optional, only needed if dwi is full acquisition)
         %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
         %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
+        %   .b_scale    : 3D voxel-wise b-value scaling map, [x,y,z](Optional, from gradient nonlinearity correction)
         % fitting   : fitting algorithm parameters (see fit function)
         % 
         % Output
@@ -191,8 +192,15 @@ classdef gpuAxCaliberSMT < handle
                 mask_tmp    = mask(:,:,slice);
                 if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end
                 else;                                                    pars0_tmp = [];                 end
-                
-                [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+
+                % slice b_scale map if provided
+                if isfield(extradata,'b_scale') && ~isempty(extradata.b_scale)
+                    b_scale_tmp = extradata.b_scale(:,:,slice);
+                else
+                    b_scale_tmp = [];
+                end
+
+                [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp,b_scale_tmp);
 
                 % restore 'out' structure from segment
                 out = utils.restore_segment_structure(out,out_tmp,slice,ks);
@@ -208,7 +216,7 @@ classdef gpuAxCaliberSMT < handle
 
         % Data fitting function
         % This is a wapper of the askadam class 'fit' function
-        function [out] = fit(this,dwi,mask,fitting,pars0)
+        function [out] = fit(this,dwi,mask,fitting,pars0,b_scale)
         %
         % Input
         % -----------
@@ -271,6 +279,7 @@ classdef gpuAxCaliberSMT < handle
             else
                 if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
             end
+            if nargin < 7; b_scale = []; end % no b-value scaling (gradient nonlinearity correction)
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
@@ -288,9 +297,15 @@ classdef gpuAxCaliberSMT < handle
             % 2.2 estimate prior if neede
             if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
 
-            % 2.3 askAdam optimisation main
-            askadamObj  = askadam(); 
-            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.model);
+            % 2.3 reshape b_scale to match masked voxel layout [1 x Nvoxels]
+            if ~isempty(b_scale)
+                mask_idx = find(mask > 0);
+                b_scale  = gpuArray(single(b_scale(mask_idx).'));
+            end
+
+            % 2.4 askAdam optimisation main
+            askadamObj  = askadam();
+            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.model, b_scale);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
@@ -546,28 +561,38 @@ classdef gpuAxCaliberSMT < handle
         %%  Signal related functions
         
         % Forward model to generate AxCaliberSMT signal
-        function s = FWD(this, pars, model)
+        function s = FWD(this, pars, model, b_scale)
 
             r       = pars.a/2;
             f       = pars.f;
             fcsf    = pars.fcsf;
             DeR     = pars.DeR;
-                
+
+            % b-value scaling for gradient nonlinearity correction
+            if nargin > 3 && ~isempty(b_scale)
+                b_eff    = this.b .* b_scale;           % [Nshells x Nvoxels]
+                g2_eff   = this.g.^2 .* b_scale;        % [Nshells x Nvoxels]
+                Scsf_eff = exp(-b_eff * this.Dcsf);      % [Nshells x Nvoxels]
+            else
+                b_eff    = this.b;
+                g2_eff   = this.g.^2;
+                Scsf_eff = this.Scsf;
+            end
+
             % Forward model
             % 1. Intra-cellular signal
             switch lower(model)
                 case 'neuman'
-                    C = this.neuman(r);
+                    C = this.neuman(r, g2_eff);
                 case 'vangelderen'
-                    C = this.vg2(r);    % less memory efficient but faster
+                    C = this.vg2(r, g2_eff);    % less memory efficient but faster
             end
-            Sa = sqrt(pi./(4*(this.b*this.Da - C))) .* exp(-C) .* erf(sqrt(this.b*this.Da - C));
+            Sa = sqrt(pi./(4*(b_eff*this.Da - C))) .* exp(-C) .* erf(sqrt(b_eff*this.Da - C));
             % 2. Extra-cellular signal
             dDe = (this.DeL - DeR); dDe = max(dDe,askadam.epsilon); %dDe(dDe<0) = 0;    % avoid division by zeros
-            Se = sqrt(pi./(4.*(dDe).*this.b)) .* exp(-this.b.*DeR) .* erf(sqrt(this.b .*(dDe)));
+            Se = sqrt(pi./(4.*(dDe).*b_eff)) .* exp(-b_eff.*DeR) .* erf(sqrt(b_eff .*(dDe)));
             % Combined signal
-            s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
-            % s = arrayfun(@AxCaliberSMT_signal_combine, C, f, fcsf, DeR, this.b,this.Da,this.DeL,this.Scsf);
+            s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*Scsf_eff;
 
             % make sure s cannot be greater than 1
             s = min(s,1);
@@ -575,7 +600,7 @@ classdef gpuAxCaliberSMT < handle
         end
         
         % compute signal attenuation associated with axon size
-        function s = vg2(this,r)
+        function s = vg2(this, r, g2_eff)
             k           = 10;
             bm2_tmp     = this.bm2(1:k); if isgpuarray(r); bm2_tmp = gpuArray(single(bm2_tmp)); end
             bm2_tmp     = permute(bm2_tmp(:),[2 3 1]);
@@ -594,12 +619,12 @@ classdef gpuAxCaliberSMT < handle
                         + 2*exp(-bm2barDelta) ...
                         - exp(-bm2barDelta-bm2bardelta)...
                         - exp(-bm2barDelta+bm2bardelta));
-            s = sum(s,3).*this.D0.*this.g.^2.*td.^3;
+            s = sum(s,3).*this.D0.*g2_eff.*td.^3;
             
         end
 
-        function s = neuman(this, r)
-            s = (7/48)*this.g.^2.*this.delta*r.^4/this.D0;
+        function s = neuman(this, r, g2_eff)
+            s = (7/48)*g2_eff.*this.delta*r.^4/this.D0;
         end
 
     end
