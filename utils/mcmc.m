@@ -205,6 +205,14 @@ classdef mcmc < handle
         %   .repetition         : # repetition of MCMC proposal
         %   .StepSize           : step size for 'GW' in MCMC proposal ('GW' only)
         %   .Nwalker            : # random walkers ('GW' only)
+        %   .Ensembleupdate    : (optional) ensemble update scheme:
+        %                          'simultaneous' - original behaviour (DEFAULT, backward compatible):
+        %                                           all walkers proposed/updated in one pass using a
+        %                                           single derangement as partners.
+        %                          'redblack'     - affine-invariance-correct parallel update
+        %                                           (Foreman-Mackey et al. 2013): split the ensemble
+        %                                           into two halves and update each half using the
+        %                                           other (frozen) half as anchors.
         % FWDfunc       : function handle of forward model
         % varargin      : contains additional input requires for FWDfunc
         % 
@@ -226,6 +234,22 @@ classdef mcmc < handle
             Ns       = numel(Nburnin+1:fitting.thinning:fitting.iteration);
             Nwalker  = fitting.Nwalker;
             StepSize = fitting.StepSize;
+
+            % red-black update scheme
+            useRedBlack = strcmpi(fitting.Ensembleupdate,'redblack');
+            if useRedBlack
+                if Nwalker < 2
+                    error('goodman_weare:Nwalker', ...
+                        'redblack update needs Nwalker >= 2 (use even, >= 2*Nvar in practice).');
+                end
+                if mod(Nwalker,2) ~= 0
+                    warning('goodman_weare:Nwalker', ...
+                        'Nwalker is odd; redblack halves will be unequal. Even Nwalker is conventional.');
+                end
+                h       = floor(Nwalker/2);
+                halfIdx = {1:h, h+1:Nwalker};   % {S0, S1}: complementary anchor sets
+            end
+            fprintf('Ensemble update scheme: %s\n', fitting.Ensembleupdate);
         
             % convert data into single datatype for better performance
             y       = gpuArray( single(y) );
@@ -261,30 +285,76 @@ classdef mcmc < handle
         
             counter = 0; start = tic;
             for k = 1:fitting.iteration
-                % 1. make a proposal with normal distribution
-                % 1.1. find a unique partner for a walker k
-                partner         = this.find_partner(Nwalker);
-                % 1.2. stretch move
-                zz              = ((StepSize-1)*rand(size(logP0),'like',xCurr) + 1).^2 / StepSize;
-                xProposed       = xCurr(:,:,partner) + (xCurr - xCurr(:,:,partner)).*zz;
-                % find proposal that is out of bound for exclusion
-                isOutofbound    = max(or(xProposed<lb, xProposed>ub),[],1);    
-                % replace boundary values so it does not give error when compting probability
-                xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
-                % convert the proposal into structure array for FWD function
-                xProposed_struct = this.array2struct(xProposed,fitting.modelParams);
-        
-                % 2. Metropolis sampling
-                % If the probability ratio of new to old > threshold, we take the new solution.
-                % 2.1 proposal probability
-                logPProposed            = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(xProposed_struct, varargin{:})-y).^2, 1 ), xProposed_struct.noise, Nm);
-                % 2.2 Compute acceptance ratio based on z^(Nd-1)*new/old probability
-                acceptanceRatio         = min(zz.^(Nvar-1).*exp(logPProposed-logPCurr), 1);
-                isAccepted              = acceptanceRatio > rand(1,Nv,Nwalker,'like',xCurr);
-                isAccepted(isOutofbound)= 0;    % reject out of bound proposal
-                % 2.3 update parameters
-                logPCurr(isAccepted)    = logPProposed(isAccepted);
-                xCurr(:,isAccepted)     = xProposed(:,isAccepted);
+
+                if ~useRedBlack
+                    % =========== LEGACY: simultaneous single-derangement update ===========
+                    % (identical to the original implementation; preserved for reproducibility)
+                    % 1.1 find a unique partner for each walker
+
+                    % 1. make a proposal with normal distribution
+                    % 1.1. find a unique partner for a walker k
+                    partner         = this.find_partner(Nwalker);
+                    % 1.2. stretch move
+                    zz              = ((StepSize-1)*rand(size(logP0),'like',xCurr) + 1).^2 / StepSize;
+                    xProposed       = xCurr(:,:,partner) + (xCurr - xCurr(:,:,partner)).*zz;
+                    % find proposal that is out of bound for exclusion
+                    isOOB    = max(or(xProposed<lb, xProposed>ub),[],1);    
+                    % replace boundary values so it does not give error when compting probability
+                    xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
+                    % convert the proposal into structure array for FWD function
+                    xProposed_struct = this.array2struct(xProposed,fitting.modelParams);
+            
+                    % 2. Metropolis sampling
+                    % If the probability ratio of new to old > threshold, we take the new solution.
+                    % 2.1 proposal probability
+                    logPProposed            = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(xProposed_struct, varargin{:})-y).^2, 1 ), xProposed_struct.noise, Nm);
+                    % 2.2 Compute acceptance ratio based on z^(Nd-1)*new/old probability
+                    acceptanceRatio         = min(zz.^(Nvar-1).*exp(logPProposed-logPCurr), 1);
+                    isAccepted              = acceptanceRatio > rand(1,Nv,Nwalker,'like',xCurr);
+                    isAccepted(isOOB)       = 0;    % reject out of bound proposal
+                    % 2.3 update parameters
+                    logPCurr(isAccepted)    = logPProposed(isAccepted);
+                    xCurr(:,isAccepted)     = xProposed(:,isAccepted);
+                else
+
+                    % =========== RED-BLACK: two complementary sub-steps per sweep ===========
+                    for s = 1:2
+                        active = halfIdx{s};       % walkers moved this sub-step
+                        frozen = halfIdx{3-s};     % anchors, held FIXED this sub-step
+                        na     = numel(active);
+
+                        % stretch proposal: each active walker anchored on a RANDOM frozen
+                        % walker (uniform, WITH replacement -- textbook GW partner draw)
+                        pidx  = frozen(randi(numel(frozen),1,na));
+                        xAnch = xCurr(:,:,pidx);                 % [Nvar,Nv,na] fixed
+                        xAct  = xCurr(:,:,active);               % [Nvar,Nv,na]
+                        zz    = ((StepSize-1)*rand(1,Nv,na,'like',xCurr) + 1).^2 / StepSize;
+                        xProp = xAnch + (xAct - xAnch).*zz;
+
+                        lb_a  = lb(:,:,active);  ub_a = ub(:,:,active);
+                        isOOB = max(or(xProp<lb_a, xProp>ub_a),[],1);
+                        xProp = max(xProp,lb_a);  xProp = min(xProp,ub_a);
+
+                        % proposal likelihood on the active half only
+                        % (two half-width evals/iter ~= one full eval: no cost regression)
+                        xProp_s  = this.array2struct(xProp,fitting.modelParams);
+                        logPProp = arrayfun(@logP_Gaussian, ...
+                                     sum( weights(:,:,active).*(modelFWD(xProp_s,varargin{:})-y).^2, 1 ), ...
+                                     xProp_s.noise, Nm);
+
+                        % acceptance  z^(Nvar-1) * pi(new)/pi(old)
+                        logPAct  = logPCurr(:,:,active);
+                        aR       = min(zz.^(Nvar-1).*exp(logPProp - logPAct), 1);
+                        acc      = aR > rand(1,Nv,na,'like',xCurr);
+                        acc(isOOB) = 0;
+
+                        % scatter accepted moves back into the active block
+                        xAct(:,acc)  = xProp(:,acc);
+                        logPAct(acc) = logPProp(acc);
+                        xCurr(:,:,active)    = xAct;
+                        logPCurr(:,:,active) = logPAct;
+                    end
+                end
         
                 % 3. Maintain the independence between iterations
                 % 3.1 discard the first burnin*100% iterations
@@ -491,7 +561,10 @@ classdef mcmc < handle
             if ~isfield(fitting,'Nwalker');             fitting2.Nwalker        = 50;               end 
             if ~isfield(fitting,'ub');                  fitting2.ub             = [];               end
             if ~isfield(fitting,'lb');                  fitting2.lb             = [];               end
-            if ~isfield(fitting,'startRange');          fitting2.startRange    = 0.001;             end
+            if ~isfield(fitting,'startRange');          fitting2.startRange     = 0.001;            end
+
+            % --- choose ensemble update scheme (default = original behaviour) ----
+            if ~isfield(fitting,'Ensembleupdate');      fitting2.Ensembleupdate  = 'simultaneous';  end
 
             if any(ismember(fitting2.metric,'mode'))
                 if ~isfield(fitting,'Nbin');            fitting2.Nbin     = 1001;                end 
