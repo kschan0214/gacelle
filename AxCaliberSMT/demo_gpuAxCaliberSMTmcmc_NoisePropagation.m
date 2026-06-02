@@ -3,7 +3,7 @@ clear;
 %% Simulate data
 
 % for reproducibility
-seed        = 8715; rng(seed); gpurng(seed);
+seed        = 'default'; rng(seed); gpurng(seed);
 Nsample     = 1e3;  % #voxel
 SNR         = 50;   
 
