@@ -19,7 +19,7 @@ classdef askadam < handle
 
     methods
 
-        function [gradients,loss,loss_fidelity,loss_reg,residuals] = model_gradient(this, parameters, data, mask, weights, fitting, userfuncCell, varargin)
+        function [gradients,loss,loss_fidelity,loss_reg,residuals,minGPUMem] = model_gradient(this, parameters, data, mask, weights, fitting, userfuncCell, varargin)
         % Input
         % ----------
         % parameters    : Structure variable containing all parameters to be estimated
@@ -37,7 +37,8 @@ classdef askadam < handle
         % loss_fidelity : loss associated with data fidelity (consistancy)
         % loss_reg      : loss associated with (TV) regularisation
 
-            
+            gpu        = gpuDevice;
+            minGPUMem  = gpu.AvailableMemory;
             
             % Obatin user forwsrd model function and regularisation function
             if ~iscell(userfuncCell)
@@ -105,6 +106,7 @@ classdef askadam < handle
                 end
             end
 
+            minGPUMem  = min(gpu.AvailableMemory,minGPUMem);
         end
 
         % askAdam optimisation loop
@@ -113,7 +115,7 @@ classdef askadam < handle
         % Input
         % -----
         % data                  : 2-D (vectorised imaging) data
-        % mask                  : (1-3)D signal mask applied on FWDfunc, NOTE this mask does NOT apply on data
+        % mask                  : (1-3)D signal mask
         % weights               : N-D wieghts, same dimension as 'data' (optional)
         % parameters            : structure variable containing starting points of all model parameters to be estimated (optional)
         % fitting               : structure contains fitting algorithm parameters
@@ -136,6 +138,9 @@ classdef askadam < handle
         % ------
         % out                   : structure contains optimisation result
         %
+
+            gpu             = gpuDevice;
+            initFreeGPUMem  = gpu.AvailableMemory;
 
             dims = size(mask,1:3); mask_idx = find(mask>0);
 
@@ -187,7 +192,7 @@ classdef askadam < handle
             if fitting.isDisplay; lineLoss = this.setup_display; end
 
             % compute the loss and residual at the starting point
-            [~,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:});
+            [~,loss,loss_fidelity,loss_reg,residuals,minGPUMem] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:});
             lossAll0                = extractdata(mean(reshape(residuals,Nmeas,Nvol),1));
             loss                    = double(utils.dlarray2single(loss));
             minLoss                 = loss;
@@ -197,8 +202,14 @@ classdef askadam < handle
             parameters_minLoss      = parameters;
             minIteration            = 0;
             epoch                   = 0;
-
+            currFreeGPUMem          = min(gpu.AvailableMemory,minGPUMem);
             start = tic;
+
+            % report max. memory usage
+            currGPUMemUsage = (initFreeGPUMem - currFreeGPUMem ) / 1024^3;
+            fprintf('Current GPU memory available   = %.3fGB \n', initFreeGPUMem / 1024^3);
+            fprintf('Max. GPU memory usage          = %.3fGB \n',currGPUMemUsage);
+                      
 
             %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
             
@@ -237,6 +248,7 @@ classdef askadam < handle
 
                     % Update convergence value
                     [convergenceCurr, convergenceBuffer] = this.update_convergence([convergenceBuffer(2:end);loss]); 
+                    currFreeGPUMem                       = min(gpu.AvailableMemory,currFreeGPUMem);
 
                     % check if there is any global improvement
                     if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
@@ -347,7 +359,7 @@ classdef askadam < handle
 
                             fprintf('Iteration #%4d,   Loss = %f,     Loss (w/o outliers) = %f,   Convergence = %e,     Elapsed:%s \n',epoch,loss,loss_nooutliers,convergenceCurr,string(D));
                         else
-                            fprintf('Iteration #%4d,   Total Loss = %.3e,   Consistency Loss = %.3e,   Regularisation Loss = %.3e,   Convergence = %.3e,   Learn rate = %.3e,   Elapsed:%s \n',epoch,loss,loss_fidelity,loss_reg,convergenceCurr, learningRate, string(D));
+                            fprintf('Iteration #%4d,   Total Loss = %.3e,   Consistency Loss = %.3e,   Regularisation Loss = %.3e,   Convergence = %.3e,   Learn rate = %.3e,   Elapsed:%s, \n',epoch,loss,loss_fidelity,loss_reg,convergenceCurr, learningRate, string(D));
                         end
                     end
                     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -403,6 +415,8 @@ classdef askadam < handle
             out.min.resloss         = utils.reshape_ND2image( utils.dlarray2single( mean(reshape(minResiduals,Nmeas,Nvol),1)).',mask);
             out.min.residual        = utils.dlarray2single( reshape(minResiduals,Nmeas,Nvol));
             out.min.Niteration      = minIteration;
+
+            out.final.memoryUsage   = currGPUMemUsage;
            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
         end
@@ -470,7 +484,7 @@ classdef askadam < handle
 
             % get fitting algorithm setting
             if ~isfield(fitting,'iteration');           fitting2.iteration = 4000;              end     % stopping criteria
-            if isfield(fitting,'Nepoch');               fitting2.iteration  = fitting.Nepoch; fitting2 = rmfield(fitting2,'Nepoch'); end % legacy
+            if isfield(fitting,'Nepoch');               fitting2.iteration = fitting.Nepoch; fitting2 = rmfield(fitting2,'Nepoch'); end % legacy
             if ~isfield(fitting,'initialLearnRate');    fitting2.initialLearnRate   = 0.001;    end
             if ~isfield(fitting,'decayRate');           fitting2.decayRate          = 0;        end
             if ~isfield(fitting,'optimiser');           fitting2.optimiser          = 'adam';   end
@@ -494,6 +508,7 @@ classdef askadam < handle
             if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres   = 1;        end
             if ~isfield(fitting,'enableComplex');       fitting2.enableComplex      = true;     end
             if ~isfield(fitting,'isOptimiseMemory');    fitting2.isOptimiseMemory   = true;     end    
+            if ~isfield(fitting,'autoMemManage');       fitting2.autoMemManage      = true;     end    
             
             if ~iscell(fitting2.lambda);                fitting2.lambda = num2cell(fitting2.lambda); end
 

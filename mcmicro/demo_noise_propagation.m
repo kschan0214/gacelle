@@ -1,4 +1,4 @@
-addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/gacelle/'));
+addpath(genpath('../../gacelle/'));
 clear;
 %% Simulate data
 

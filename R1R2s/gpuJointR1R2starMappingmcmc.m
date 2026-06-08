@@ -293,7 +293,7 @@ classdef gpuJointR1R2starMappingmcmc < handle
             s = utils.reshape_ND2GD(s,[]);
             % reshape s for GW
             if ~isempty(fitting)
-                if strcmpi(fitting.algorithm,'gw')
+                if strcmpi(fitting.algorithm,'ensemble')
                     s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
                 end
             end

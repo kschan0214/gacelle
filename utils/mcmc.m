@@ -8,6 +8,7 @@ classdef mcmc < handle
 % Date modified: 7 August 2024
 % Date modified: 23 August 2024
 % Date modified: 5 October 2024
+% Date modified: 4 June 2026 (update affine-invariant method with and without global parameters)
 %
     properties (GetAccess = public, SetAccess = protected)
 
@@ -382,136 +383,185 @@ classdef mcmc < handle
         end
 
         function xPosterior = goodman_weare_wglobal_constant(this,y,x0,weights,fitting,modelFWD,varargin)
-        % Input
-        % ----------
-        % y         : measurements, [Nmeas,Nvoxels]
-        % x0        : structure array, starting points, N fields, each field 1xNvoxel
-        % weights   : weighting for non-linear least square fitting, same dimension as y
-        % pars0         : Structure variable containing all parameters to be estimated
-        % fitting       : Structure variable containing all fitting algorithm setting
-        %   .modelParams       : 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};
-        %   .lb                 : 1xM numeric variable, fitting lower bound, same order as field 'modelParams', e.g. [0.5, 0, 0.001];
-        %   .ub                 : 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];
-        %   .iteration          : # MCMC iterations
-        %   .thinning           : sampling interval between iterations
-        %   .burnin             : iterations at the beginning to be discarded, if burnin>1, then the exact number will  be used; if 0<burnin<1 then actual burnin = iteration*burnin
-        %   .repetition         : # repetition of MCMC proposal
-        %   .StepSize           : step size for 'GW' in MCMC proposal ('GW' only)
-        %   .Nwalker            : # random walkers ('GW' only)
-        % FWDfunc       : function handle of forward model
-        % varargin      : contains additional input requires for FWDfunc
-        % 
-        % ENSEMBLE SAMPLERS WITH AFFINE INVARIANCE (2010) JONATHAN GOODMAN AND JONATHAN WEARE
-        % Other references:
-        % emcee: The MCMC Hammer (2013) https://arxiv.org/pdf/1202.3665
-        % https://github.com/grinsted/gwmcmc/tree/master
-        % 
+        % Affine-invariant ensemble sampling for hierarchical / partial-pooling
+        % problems with GLOBAL (shared) parameters, via block Metropolis-within-Gibbs.
+        %
+        % CONTRACT (scope of this sampler):
+        %   The log-likelihood must factorise over units (voxels) as
+        %       sum_z loglik(y_z | theta_z, phi)
+        %   i.e. given the global parameters phi, the units are conditionally
+        %   independent. Parameters split into LOCAL theta_z (one set per unit) and
+        %   GLOBAL phi (shared). Any model with this structure is supported
+        %   (arbitrary NND local and NGlobal global parameters); the sampler holds
+        %   no model-specific knowledge.
+        %
+        % WHICH PARAMETERS ARE GLOBAL is detected from the starting structure: a
+        % field of x0 with size==1 along the voxel dimension is treated as global
+        % (see check_global_constant). So {R2c,k2A}, a shared diffusivity, a global
+        % B1 term, etc., all work without code changes.
+        %
+        % One iteration = two decoupled blocks, each a Goodman-Weare stretch move:
+        %   LOCAL block : propose theta, GLOBALS HELD FIXED, exponent z^(NND-1),
+        %                 forward model evaluated at (new local, old global).
+        %   GLOBAL block: propose phi, LOCALS HELD FIXED at their updated values,
+        %                 exponent z^(NGlobal-1), forward model evaluated at
+        %                 (current local, new global); acceptance uses the summed
+        %                 log-likelihood DIFFERENCE accumulated in double precision.
+        %
+        % This structure is what keeps the cached likelihood consistent with the
+        % current state at all times (the previous single-eval / two-accept scheme
+        % left it stale) and gives each block its correct stretch Jacobian.
+        %
+        % NOTES / options:
+        %   .StepSize          : stretch scale 'a'
+        %   .Nwalker           : # walkers (even, >= 2*max(NND,NGlobal) recommended)
+        %   .startRange        : local walker init spread (fraction of range)
+        %   .globalWarmup      : (optional) # global-only iterations before the joint
+        %                        loop (locals frozen). Default 0. Helps when the global
+        %                        posterior is very tight.
+        %   .Ensembleupdate          : ensemble update scheme, applied to BOTH blocks:
+        %                          'simultaneous' - (DEFAULT, backward compatible)
+        %                                           all walkers proposed at once using a
+        %                                           single derangement as partners.
+        %                          'redblack'     - correct parallel update
+        %                                           (Foreman-Mackey 2013): split walkers
+        %                                           into two halves and update each half
+        %                                           using the other as frozen anchors.
+        %                        Consistent with the option in goodman_weare.
+        %
+        % Goodman & Weare 2010; emcee (Foreman-Mackey 2013).
 
             fitting = this.check_set_default_basic(fitting);
             if isempty(weights); weights = ones(size(y), 'like', y); end
 
-            % Nm: # measurements; Nv: # voxels
             [Nm, Nv] = size(y);
-            % Nvar: # estimation parameters
             Nvar     = numel(fitting.modelParams);
             Nburnin  = this.get_number_burnin(fitting);
-            % Ns: # samples in posterior distribution
             Ns       = numel(Nburnin+1:fitting.thinning:fitting.iteration);
             Nwalker  = fitting.Nwalker;
             StepSize = fitting.StepSize;
-        
-            % convert data into single datatype for better performance
+
+            % --- ensemble update scheme (consistent with goodman_weare) -----
+            useRedBlack = strcmpi(fitting.Ensembleupdate,'redblack');
+            if useRedBlack
+                if mod(Nwalker,2) ~= 0
+                    warning('goodman_weare_wglobal_constant:Nwalker', ...
+                        'Nwalker is odd; red-black halves will be unequal. Even Nwalker is conventional.');
+                end
+                h       = floor(Nwalker/2);
+                halfIdx = {1:h, h+1:Nwalker};
+            end
+            fprintf('Ensemble update scheme: %s\n', fitting.Ensembleupdate);
+            % -----------------------------------------------------------------
+
+            % convert to single + push to GPU
             y       = gpuArray( single(y) );
             weights = gpuArray( single(weights) );
-            for km = 1:Nvar; x0.(fitting.modelParams{km}) = gpuArray(single( x0.(fitting.modelParams{km}) ));end
-        
+            for km = 1:Nvar; x0.(fitting.modelParams{km}) = gpuArray(single( x0.(fitting.modelParams{km}) )); end
+
             isGlobal = this.check_global_constant(x0,fitting.modelParams);
+            NGlobal  = numel(isGlobal(isGlobal==1));
+            NND      = Nvar - NGlobal;
+            if NND==0 || NGlobal==0
+                error('goodman_weare_wglobal_constant:partition', ...
+                    'Need at least one local and one global parameter (NND=%d, NGlobal=%d). Use goodman_weare for the all-local case.',NND,NGlobal);
+            end
 
-            NGlobal = numel(isGlobal(isGlobal==1));
-            NND     = Nvar - NGlobal;
+            % bounds
+            lb        = gpuArray( single(repmat(fitting.lb(isGlobal==0),1,Nv,Nwalker)));
+            ub        = gpuArray( single(repmat(fitting.ub(isGlobal==0),1,Nv,Nwalker)));
+            lb_global = gpuArray( single(repmat(fitting.lb(isGlobal==1),1,1,Nwalker)));
+            ub_global = gpuArray( single(repmat(fitting.ub(isGlobal==1),1,1,Nwalker)));
+            weights   = repmat(weights,1,1,Nwalker);
 
-            % setup boundary variables
-            lb          = gpuArray( single(repmat(fitting.lb(isGlobal==0),1,Nv,Nwalker)));
-            ub          = gpuArray( single(repmat(fitting.ub(isGlobal==0),1,Nv,Nwalker)));
-            lb_global   = gpuArray( single(repmat(fitting.lb(isGlobal==1),1,1,Nwalker)));  % global constant
-            ub_global   = gpuArray( single(repmat(fitting.ub(isGlobal==1),1,1,Nwalker)));  % global constant
-            % set up weight
-            weights     = repmat(weights,1,1,Nwalker);
-            % initialize array to staore all the samples
-            xPosterior_ND       = zeros(NND, Nv, Nwalker, Ns, fitting.repetition,'single');
-            xPosterior_global   = zeros(NGlobal, 1, Nwalker, Ns, fitting.repetition,'single');
-            
-            % initiate an ensemble of walkers around the starting position (0.1% full range) with Gaussian distribution
-            % 1st: Nvar;2nd: Nv; 3rd: Nwalker
-            [xCurr_ND,xCurr_global]     = this.struct2array_wglobal(x0,fitting.modelParams);                                    % extract parameter structure to numeric array for faster computation
-            xCurr_ND                    = xCurr_ND + (ub-lb)*fitting.startRange.*randn(size(ub));                               % initiate starting position for all walkers
-            xCurr_ND                    = max(xCurr_ND,lb); xCurr_ND = min(xCurr_ND,ub);                                        % set boundary
-            xCurr_global                = xCurr_global + (ub_global-lb_global)*fitting.startRange.*randn(size(ub_global));      % initiate starting position for all walkers
-            xCurr_global                = max(xCurr_global,lb_global); xCurr_global = min(xCurr_global,ub_global);              % set boundary
-            x0                          = this.array2struct_wglobal(xCurr_ND,xCurr_global,fitting.modelParams, isGlobal);       % convert array back to structure for FWD function
-         
-            % compute likelihood at starting points
-            logP0   = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0, varargin{:})-y).^2, 1 ), x0.noise, Nm);
-        
+            xPosterior_ND     = zeros(NND, Nv, Nwalker, Ns, fitting.repetition,'single');
+            xPosterior_global = zeros(NGlobal, 1, Nwalker, Ns, fitting.repetition,'single');
+
+            % --- initialise walkers -------------------------------------------------
+            [xCurr_ND,~] = this.struct2array_wglobal(x0,fitting.modelParams);
+            % local: tight cloud around starting point
+            xCurr_ND     = xCurr_ND + (ub-lb)*fitting.startRange.*randn(size(ub));
+            xCurr_ND     = min(max(xCurr_ND,lb),ub);
+            % GLOBAL: OVER-DISPERSED across the full prior box. Ensemble samplers
+            % cannot manufacture spread a collapsed cloud lacks, and the global
+            % posterior is typically very tight (informed by all voxels), so a small
+            % cloud can get stuck. Over-dispersion contracts correctly; collapse does not.
+            xCurr_global = lb_global + (ub_global-lb_global).*rand(size(ub_global));
+            x0 = this.array2struct_wglobal(xCurr_ND,xCurr_global,fitting.modelParams,isGlobal);
+
+            logP0 = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0,varargin{:})-y).^2, 1 ), x0.noise, Nm);
+
             disp('-------------------------');
-            disp('MCMC optimisation process');
+            disp('MCMC optimisation process (block GW: local + global)');
             disp('-------------------------');
-        
+
             for ii = 1:fitting.repetition
-            fprintf('Repetition #%i/%i \n',ii,fitting.repetition)
-        
-            logPCurr= logP0;
-            % xCurr   = this.struct2array(x0,fitting.modelParams);
-            [xCurr_ND,xCurr_global]     = this.struct2array_wglobal(x0,fitting.modelParams);
-        
+                fprintf('Repetition #%i/%i \n',ii,fitting.repetition)
+    
+                logPCurr = logP0;
+                [xCurr_ND,xCurr_global] = this.struct2array_wglobal(x0,fitting.modelParams);
+
+            % optional global-only warmup (locals frozen) to settle the tight global block
+            for kw = 1:fitting.globalWarmup
+                [xCurr_global,logPCurr] = this.gw_global_block( ...
+                    xCurr_ND,xCurr_global,logPCurr,weights,y,Nm,Nv,Nwalker, ...
+                    StepSize,NGlobal,lb_global,ub_global,fitting,isGlobal,modelFWD,varargin{:});
+            end
+
             counter = 0; start = tic;
             for k = 1:fitting.iteration
-                % 1. make a proposal with normal distribution
-                % 1.1. find a unique partner for a walker k
-                partner         = this.find_partner(Nwalker);
-                % 1.2. stretch move
-                zz_ND           = ((StepSize-1)*rand(size(logP0),'like',xCurr_ND) + 1).^2 / StepSize;
-                zz_global       = ((StepSize-1)*rand(1,1,Nwalker,'like',xCurr_global) + 1).^2 / StepSize;
-                xProposed_ND    = xCurr_ND(:,:,partner) + (xCurr_ND - xCurr_ND(:,:,partner)).*zz_ND;
-                xProposed_global= xCurr_global(:,:,partner) + (xCurr_global - xCurr_global(:,:,partner)).*zz_global;
-                % find proposal that is out of bound for exclusion
-                isOutofbound_global = max(or(xProposed_global<lb_global, xProposed_global>ub_global),[],1);  
-                isOutofbound        = max(max(or(xProposed_ND<lb, xProposed_ND>ub),[],1), isOutofbound_global);   % combined
-                % replace boundary values so it does not give error when compting probability
-                xProposed_ND     = max(xProposed_ND,lb);            xProposed_ND        = min(xProposed_ND,ub);
-                xProposed_global = max(xProposed_global,lb_global); xProposed_global    = min(xProposed_global,ub_global);
-                % convert the proposal into structure array for FWD function
-                xProposed_struct = this.array2struct_wglobal(xProposed_ND,xProposed_global,fitting.modelParams, isGlobal);
-        
-                % 2. Metropolis sampling
-                % If the probability ratio of new to old > threshold, we take the new solution.
-                % 2.1 proposal probability
-                logPProposed                = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(xProposed_struct, varargin{:})-y).^2, 1 ), xProposed_struct.noise, Nm);
-                % 2.2 Compute acceptance ratio based on z^(Nd-1)*new/old probability
-                acceptanceRatio             = min(zz_ND.^(Nvar-1).*exp(logPProposed-logPCurr), 1);
-                % acceptanceRatio_ND          = min(zz_ND.^(NND-1).*exp(logPProposed-logPCurr), 1);
-                acceptanceRatioGlobal       = min(zz_global.^(Nvar-1).*exp(sum(logPProposed,2)-sum(logPCurr,2)), 1);   % summing all voxels
-                % acceptanceRatio             = min(acceptanceRatio_ND,acceptanceRatioGlobal);                                % combine both
-                isAccepted                  = acceptanceRatio > rand(1,Nv,Nwalker,'like',xCurr_ND);
-                isAccepted(isOutofbound)    = 0;    % reject out of bound proposal
-                isAcceptedGlobal            = acceptanceRatioGlobal > rand(1,1,Nwalker,'like',xProposed_global);
-                % isAcceptedGlobal            = min(mean(isAccepted,2)>0.5,isAcceptedGlobal);     % if the overall performance improve then take that, not optimal thought
-                isAcceptedGlobal(isOutofbound_global)= 0;    % reject out of bound proposal
-                % 2.3 update parameters
-                logPCurr(isAccepted)                = logPProposed(isAccepted);
-                xCurr_ND(:,isAccepted)              = xProposed_ND(:,isAccepted);           % not perfect
-                xCurr_global(:,isAcceptedGlobal)    = xProposed_global(:,isAcceptedGlobal); % not perfect
 
-                % 3. Maintain the independence between iterations
-                % 3.1 discard the first burnin*100% iterations
-                % 3.2 keep an iteration every N iterations
-                if ( k > Nburnin ) && mod(k-Nburnin+1, fitting.thinning) == 0 
+                % ============ LOCAL block (globals fixed) ============
+                if ~useRedBlack
+                    % --- simultaneous (default, original behaviour) ---
+                    partner  = this.find_partner(Nwalker);
+                    zz_ND    = ((StepSize-1)*rand(1,Nv,Nwalker,'like',xCurr_ND) + 1).^2 / StepSize;
+                    xProp_ND = xCurr_ND(:,:,partner) + (xCurr_ND - xCurr_ND(:,:,partner)).*zz_ND;
+                    oob_ND   = max(or(xProp_ND<lb, xProp_ND>ub),[],1);
+                    xProp_ND = min(max(xProp_ND,lb),ub);
+                    s_local  = this.array2struct_wglobal(xProp_ND, xCurr_global, fitting.modelParams, isGlobal);
+                    logP_loc = arrayfun(@logP_Gaussian, sum( weights.*(modelFWD(s_local,varargin{:})-y).^2, 1 ), s_local.noise, Nm);
+                    aR       = min( zz_ND.^(NND-1).*exp(logP_loc - logPCurr), 1);
+                    acc      = aR > rand(1,Nv,Nwalker,'like',xCurr_ND);
+                    acc(oob_ND) = 0;
+                    logPCurr(acc)   = logP_loc(acc);       % cache <- (new local, OLD global)
+                    xCurr_ND(:,acc) = xProp_ND(:,acc);
+                else
+                    % --- red-black: two sub-steps over walker halves ---
+                    for s = 1:2
+                        active = halfIdx{s}; frozen = halfIdx{3-s}; na = numel(active);
+                        pidx   = frozen(randi(numel(frozen),1,na));
+                        xAnch  = xCurr_ND(:,:,pidx); xAct = xCurr_ND(:,:,active);
+                        zz_ND  = ((StepSize-1)*rand(1,Nv,na,'like',xCurr_ND) + 1).^2 / StepSize;
+                        xProp  = xAnch + (xAct - xAnch).*zz_ND;
+                        lb_a   = lb(:,:,active); ub_a = ub(:,:,active);
+                        isOOB  = max(or(xProp<lb_a, xProp>ub_a),[],1);
+                        xProp  = min(max(xProp,lb_a),ub_a);
+                        % eval at (new local active, OLD global active) -- globals fixed this block
+                        s_loc  = this.array2struct_wglobal(xProp, xCurr_global(:,:,active), fitting.modelParams, isGlobal);
+                        logP_loc = arrayfun(@logP_Gaussian, sum( weights(:,:,active).*(modelFWD(s_loc,varargin{:})-y).^2, 1 ), s_loc.noise, Nm);
+                        logPAct  = logPCurr(:,:,active);
+                        aR       = min( zz_ND.^(NND-1).*exp(logP_loc - logPAct), 1);
+                        acc      = aR > rand(1,Nv,na,'like',xCurr_ND); acc(isOOB) = 0;
+                        xAct(:,acc)  = xProp(:,acc);
+                        logPAct(acc) = logP_loc(acc);
+                        xCurr_ND(:,:,active)    = xAct;
+                        logPCurr(:,:,active)    = logPAct;
+                    end
+                end
+
+                % ============ GLOBAL block (locals fixed at updated values) ============
+                [xCurr_global,logPCurr] = this.gw_global_block( ...
+                    xCurr_ND,xCurr_global,logPCurr,weights,y,Nm,Nv,Nwalker, ...
+                    StepSize,NGlobal,lb_global,ub_global,fitting,isGlobal,modelFWD,varargin{:});
+
+                % thinning / burn-in
+                if ( k > Nburnin ) && mod(k-Nburnin+1, fitting.thinning) == 0
                     counter = counter+1;
                     xPosterior_ND(:,:,:,counter,ii)     = gather(xCurr_ND);
                     xPosterior_global(:,:,:,counter,ii) = gather(xCurr_global);
                 end
-        
-                % display message at 1000 ietration and every 2000 iterations
+
                 if mod(k,fitting.iteration/50) == 0 || k == min(1e2, fitting.iteration/100)
                     ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
                     ERT = ET / (k/fitting.iteration) - ET;
@@ -520,12 +570,59 @@ classdef mcmc < handle
             end
             end
 
-            % convert final posterior distribution into structure
             xPosterior = this.array2struct_wglobal(xPosterior_ND,xPosterior_global,fitting.modelParams,isGlobal);
             for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
 
-            disp('The affine-invariant ensemble MCMC sampling is completed.')
-        
+            disp('The block affine-invariant ensemble MCMC sampling is completed.')
+
+        end
+
+        % ---- GLOBAL block: one GW stretch update of phi, locals held fixed -------
+        function [xCurr_global,logPCurr] = gw_global_block(this, ...
+                xCurr_ND,xCurr_global,logPCurr,weights,y,Nm,Nv,Nwalker, ...
+                StepSize,NGlobal,lb_global,ub_global,fitting,isGlobal,modelFWD,varargin)
+
+            useRedBlack = strcmpi(fitting.Ensembleupdate,'redblack');
+            if ~useRedBlack
+                % --- simultaneous (default, original behaviour) ---
+                partner = this.find_partner(Nwalker);
+                zz_g    = ((StepSize-1)*rand(1,1,Nwalker,'like',xCurr_global) + 1).^2 / StepSize;
+                gProp   = xCurr_global(:,:,partner) + (xCurr_global - xCurr_global(:,:,partner)).*zz_g;
+                oob_g   = max(or(gProp<lb_global, gProp>ub_global),[],1);
+                gProp   = min(max(gProp,lb_global),ub_global);
+                s_glob  = this.array2struct_wglobal(xCurr_ND, gProp, fitting.modelParams, isGlobal);
+                logP_g  = arrayfun(@logP_Gaussian, sum( weights.*(modelFWD(s_glob,varargin{:})-y).^2, 1 ), s_glob.noise, Nm);
+                dlogP   = sum( double(logP_g - logPCurr), 2 );
+                aR_g    = min( zz_g.^(NGlobal-1).*exp(dlogP), 1 );
+                acc_g   = aR_g > rand(1,1,Nwalker,'like',xCurr_global);
+                acc_g(oob_g) = 0; acc_g = logical(acc_g);
+                xCurr_global(:,:,acc_g) = gProp(:,:,acc_g);
+                logPCurr(:,:,acc_g)     = logP_g(:,:,acc_g);
+            else
+                % --- red-black: two sub-steps over walker halves ---
+                h_g = floor(Nwalker/2); halfIdx_g = {1:h_g, h_g+1:Nwalker};
+                for s = 1:2
+                    active = halfIdx_g{s}; frozen = halfIdx_g{3-s}; na = numel(active);
+                    pidx   = frozen(randi(numel(frozen),1,na));
+                    xg_act = xCurr_global(:,:,active);
+                    zz_g   = ((StepSize-1)*rand(1,1,na,'like',xCurr_global) + 1).^2 / StepSize;
+                    gProp  = xCurr_global(:,:,pidx) + (xg_act - xCurr_global(:,:,pidx)).*zz_g;
+                    oob_g  = max(or(gProp<lb_global, gProp>ub_global),[],1);
+                    gProp  = min(max(gProp,lb_global),ub_global);
+                    % eval at (current local active, new global active) -- locals fixed this block
+                    s_glob = this.array2struct_wglobal(xCurr_ND(:,:,active), gProp, fitting.modelParams, isGlobal);
+                    logP_g = arrayfun(@logP_Gaussian, sum( weights(:,:,active).*(modelFWD(s_glob,varargin{:})-y).^2, 1 ), s_glob.noise, Nm);
+                    lp_act = logPCurr(:,:,active);
+                    dlogP  = sum( double(logP_g - lp_act), 2 );    % [1,1,na], double
+                    aR_g   = min( zz_g.^(NGlobal-1).*exp(dlogP), 1 );
+                    acc_g  = aR_g > rand(1,1,na,'like',xCurr_global);
+                    acc_g(oob_g) = 0; acc_g = logical(acc_g);
+                    xg_act(:,:,acc_g)  = gProp(:,:,acc_g);
+                    lp_act(:,:,acc_g)  = logP_g(:,:,acc_g);
+                    xCurr_global(:,:,active) = xg_act;
+                    logPCurr(:,:,active)     = lp_act;
+                end
+            end
         end
 
     end
@@ -565,6 +662,7 @@ classdef mcmc < handle
 
             % --- choose ensemble update scheme (default = original behaviour) ----
             if ~isfield(fitting,'Ensembleupdate');      fitting2.Ensembleupdate  = 'simultaneous';  end
+            if ~isfield(fitting,'globalWarmup');        fitting2.globalWarmup   = 0;          end
 
             if any(ismember(fitting2.metric,'mode'))
                 if ~isfield(fitting,'Nbin');            fitting2.Nbin     = 1001;                end 
@@ -592,8 +690,8 @@ classdef mcmc < handle
             disp(['Thinning          : ', num2str(fitting.thinning)]);
             disp(['Burn-in (#iter.)  : '  num2str(mcmc.get_number_burnin(fitting))])
             disp(['Metric(s)         : ', cell2str(fitting.metric)]);
-            if strcmpi( fitting.algorithm, 'gw'); disp(['Step size         : ', num2str(fitting.StepSize) ]); end
-            if strcmpi( fitting.algorithm, 'gw'); disp(['No. of walkers    : ', num2str(fitting.Nwalker) ]); end
+            if strcmpi( fitting.algorithm, 'ensemble'); disp(['Step size         : ', num2str(fitting.StepSize) ]); end
+            if strcmpi( fitting.algorithm, 'ensemble'); disp(['No. of walkers    : ', num2str(fitting.Nwalker) ]); end
 
         end
         

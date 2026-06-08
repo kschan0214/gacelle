@@ -317,6 +317,108 @@ classdef utils < handle
             end
         end
 
+        %%%%%% Memory management
+
+        function [sliceBoundaries,NSegment] = find_optimal_segment_3D(modelObj, data, mask, fitting, varargin)
+        % modelObj : the model object (e.g. gpuMCRMWI, gpuJointR1R2starMapping)
+        %            must implement: fit_probe, slice_segment, fit_segment, postprocess_segments
+
+        % if nargin < 4; safetyFactor = 1; end
+            safetyFactor = 1;
+
+            gpu = gpuDevice; reset(gpu);
+
+            Nvoxel    = nnz(mask);
+            probeSize = round(logspace(2, 3, 5)) * 2;
+        
+            if fitting.autoMemManage && Nvoxel > max(probeSize)
+        
+                fprintf('Checking GPU memory requirements...\n');
+                memUsage = nan(1, numel(probeSize));
+        
+                for kp = 1:numel(probeSize)
+                    mask_probe                  = zeros(size(mask));
+                    mask_probe(1:probeSize(kp)) = 1;
+                    fitting_probe               = fitting;
+                    fitting_probe.iteration     = 0;
+                    fitting_probe.start         = 'default';
+        
+                    logFile   = strcat(tempname, '_gacelle_probe.csv');
+                    cmd       = sprintf('nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 5 > %s &', logFile);
+                    system(cmd);
+                    [~, pidStr] = system('pgrep -n nvidia-smi');
+                    nvidiaPID   = strtrim(pidStr);
+        
+                    try
+                        % modelObj passed explicitly - no 'this' needed
+                        [~, ~] = evalc('modelObj.fit(data, mask_probe, fitting_probe, varargin{:})');
+                    catch ME
+                        system(sprintf('kill %s 2>/dev/null', nvidiaPID));
+                        if isfile(logFile); delete(logFile); end
+                        if contains(ME.message, 'out of memory', 'IgnoreCase', true)
+                            warning('GACELLE:probeOOM', 'OOM at probe size %d', probeSize(kp));
+                            continue
+                        else
+                            rethrow(ME);
+                        end
+                    end
+        
+                    system(sprintf('kill %s 2>/dev/null', nvidiaPID));
+                    pause(0.1);
+        
+                    memUsage(kp) = utils.read_peak_from_log(logFile) / 1024;
+                    fprintf('  Probe %d/%d (N=%4d voxels): peak = %.0f MiB\n', ...
+                        kp, numel(probeSize), probeSize(kp), memUsage(kp)*1024);
+        
+                    if isfile(logFile); delete(logFile); end
+                end
+        
+                % [sliceBoundaries, NSegment] = utils.find_optimal_segment_3D(mask, probeSize, memUsage);
+
+                coef        = polyfit(probeSize, memUsage,1);
+                memPred     = polyval(coef, Nvoxel);
+                slope       = coef(1);                     % GB per voxel
+                intercept   = coef(2);                     % GB fixed overhead
+    
+                % Available memory with safety margin
+                memAvail      = gpu.AvailableMemory / 1024^3 * safetyFactor;  % GB
+    
+                if gpu.AvailableMemory/(1024^3) < memPred
+                    warning('GACELLE:memoryWarning', ...
+                            'Predicted memory (%.2f GB) exceeds 100%% of available GPU memory (%.2f GB). Segmenting data.', ...
+                            memPred, memAvail);
+    
+                    % Solve for max voxels per segment:
+                    % slope * NvoxPerSeg + intercept <= memAvail
+                    NvoxPerSeg = floor((memAvail - intercept) / slope);
+    
+                    if NvoxPerSeg <= 0
+                        error('GACELLE:memoryError', ...
+                              'Insufficient GPU memory even for a single segment. Predicted fixed overhead (%.2f GB) already exceeds available memory (%.2f GB).', ...
+                              intercept, memAvail);
+                    end
+    
+                    % Build density-balanced slice boundaries
+                    % so each segment has <= NvoxPerSeg masked voxels
+                    sliceBoundaries = utils.build_balanced_boundaries(mask, NvoxPerSeg);
+                    NSegment        = numel(sliceBoundaries);
+                    fprintf('Data divided into %d segments (max %d voxels/segment)\n', NSegment, NvoxPerSeg);
+                    fprintf('The estimation will not be exactly the same as 1 segment.');
+    
+                else
+                    sliceBoundaries = {1:size(mask,3)};
+                    NSegment        = 1;
+                    fprintf('Full data fits in GPU memory (predicted %.2f GB / available %.2f GB)\n', ...
+                        memPred, memAvail/safetyFactor);
+                end
+            
+            else
+                sliceBoundaries = {1:size(mask, 3)};
+                NSegment        = 1;
+            end
+
+        end
+
         % TODO: determine how the dataset will be divided based on vailable memory in GPU
         function [NSegment,maxSlice] = find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel)
         % Input
@@ -358,6 +460,148 @@ classdef utils < handle
             end
         end
 
+        function boundaries = build_balanced_boundaries(mask, NvoxPerSeg)
+        % Divide slices into segments with approximately equal voxel counts,
+        % where each segment stays <= NvoxPerSeg masked voxels.
+        %
+        % Strategy: compute cumulative voxel count across slices, then find
+        % slice indices where cumulative count crosses multiples of the target
+        % per-segment count.
+        
+            sliceDensity = squeeze(sum(mask, [1 2]));   % [dims3 x 1]
+            dims3        = size(mask, 3);
+            totalVox     = sum(sliceDensity);
+        
+            % How many segments do we actually need?
+            NSegment     = ceil(totalVox / NvoxPerSeg);
+            targetPerSeg = totalVox / NSegment;          % equal voxel target per segment
+        
+            % Walk cumulative sum and cut when we cross each target boundary
+            cumVox     = cumsum(sliceDensity);
+            boundaries = cell(NSegment, 1);
+            segStart   = 1;
+        
+            for ks = 1:NSegment
+                if ks < NSegment
+                    % Find the slice where cumulative voxels first reaches this
+                    % segment's target, choosing the cut that minimises imbalance
+                    target    = ks * targetPerSeg;
+                    % Last slice before we exceed target
+                    below     = find(cumVox < target, 1, 'last');
+                    % First slice at or above target  
+                    above     = find(cumVox >= target, 1, 'first');
+        
+                    if isempty(below)
+                        % All slices exceed target - take just one slice
+                        segEnd = segStart;
+                    elseif isempty(above)
+                        segEnd = dims3;
+                    else
+                        % Pick whichever cut gives closer to targetPerSeg voxels
+                        vox_if_below = cumVox(below) - (ks-1)*targetPerSeg;
+                        vox_if_above = cumVox(above) - (ks-1)*targetPerSeg;
+                        if abs(vox_if_below - targetPerSeg) <= abs(vox_if_above - targetPerSeg)
+                            segEnd = below;
+                        else
+                            segEnd = above;
+                        end
+                    end
+                    % Guard: ensure we always make forward progress
+                    segEnd = max(segEnd, segStart);
+                else
+                    % Last segment takes whatever remains
+                    segEnd = dims3;
+                end
+        
+                boundaries{ks} = segStart:segEnd;
+                segStart       = segEnd + 1;
+            end
+        
+            % Remove any empty segments (can occur with very sparse masks)
+            boundaries = boundaries(~cellfun(@isempty, boundaries));
+        
+            % Diagnostic: report actual voxel counts per segment
+            fprintf('Segment voxel counts (target = %d per segment):\n', round(targetPerSeg));
+            for ks = 1:numel(boundaries)
+                slices   = boundaries{ks};
+                segVox   = sum(sliceDensity(slices));
+                fprintf('  Segment %d: slices %d-%d, %d voxels (%.1f%% of target)\n', ...
+                    ks, slices(1), slices(end), segVox, 100*segVox/targetPerSeg);
+            end
+        end
+        
+        function peak_MiB = read_peak_from_log(logFile)
+        % function peakDelta_MiB = read_peak_from_log(logFile)
+        % get the peak memory usage from nvidia-smi log file
+
+            try
+                attempts = 0;
+                while ~isfile(logFile) && attempts < 20
+                    pause(0.05);
+                    attempts = attempts + 1;
+                end
+        
+                T    = readtable(logFile, 'FileType', 'text', 'Delimiter', ',', ...
+                                 'VariableNamingRule', 'preserve');
+                vals = T{:,1};
+        
+                if ~isnumeric(vals)
+                    vals = str2double(erase(string(vals), ' MiB'));
+                end
+                vals = vals(~isnan(vals));
+        
+                if numel(vals) < 5
+                    warning('GACELLE:memoryLog', ...
+                        'Too few samples in log (%d) after reading %s.', numel(vals), logFile);
+                    peak_MiB = max(vals);
+                    return
+                end
+        
+                % --- Discard startup noise ---
+                % First 5% of samples may reflect nvidia-smi startup latency
+                % and fit initialisation transients rather than steady pre-fit state
+                nDiscard = max(2, round(0.05 * numel(vals)));
+                vals     = vals(nDiscard+1:end);
+        
+                if numel(vals) < 3
+                    warning('GACELLE:memoryLog', ...
+                        'Too few samples after discarding startup portion (%d remaining).', numel(vals));
+                    peak_MiB = max(vals);
+                    return
+                end
+        
+                % --- Baseline: median of next 10% after discarded portion ---
+                % Median is robust to any residual transients in the early window
+                nBaseline    = max(3, round(0.10 * numel(vals)));
+                baseline_MiB = median(vals(1:nBaseline));
+        
+                % --- Peak: maximum of remaining samples after baseline window ---
+                peak_MiB     = max(vals(nBaseline+1:end));
+        
+                % --- Delta: memory cost attributable to the fit ---
+                peakDelta_MiB = peak_MiB - baseline_MiB;
+        
+                if peakDelta_MiB < 0
+                    warning('GACELLE:memoryLog', ...
+                        'Negative delta (baseline=%.0f, peak=%.0f MiB). Background activity may be interfering.', ...
+                        baseline_MiB, peak_MiB);
+                    peakDelta_MiB = 0;
+                end
+        
+                fprintf('    [mem log] samples=%d, discarded=%d, baseline=%.0f MiB, peak=%.0f MiB, delta=%.0f MiB\n', ...
+                    numel(vals)+nDiscard, nDiscard, baseline_MiB, peak_MiB, peakDelta_MiB);
+        
+            catch ME
+                warning('GACELLE:memoryLog', 'Could not read log %s: %s', logFile, ME.message);
+                g             = gpuDevice;
+                peakDelta_MiB = (g.TotalMemory - g.FreeMemory) / 1024^2;
+            end
+        end
+        
+
+
+
+        %%%%%%%%%%%%%%%%%%%
         % compute masked statistics
         function val = min_masked(img,mask)
             if size(mask,ndims(mask)) ~= size(img,ndims(img))
@@ -391,41 +635,170 @@ classdef utils < handle
             val = numel(img(img~=0));
         end
 
-        % This function create a full out structure variable if the data is divided into multiple segments
-        function out = restore_segment_structure(out,out_tmp,slice,ksegment)
-        % Input
-        % ---------
-        % out       : askadam out structure final output 
-        % out_tmp   : temporary out structure of each segment
-        % slice     : slices where the segment belongs to
-        % ksegment  : current segment number
+        % % This function create a full out structure variable if the data is divided into multiple segments
+        % function out = restore_segment_structure(out,out_tmp,slice,ksegment)
+        % % Input
+        % % ---------
+        % % out       : askadam out structure final output 
+        % % out_tmp   : temporary out structure of each segment
+        % % slice     : slices where the segment belongs to
+        % % ksegment  : current segment number
+        % % 
         % 
+        %     % reformat out structure
+        %     fn1 = fieldnames(out_tmp);
+        %     for kfn1 = 1:numel(fn1)
+        %         fn2 = fieldnames(out_tmp.(fn1{kfn1}));
+        %         for kfn2 = 1:numel(fn2)
+        %             if isscalar(out_tmp.(fn1{kfn1}).(fn2{kfn2})) % scalar value
+        %                 out.(fn1{kfn1}).(fn2{kfn2})(ksegment) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+        %             else
+        %                 % image result
+        %                 try
+        %                     if ksegment == 1
+        %                         out.(fn1{kfn1}).(fn2{kfn2}) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+        %                     else
+        %                         out.(fn1{kfn1}).(fn2{kfn2})(:,:,slice,:,:) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+        %                     end
+        %                 catch
+        %                     if ksegment == 1
+        %                         out.(fn1{kfn1}).(fn2{kfn2}) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
+        %                     else
+        %                         out.(fn1{kfn1}).(fn2{kfn2}) = cat(1,out.(fn1{kfn1}).(fn2{kfn2}) ,out_tmp.(fn1{kfn1}).(fn2{kfn2}));
+        %                     end
+        %                 end
+        %             end
+        % 
+        %         end
+        %     end
+        % end
 
-            % reformat out structure
+        function out = restore_segment_structure(out, out_tmp, slice, ksegment)
+        % Restore segmented fitting output into a single output structure.
+        %
+        % Handles fields of any shape:
+        %   - Scalar         : collected into a vector across segments
+        %   - 3D image       : inserted at correct slice indices along dim 3
+        %   - ND image       : inserted at correct slice indices along dim 3
+        %   - 2D matrix      : concatenated along dim 2 (voxel dimension in askadam)
+        %   - 1D vector      : concatenated along dim 1
+        %   - Char/string    : kept from first segment only
+        %   - Nested struct  : recursed into (handles out.final, out.min, etc.)
+        
             fn1 = fieldnames(out_tmp);
             for kfn1 = 1:numel(fn1)
-                fn2 = fieldnames(out_tmp.(fn1{kfn1}));
-                for kfn2 = 1:numel(fn2)
-                    if isscalar(out_tmp.(fn1{kfn1}).(fn2{kfn2})) % scalar value
-                        out.(fn1{kfn1}).(fn2{kfn2})(ksegment) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
-                    else
-                        % image result
-                        try
-                            if ksegment == 1
-                                out.(fn1{kfn1}).(fn2{kfn2}) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
-                            else
-                                out.(fn1{kfn1}).(fn2{kfn2})(:,:,slice,:,:) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
-                            end
-                        catch
-                            if ksegment == 1
-                                out.(fn1{kfn1}).(fn2{kfn2}) = out_tmp.(fn1{kfn1}).(fn2{kfn2});
-                            else
-                                out.(fn1{kfn1}).(fn2{kfn2}) = cat(1,out.(fn1{kfn1}).(fn2{kfn2}) ,out_tmp.(fn1{kfn1}).(fn2{kfn2}));
-                            end
-                        end
+                field1 = fn1{kfn1};
+                val    = out_tmp.(field1);
+        
+                if isstruct(val)
+                    % Recurse one level (handles out.final.X, out.min.X, etc.)
+                    fn2 = fieldnames(val);
+                    for kfn2 = 1:numel(fn2)
+                        field2 = fn2{kfn2};
+                        out.(field1).(field2) = utils.restore_field( ...
+                            utils.get_field_safe(out, field1, field2), ...
+                            val.(field2), slice, ksegment);
                     end
-                        
+                else
+                    % Top-level non-struct field (e.g. out.mask)
+                    out.(field1) = utils.restore_field( ...
+                        utils.get_field_safe(out, field1), ...
+                        val, slice, ksegment);
                 end
+            end
+        end
+
+        function existing = get_field_safe(out, varargin)
+        % Safely retrieve a (possibly absent) field, returning [] if missing.
+            try
+                existing = out;
+                for k = 1:numel(varargin)
+                    existing = existing.(varargin{k});
+                end
+            catch
+                existing = [];
+            end
+        end
+        
+        function merged = restore_field(existing, new_val, slice, ksegment)
+        % Merge new_val from one segment into the existing accumulated value.
+        
+            % Non-numeric types: keep from first segment, ignore subsequent
+            if ischar(new_val) || isstring(new_val) || islogical(new_val) && isscalar(new_val)
+                if ksegment == 1
+                    merged = new_val;
+                else
+                    merged = existing;
+                end
+                return
+            end
+        
+            % Empty: pass through
+            if isempty(new_val)
+                merged = new_val;
+                return
+            end
+        
+            sz  = size(new_val);
+            nd  = ndims(new_val);
+        
+            % --- Scalar numeric ---
+            if isscalar(new_val)
+                % Accumulate one value per segment into a growing vector
+                if ksegment == 1
+                    merged = new_val;
+                else
+                    merged = [existing, new_val];
+                end
+                return
+            end
+        
+            % --- Spatially-indexed array: 3rd dim matches slice count ---
+            % This covers 3D, 4D, 5D parameter maps
+            if nd >= 3 && sz(3) == numel(slice)
+                if ksegment == 1
+                    % Pre-allocate full output on first segment using total slice info
+                    % We don't know total slices yet so just store; will expand later
+                    merged = new_val;
+                else
+                    % Insert at correct slice positions along dim 3
+                    % Works for any number of trailing dimensions
+                    idx                  = repmat({':'}, 1, nd);
+                    idx{3}               = slice;
+                    merged               = existing;
+                    merged(idx{:})       = new_val;
+                end
+                return
+            end
+        
+            % --- 2D matrix: rows=measurements, cols=voxels (askadam residual format) ---
+            if nd == 2 && sz(2) > 1
+                if ksegment == 1
+                    merged = new_val;
+                else
+                    merged = cat(2, existing, new_val);  % concatenate along voxel dim
+                end
+                return
+            end
+        
+            % --- 1D vector ---
+            if nd == 2 && sz(2) == 1
+                if ksegment == 1
+                    merged = new_val;
+                else
+                    merged = cat(1, existing, new_val);
+                end
+                return
+            end
+        
+            % --- Fallback: store from first segment, warn on subsequent ---
+            if ksegment == 1
+                merged = new_val;
+            else
+                warning('GACELLE:restoreSegment', ...
+                    'Cannot determine how to merge field of size [%s] along segments. Keeping first segment value.', ...
+                    num2str(sz));
+                merged = existing;
             end
         end
         

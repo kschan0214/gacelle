@@ -43,7 +43,7 @@ s       = s + randn(size(s)) .* noiseLv;
 
 %% askadam estimation
 fitting             = [];
-fitting.algorithm   = 'GW';
+fitting.algorithm   = 'Ensemble';
 fitting.Nwalker     = 50;
 fitting.StepSize    = 2;
 fitting.iteration   = 1e4;
