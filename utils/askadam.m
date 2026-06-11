@@ -38,8 +38,12 @@ classdef askadam < handle
         % loss_fidelity : loss associated with data fidelity (consistancy)
         % loss_reg      : loss associated with (TV) regularisation
 
+        if fitting.debug
             gpu        = gpuDevice;
             minGPUMem  = gpu.AvailableMemory;
+        else
+            minGPUMem = inf;
+        end
             
             % Obatin user forwsrd model function and regularisation function
             if ~iscell(userfuncCell)
@@ -107,7 +111,9 @@ classdef askadam < handle
                 end
             end
 
-            minGPUMem  = min(gpu.AvailableMemory,minGPUMem);
+            if fitting.debug
+                minGPUMem  = min(gpu.AvailableMemory,minGPUMem);
+            end
         end
 
         % askAdam optimisation loop
@@ -162,85 +168,70 @@ classdef askadam < handle
             data    = dlarray(data(:).',    'CB');
             weights = dlarray(weights(:).', 'CB');
 
-            % in I/O setup block, after weights is first constructed
-            weights_original = weights;  % preserve user-defined weights for robust convergence modulation
-
             %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
             %%%%%%%%%%%%%%%%%%%%%%%%%% 2. Initialisation %%%%%%%%%%%%%%%%%%%%%%%%%%
-            % check and set fitting default
+
+            % --- 2.1 Fitting settings ---
             fitting = this.check_set_default_basic(fitting);
             if numel(userfuncCell) > 1; fitting.defaultRegularisation = false; end
 
-            if fitting.isDisplay; lineLoss = this.setup_display; end
-            
-            % initiate starting points arrays
-            parameters = this.set_boundary01(this.initialise_parameter(dims,parameters,fitting,mask),fitting.enableComplex);    % the parameter maps here are normalised to [0,1] using their boundary values
+            % --- 2.2 Parameters ---
+            % normalise to [0,1] using parameter bounds
+            parameters = this.set_boundary01(this.initialise_parameter(dims, parameters, fitting, mask), fitting.enableComplex);
 
-            % clear cache before running everthing
+            % --- 2.3 Optimiser state ---
+            averageGrad   = []; averageSqGrad = []; vel           = [];
+
+            % --- 2.4 Accelerated function handle ---
             if fitting.debug;   accfun = @this.model_gradient ;
             else;               accfun = dlaccelerate(@this.model_gradient); clearCache(accfun); end
 
-            % initiate optimiser parameters
-            averageGrad = []; averageSqGrad = []; vel = [];
-
-            % parameter for gradient check
-            movingAvgFactor             = 0.9; % Moving average factor
-            movingAvgNorm               = []; %0; % Initialize moving average of gradient norms
-            epochsWithoutImprovement    = 0;
+            % --- 2.5 Starting point evaluation ---
+            % compute loss and residuals at initialisation for minLoss tracking and
+            % per-voxel loss history (robustConvergence)
+            [~, loss, loss_fidelity, loss_reg, residuals, minGPUMem] = dlfeval(accfun, parameters, data, mask, weights, fitting, userfuncCell, varargin{:});
             
-            % create buffer arrays
-            convergenceBuffer       = ones(fitting.convergenceWindow,1);
-            insepctInterval         = 5;  % interval to check loss on each voxel
-            NparamBuffer            = 5; kBuffer = 1;
-            parameterBuffer         = repmat({parameters},1,NparamBuffer);
+            loss                  = double(utils.dlarray2single(loss));
+            perVoxelLossInit      = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));  % [1 x Nvol], CPU
 
+            % --- 2.6 Minimum loss tracking ---
+            minLoss               = loss;
+            minLossFidelity       = utils.dlarray2single(loss_fidelity);
+            minLossRegularisation = utils.dlarray2single(loss_reg);
+            minResiduals          = residuals;
+            parameters_minLoss    = parameters;
+            minIteration          = 0;
+            epoch                 = 0;
 
-            % --- initialisation for convergence check
-            % compute the loss and residual at the starting point
-            [~,loss,loss_fidelity,loss_reg,residuals,minGPUMem] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:});
-            perVoxelLossInit        = extractdata(mean(reshape(residuals,Nmeas,Nvol),1)); % extract starting per-voxel loss (computed before loop from initial dlfeval)
-            loss                    = double(utils.dlarray2single(loss));
-            minLoss                 = loss;
-            minLossFidelity         = utils.dlarray2single(loss_fidelity);
-            minLossRegularisation   = utils.dlarray2single(loss_reg);
-            minResiduals            = residuals;
-            parameters_minLoss      = parameters;
-            minIteration            = 0;
-            epoch                   = 0;
-            ema_loss                = double(utils.dlarray2single(loss));  % in case for EMA model
-
-            % v1.1: convergence of step (parameters)
-            if fitting.convergenceStepTol > 0
-                parameters_prev              = parameters;
-                stepNorm_curr                = Inf;
-                epochsWithoutImprovementStep = 0;
-            end
-            % v1.1: convergence of gradient
-            if fitting.convergenceGradTol > 0
-                gradNorm_curr                = Inf;
-                epochsWithoutImprovementGrad = 0;
-            end
-            % v1.1: robust model that handles outliers
+            % --- 2.7 Convergence signal state ---
+            ema_loss                     = loss;
+            convergenceBuffer            = ones(fitting.convergenceWindow, 1);
+            epochsWithoutImprovementConv = 0;
+            stepNorm_curr                = Inf;
+            epochsWithoutImprovementStep = 0;
+            parameters_prev              = parameters;
+            gradNorm_curr                = Inf;
+            epochsWithoutImprovementGrad = 0;
+            
+            % --- 2.8 Robust convergence state ---
+            % mainMask, outlierFlagCount, perVoxelLossHistory always initialised
+            % so update_outlier_mask can be called unconditionally in the loop
+            mainMask            = true(1, Nvol);                    % [1 x Nvol], CPU
+            outlierFlagCount    = zeros(1, Nvol, 'single');         % [1 x Nvol], CPU
+            perVoxelLossHistory = [];                               % populated below if robustConvergence
+            weights_original    = weights;                          % always stored; used only if robustConvergence
+            
             if fitting.robustConvergence
-                
-                % rolling history initialised at starting loss
-                perVoxelLossHistory = repmat(perVoxelLossInit, fitting.outlierCheckWindow, 1);        % [outlierCheckWindow x Nvol], CPU
-                
-                % flag duration counter — zero means not currently flagged
-                outlierFlagCount    = zeros(1, Nvol, 'single');                                       % [1 x Nvol], CPU
-                
-                % initialise mainMask as all-true before first check
-                mainMask            = true(1, Nvol);                                                  % [1 x Nvol], CPU
-                
-                % preserve original user-defined weights for modulation
-                weights_original    = weights;
+                perVoxelLossHistory = repmat(perVoxelLossInit, fitting.outlierCheckWindow, 1);  % [outlierCheckWindow x Nvol], CPU
             end
-
-            % report max. memory usage
-            currFreeGPUMem  = min(gpu.AvailableMemory,minGPUMem);
-            currGPUMemUsage = (initFreeGPUMem - currFreeGPUMem ) / 1024^3;
-                      
+            % --- 2.9 GPU memory usage at initialisation ---
+            currFreeGPUMem  = min(gpu.AvailableMemory, minGPUMem);
+            currGPUMemUsage = (initFreeGPUMem - currFreeGPUMem) / 1024^3;
+            
+            % --- 2.10 Display ---
+            if fitting.isDisplay; lineLoss = this.setup_display; end
+            
             %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
             
             %%%%%%%%%%%%%%%%%%%%%%%%%% 3. Optimisation %%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -254,299 +245,38 @@ classdef askadam < handle
                 disp('----------------------');
 
                 for epoch = 1:fitting.iteration
-                    
-                    %%%%%%%%%%%%%%%%%%%% 3.1. Model evaluation module %%%%%%%%%%%%%%%%%%%%
-                    parameters = this.set_boundary01(parameters,fitting.enableComplex); % make sure the parameters are [0,1]
-                    
-                    [gradients,loss,loss_fidelity,loss_reg,residuals] = dlfeval(accfun,parameters,data,mask,weights,fitting,userfuncCell,varargin{:}); % Evaluate the model gradients and loss using dlfeval and the modelGradients function
-                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-                    % if fitting.debug; isNaNInf = this.check_nan_in_gradients(gradients, mask_idx); if isNaNInf; disp(num2str(epoch));end; end % DEBUG module
-                    
-                    %%%%%%%%%%%%%%%%%%%% 3.2. Stopping criteria module %%%%%%%%%%%%%%%%%%%%
-                    loss = double(utils.dlarray2single(loss)); % get loss
+                    %%%%%%%%%%%%%%%%%%%% 3.1. Forward pass %%%%%%%%%%%%%%%%%%%%
+                    [gradients, loss, loss_fidelity, loss_reg, residuals] = this.forward_pass(accfun, parameters, data, mask, weights, fitting, userfuncCell, varargin{:});
 
-                    % store the results with minimal loss
-                    if minLoss > loss
-                        minLoss                 = loss;
-                        minLossFidelity         = loss_fidelity;
-                        minLossRegularisation   = loss_reg;
-                        minResiduals            = residuals;
-                        parameters_minLoss      = parameters;
-                        minIteration            = epoch;
-                        
-                    end
+                    %%%%%%%%%%%%%%%%%%%% 3.2. Track minimum loss %%%%%%%%%%%%%%%%%%%%
+                    [minLoss, minLossFidelity, minLossRegularisation, minResiduals, parameters_minLoss, minIteration] = this.update_min_loss(loss, loss_fidelity, loss_reg, residuals, parameters, ...
+                                                                                                                            minLoss, minLossFidelity, minLossRegularisation, minResiduals, parameters_minLoss, minIteration, epoch);
 
-                    % --- Compute convergence check ---
-                    % Extracts per-voxel mean loss from residuals. The extractdata call breaks the autodiff graph intentionally — 
-                    % perVoxelLoss is a plain numeric array used for outlier classification, which is treated as a constant within 
-                    % each iteration. There is therefore a one-weightUpdateInterval lag between when a voxel improves and when it is reclassified.
-                    if fitting.robustConvergence
-                        perVoxelLoss = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
-                    end
+                    %%%%%%%%%%%%%%%%%%%% 3.3. Outlier detection and weight update %%%%%%%%%%%%%%%%%%%%
+                    [mainMask, weights, outlierFlagCount, perVoxelLossHistory] = this.update_outlier_mask(residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
+                                                                                                            perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting);
 
-                    % Updates the rolling loss history, then applies two independent criteria to classify outliers. 
-                    % A voxel must fail both criteria to be flagged. Once flagged, it remains downweighted for at least 
-                    % outlierMinFlagDuration checks even if it starts improving, giving the downweighting time to take effect before reassessment.
-                    if fitting.robustConvergence && mod(epoch, fitting.weightUpdateInterval) == 0
+                    %%%%%%%%%%%%%%%%%%%% 3.4. Convergence signals %%%%%%%%%%%%%%%%%%%%
+                    [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, ...
+                         epochsWithoutImprovementGrad, gradNorm_curr] = this.update_convergence_signals(loss, residuals, mainMask, Nmeas, Nvol, ...
+                                                                                                            parameters, parameters_prev, gradients, ema_loss, convergenceBuffer, ...
+                                                                                                            epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, ...
+                                                                                                            epochsWithoutImprovementGrad, gradNorm_curr, minLoss, epoch, fitting);
+                
+                    %%%%%%%%%%%%%%%%%%%% 3.5. Stopping check %%%%%%%%%%%%%%%%%%%%
+                    [doStop, stopMsg] = this.check_stopping(loss, epochsWithoutImprovementConv, epochsWithoutImprovementStep, epochsWithoutImprovementGrad, fitting);
+                    if doStop; fprintf(stopMsg); break; end
+                
+                    %%%%%%%%%%%%%%%%%%%% 3.6. Parameter update %%%%%%%%%%%%%%%%%%%%
+                    [parameters, averageGrad, averageSqGrad, vel, learningRate] = ...
+                        this.update_parameters(parameters, gradients, averageGrad, averageSqGrad, vel, epoch, fitting);
+                
+                    %%%%%%%%%%%%%%%%%%%% 3.7. Verbose output %%%%%%%%%%%%%%%%%%%%
+                    if fitting.isDisplay; this.add_point_to_display(lineLoss,epoch,loss,start); end     % plot loss 
+                    this.print_verbose(epoch, loss, loss_fidelity, loss_reg, learningRate, convergenceCurr, epochsWithoutImprovementConv, mainMask, Nvol, ...
+                                            stepNorm_curr, epochsWithoutImprovementStep, gradNorm_curr, epochsWithoutImprovementGrad, fitting, start);
 
-                        % --- update rolling loss history ---
-                        % shift window: drop oldest check, append current
-                        perVoxelLossHistory = [perVoxelLossHistory(2:end, :); perVoxelLoss];  % [outlierCheckWindow x Nvol]
-                    
-                        % --- criterion A: stagnation relative to population over last N checks ---
-                        % improvement = fractional reduction from oldest to newest in window
-                        voxelImprovementA  = (perVoxelLossHistory(1,:) - perVoxelLossHistory(end,:)) ./ (perVoxelLossHistory(1,:) + 1e-8);
-                        medianImprovementA = median(voxelImprovementA);
-                    
-                        failA = voxelImprovementA < fitting.outlierVoxelThres & ...  % voxel improved less than X%
-                                medianImprovementA > fitting.outlierPopThres;        % while median improved more than Y%
-                    
-                        % --- criterion B: stagnation relative to own initialisation loss ---
-                        voxelImprovementB  = (perVoxelLossInit - perVoxelLoss) ./ (perVoxelLossInit + 1e-8);
-                        medianImprovementB = median(voxelImprovementB);
-                    
-                        failB = voxelImprovementB < fitting.outlierInitThres & ...   % voxel improved less than 5% from init
-                                medianImprovementB > fitting.outlierInitPopThres;    % while median improved more than 20% from init
-                    
-                        % --- classify outliers: must fail both criteria ---
-                        newOutliers = failA & failB;
-                    
-                        % --- update flag duration counter ---
-                        % increment counter for newly or persistently flagged voxels
-                        outlierFlagCount(newOutliers)  = outlierFlagCount(newOutliers) + 1;
-                        % decrement counter for voxels that no longer meet outlier criteria
-                        outlierFlagCount(~newOutliers) = max(outlierFlagCount(~newOutliers) - 1, 0);
-                    
-                        % --- enforce minimum flag duration ---
-                        % a voxel remains flagged until its counter drops to zero
-                        mainMask = outlierFlagCount == 0;
-                    
-                        % --- modulate original weights ---
-                        outlierModulator            = ones(1, Nvol, 'single');
-                        outlierModulator(~mainMask) = fitting.outlierWeight;
-                        outlierModulator            = repmat(outlierModulator, Nmeas, 1);
-                        weights                     = weights_original .* dlarray(gpuArray(outlierModulator(:).'), 'CB');
-                    end
-
-                    % Update convergence value
-                    if fitting.robustConvergence
-                        loss_main = mean(perVoxelLoss(mainMask));
-                    
-                        switch fitting.convergenceModel
-                            case 'ema'
-                                [ema_loss, convergenceCurr] = this.update_convergence_ema(loss_main, ema_loss, fitting.emaDecay);
-                            case 'linear'
-                                [convergenceCurr, convergenceBuffer] = this.update_convergence([convergenceBuffer(2:end); loss_main]);
-                        end
-                    else
-                        switch fitting.convergenceModel
-                            case 'ema'
-                                [ema_loss, convergenceCurr] = this.update_convergence_ema(loss, ema_loss, fitting.emaDecay);
-                            case 'linear'
-                                [convergenceCurr, convergenceBuffer] = this.update_convergence([convergenceBuffer(2:end); loss]);
-                        end
-                    end
-
-                    % compute convergence of step
-                    if fitting.convergenceStepTol > 0
-                        stepNorm_num = 0;
-                        stepNorm_den = 0;
-                        for k = 1:numel(fitting.modelParams)
-                            delta        = parameters.(fitting.modelParams{k}) - parameters_prev.(fitting.modelParams{k});
-                            stepNorm_num = stepNorm_num + sum(abs(extractdata(delta(:))).^2);
-                            stepNorm_den = stepNorm_den + sum(abs(extractdata(parameters.(fitting.modelParams{k})(:))).^2);
-                        end
-                        stepNorm_curr   = sqrt(stepNorm_num) / (1 + sqrt(stepNorm_den));
-                        parameters_prev = parameters;
-                    end
-                    % compute convergence of gradient
-                    if fitting.convergenceGradTol > 0
-                        gradNorm_curr = 0;
-                        fields        = fieldnames(gradients);
-                        for k = 1:numel(fields)
-                            gradNorm_curr = gradNorm_curr + gather(sum(abs(gradients.(fields{k})(:)).^2, 'all'));
-                        end
-                        gradNorm_curr = sqrt(gradNorm_curr);
-                    end
-                    
-                    % check if there is any global improvement
-                    if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
-                        
-                        epochsWithoutImprovement = 0; % when global loss gradient > tolerance, -> improving, then reset epochsWithoutImprovement
-
-                    elseif (minLoss - loss) > fitting.convergenceValue 
-                        
-                        epochsWithoutImprovement = 0; % if the current loss is smaller than the minimum loss by the convergenceValue then suppose it's improving so can reset
-                    else
-                        epochsWithoutImprovement = epochsWithoutImprovement + 1;
-                    end
-
-                    % check if there is any improvement on step
-                    if fitting.convergenceStepTol > 0
-                        if stepNorm_curr < fitting.convergenceStepTol
-                            epochsWithoutImprovementStep = epochsWithoutImprovementStep + 1;
-                        else
-                            epochsWithoutImprovementStep = 0;
-                        end
-                    end
-
-                    % check if there is any improvement on gradient
-                    if fitting.convergenceGradTol > 0
-                        if gradNorm_curr < fitting.convergenceGradTol
-                            epochsWithoutImprovementGrad = epochsWithoutImprovementGrad + 1;
-                        else
-                            epochsWithoutImprovementGrad = 0;
-                        end
-                    end
-                    
-                    % --- actual stopping check here ---
-                    % check if the optimisation should be stopped
-                    % existing loss convergence
-                    if epochsWithoutImprovement > fitting.patienceConvergence
-                        if fitting.robustConvergence
-                            fprintf('Optimisation is done. Main population loss convergence below tolerance %e (patience %d).\n', ...
-                                fitting.convergenceValue, fitting.patienceConvergence);
-                        else
-                            fprintf('Optimisation is done. Loss convergence below tolerance %e (patience %d).\n', ...
-                                fitting.convergenceValue, fitting.patienceConvergence);
-                        end
-                        break
-                    end
-                    
-                    % step norm
-                    if fitting.convergenceStepTol > 0 && epochsWithoutImprovementStep > fitting.patienceStep
-                        fprintf('Optimisation is done. Step norm below tolerance %e (patience %d).\n', ...
-                            fitting.convergenceStepTol, fitting.patienceStep);
-                        break
-                    end
-                    
-                    % gradient norm
-                    if fitting.convergenceGradTol > 0 && epochsWithoutImprovementGrad > fitting.patienceGrad
-                        fprintf('Optimisation is done. Gradient norm below tolerance %e (patience %d).\n', ...
-                            fitting.convergenceGradTol, fitting.patienceGrad);
-                        break
-                    end
-                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-                    % deprecated, will be removed in future update
-                    %%%%%%%%%%%%%%%%%%%% 3.3 Individual sample consistency module %%%%%%%%%%%%%%%%%%%%
-                    if fitting.isClipGradient
-
-                        % clipping gradients to avoid sudden big jumps
-                        [gradients, movingAvgNorm] = this.adaptive_gradient_clipping(gradients, mask_idx, movingAvgNorm, movingAvgFactor, fitting.maxGradientThres); % gradientThreshold = 1; gradients = this.clip_gradients(gradients, mask, gradientThreshold);
-    
-                    end
-                    % deprecated
-                    if fitting.isSampleConsistency
-                        
-                        % preparing buffer
-                        if kBuffer < NparamBuffer
-                            % compute loss on each voxel and compare to previous loss
-                            perVoxelLoss         = extractdata(mean(reshape(residuals,Nmeas,Nvol),1));
-                            maskNoImprove   = perVoxelLoss > perVoxelLossInit;
-                            for kf = 1:numel(fitting.modelParams)
-                                % replace the no-improvement voxel with previous position
-                                parameters.(fitting.modelParams{kf})(maskNoImprove) = parameterBuffer{kBuffer}.(fitting.modelParams{kf})(maskNoImprove);
-                            end
-                            % update loss
-                            perVoxelLoss(maskNoImprove)  = perVoxelLossInit(maskNoImprove);
-                            perVoxelLossInit                = perVoxelLoss;   
-                            % update buffer
-                            parameterBuffer(1:end-1) = parameterBuffer(2:end); parameterBuffer(end) = {parameters};
-                            kBuffer = kBuffer + 1;
-                        end
-
-
-                        % check if the loss of the each voxel gets improved every 5 iterations
-                        if mod(epoch,insepctInterval) == 0 
-
-                            % once we have sufficient short term memory, check if the fitting actually improving the loss
-                            if epoch > insepctInterval*NparamBuffer && epoch < fitting.iteration
-
-                                % compute loss on each voxel and compare to previous loss
-                                perVoxelLoss         = extractdata(mean(reshape(residuals,Nmeas,Nvol),1));
-                                maskNoImprove   = perVoxelLoss > perVoxelLossInit;
-    
-                                for kf = 1:numel(fitting.modelParams)
-                                    % draw a random number
-                                    n = randi(NparamBuffer);  
-                                    % replace the no-improvement voxel with one of those in the buffer for restart
-                                    parameters.(fitting.modelParams{kf})(maskNoImprove) = parameterBuffer{n}.(fitting.modelParams{kf})(maskNoImprove);
-                                end
-                                % update loss
-                                perVoxelLossInit = perVoxelLoss;          
-
-                                 % update buffer
-                                parameterBuffer(1:end-1) = parameterBuffer(2:end); parameterBuffer(end) = {parameters};
-                            end
-                        end
-                    end
-                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    
-                    %%%%%%%%%%%%%%%%%%%% 3.4. Parameter update module %%%%%%%%%%%%%%%%%%%%
-                    % Update learning rate
-                    learningRate = this.update_learn_rate(fitting.initialLearnRate,fitting.decayRate, epoch); 
-                    % Update the network parameters using the one of the following optimisers
-                    if epoch < fitting.iteration
-                        switch lower(fitting.optimiser)
-                            case 'adam'
-                                [parameters,averageGrad,averageSqGrad]  = adamupdate(parameters,gradients,averageGrad, ...
-                                                                                        averageSqGrad,epoch,learningRate,fitting.adamupdateGradDecay,fitting.adamupdateSqGradDecay,fitting.adamupdateEpsilon);
-                            case 'sgdm'
-                                [parameters,vel]                        = sgdmupdate(parameters,gradients,vel, ...
-                                                                                        learningRate,fitting.sgdmupdateMomentum);
-                            case 'rmsprop'
-                                [parameters,averageSqGrad]              = rmspropupdate(parameters,gradients,averageSqGrad, ...
-                                                                                        learningRate,fitting.rmspropupdateSqGradDecay,fitting.rmspropupdateEpsilon);
-                        end
-                    end
-                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-                    % 
-                    % if fitting.isDisplay; this.add_point_to_display(lineLoss,epoch,loss,start); end % DEBUG module
-                    % 
-                    % %%%%%%%%%%%%%%%%%%%% verbose module %%%%%%%%%%%%%%%%%%%%
-                    if mod(epoch,100) == 0 || epoch == 1
-                        D = duration(0,0,toc(start),'Format','hh:mm:ss');
-                        
-                        % --- base message, always reported ---
-                        msg = sprintf('Iteration #%4d | Loss = %.3e (fidelity = %.3e, reg = %.3e) | LR = %.3e', ...
-                            epoch, loss, loss_fidelity, loss_reg, learningRate);
-                        
-                        % --- convergence signal: loss-based ---
-                        % label differs depending on whether robustConvergence is active
-                        if fitting.robustConvergence
-                            msg = [msg sprintf(' | Conv (main, n=%d) = %.3e [patience %d/%d]', ...
-                                sum(mainMask), convergenceCurr, epochsWithoutImprovement, fitting.patienceConvergence)];
-                        else
-                            msg = [msg sprintf(' | Conv = %.3e [patience %d/%d]', ...
-                                convergenceCurr, epochsWithoutImprovement, fitting.patienceConvergence)];
-                        end
-                        
-                        % --- outlier count: only if robustConvergence active ---
-                        if fitting.robustConvergence
-                            msg = [msg sprintf(' | Outliers = %d/%d', sum(~mainMask), Nvol)];
-                        end
-                        
-                        % --- step norm: only if enabled ---
-                        if fitting.convergenceStepTol > 0
-                            msg = [msg sprintf(' | Step = %.3e [patience %d/%d]', ...
-                                stepNorm_curr, epochsWithoutImprovementStep, fitting.patienceStep)];
-                        end
-                        
-                        % --- gradient norm: only if enabled ---
-                        if fitting.convergenceGradTol > 0
-                            msg = [msg sprintf(' | Grad = %.3e [patience %d/%d]', ...
-                                gradNorm_curr, epochsWithoutImprovementGrad, fitting.patienceGrad)];
-                        end
-                        
-                        % --- elapsed time, always last ---
-                        msg = [msg sprintf(' | Elapsed: %s\n', string(D))];
-                        
-                        fprintf(msg);
-                    end
-                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-                    
                 end
             end
             %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -638,6 +368,311 @@ classdef askadam < handle
    
     end
 
+    methods (Access = private)
+
+        function [gradients, loss, loss_fidelity, loss_reg, residuals] = forward_pass(this, accfun, parameters, data, mask, weights, fitting, userfuncCell, varargin)
+            % Evaluate forward model, compute loss and gradients via autodiff.
+            % Parameters are clipped to [0,1] before evaluation to enforce bounds.
+
+            parameters = this.set_boundary01(parameters, fitting.enableComplex);
+
+            [gradients, loss, loss_fidelity, loss_reg, residuals] = dlfeval(accfun, parameters, data, mask, weights, fitting, userfuncCell, varargin{:});
+
+            loss = double(utils.dlarray2single(loss));
+        end
+
+        function [minLoss, minLossFidelity, minLossRegularisation, minResiduals, parameters_minLoss, minIteration] = update_min_loss(~, loss, loss_fidelity, loss_reg, residuals, parameters, ...
+                                                                                                                                        minLoss, minLossFidelity, minLossRegularisation, minResiduals, parameters_minLoss, minIteration, epoch)
+            % Track the parameter set corresponding to the minimum loss seen so far.
+            % This guards against oscillation near convergence — the minimum loss
+            % result is returned alongside the final iteration result.
+            if minLoss > loss
+                minLoss               = loss;
+                minLossFidelity       = loss_fidelity;
+                minLossRegularisation = loss_reg;
+                minResiduals          = residuals;
+                parameters_minLoss    = parameters;
+                minIteration          = epoch;
+            end
+        end
+
+        function [mainMask, weights, outlierFlagCount, perVoxelLossHistory] = update_outlier_mask(~, residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
+                                                                                                    perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting)
+            % Detect outlier voxels based on improvement behaviour over time and
+            % downweight their gradient contribution. Only active when
+            % fitting.robustConvergence = true.
+            %
+            % Criterion A: voxel has not improved by outlierVoxelThres over last
+            %              outlierCheckWindow checks, while median has improved by outlierPopThres
+            % Criterion B: voxel has not improved by outlierInitThres from initialisation,
+            %              while median has improved by outlierInitPopThres
+            %
+            % A voxel must fail both criteria to be flagged. Once flagged it remains
+            % downweighted for at least outlierMinFlagDuration checks before reassessment.
+            % Outlier classification lags by one weightUpdateInterval — this is intentional
+            % since extractdata breaks the autodiff graph.
+        
+            % pass through defaults — returned unchanged if robustConvergence is false
+            % or if weightUpdateInterval has not been reached
+            % weights is reassigned below only when outlier mask is updated
+            weights = weights_original;
+
+            if ~fitting.robustConvergence
+                return
+            end
+        
+            perVoxelLoss = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
+        
+            if mod(epoch, fitting.weightUpdateInterval) == 0
+        
+                % shift rolling history window: drop oldest, append current
+                perVoxelLossHistory = [perVoxelLossHistory(2:end, :); perVoxelLoss];
+        
+                % criterion A: stagnation relative to population over last N checks
+                voxelImprovementA  = (perVoxelLossHistory(1,:) - perVoxelLossHistory(end,:)) ./ (perVoxelLossHistory(1,:) + 1e-8);
+                medianImprovementA = median(voxelImprovementA);
+                failA = voxelImprovementA < fitting.outlierVoxelThres & ...
+                        medianImprovementA  > fitting.outlierPopThres;
+        
+                % criterion B: stagnation relative to own initialisation loss
+                voxelImprovementB  = (perVoxelLossInit - perVoxelLoss) ./ (perVoxelLossInit + 1e-8);
+                medianImprovementB = median(voxelImprovementB);
+                failB = voxelImprovementB < fitting.outlierInitThres & ...
+                        medianImprovementB  > fitting.outlierInitPopThres;
+        
+                % must fail both criteria to be classified as outlier
+                newOutliers = failA & failB;
+        
+                % increment counter for flagged voxels, decrement for recovered ones
+                outlierFlagCount(newOutliers)  = outlierFlagCount(newOutliers) + 1;
+                outlierFlagCount(~newOutliers) = max(outlierFlagCount(~newOutliers) - 1, 0);
+        
+                % voxel remains flagged until counter drops to zero (minimum flag duration)
+                mainMask = outlierFlagCount == 0;
+        
+                % modulate original user-defined weights multiplicatively
+                % preserves relative SNR weighting within both populations
+                outlierModulator            = ones(1, Nvol, 'single');
+                outlierModulator(~mainMask) = fitting.outlierWeight;
+                outlierModulator            = repmat(outlierModulator, Nmeas, 1);
+                weights = weights_original .* dlarray(gpuArray(outlierModulator(:).'), 'CB');
+            end
+        end
+
+        function [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovement, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, epochsWithoutImprovementGrad, gradNorm_curr] = update_convergence_signals(~, loss, residuals, mainMask, Nmeas, Nvol, ...
+                                                                                                                                                                                                                                    parameters, parameters_prev, gradients, ema_loss, convergenceBuffer, ...
+                                                                                                                                                                                                                                    epochsWithoutImprovement, epochsWithoutImprovementStep, stepNorm_curr, ...
+                                                                                                                                                                                                                                    epochsWithoutImprovementGrad, gradNorm_curr, minLoss, epoch, fitting)
+            % Compute all active convergence signals and update their patience counters.
+            %
+            % Signal 1 (always active): loss-based convergence via linear slope or EMA,
+            %   computed on main population loss if robustConvergence, else global loss.
+            % Signal 2 (optional): relative parameter step norm, analogous to StepTolerance
+            %   in lsqnonlin. Active when fitting.convergenceStepTol > 0.
+            % Signal 3 (optional): raw gradient norm before Adam correction.
+            %   Active when fitting.convergenceGradTol > 0.
+        
+            % --- signal 1: loss-based ---
+            if fitting.robustConvergence
+                perVoxelLoss     = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
+                loss_convergence = mean(perVoxelLoss(mainMask));
+            else
+                loss_convergence = loss;
+            end
+        
+            switch fitting.convergenceModel
+                case 'ema'
+                    [ema_loss, convergenceCurr] = askadam.update_convergence_ema(loss_convergence, ema_loss, fitting.emaDecay);
+                case 'linear'
+                    [convergenceCurr, convergenceBuffer] = askadam.update_convergence([convergenceBuffer(2:end); loss_convergence]);
+            end
+        
+            if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
+                epochsWithoutImprovement = 0;
+            elseif (minLoss - loss) > fitting.convergenceValue
+                epochsWithoutImprovement = 0;
+            else
+                epochsWithoutImprovement = epochsWithoutImprovement + 1;
+            end
+        
+            % --- signal 2: step norm ---
+            if fitting.convergenceStepTol > 0
+                stepNorm_num = 0;
+                stepNorm_den = 0;
+                for k = 1:numel(fitting.modelParams)
+                    delta        = parameters.(fitting.modelParams{k}) - parameters_prev.(fitting.modelParams{k});
+                    stepNorm_num = stepNorm_num + gather(sum(abs(delta(:)).^2, 'all'));
+                    stepNorm_den = stepNorm_den + gather(sum(abs(parameters.(fitting.modelParams{k})(:)).^2, 'all'));
+                end
+                stepNorm_curr   = sqrt(stepNorm_num) / (1 + sqrt(stepNorm_den));
+                parameters_prev = parameters;
+        
+                if stepNorm_curr < fitting.convergenceStepTol
+                    epochsWithoutImprovementStep = epochsWithoutImprovementStep + 1;
+                else
+                    epochsWithoutImprovementStep = 0;
+                end
+            end
+        
+            % --- signal 3: gradient norm ---
+            if fitting.convergenceGradTol > 0
+                gradNorm_curr = 0;
+                fields        = fieldnames(gradients);
+                for k = 1:numel(fields)
+                    gradNorm_curr = gradNorm_curr + gather(sum(abs(gradients.(fields{k})(:)).^2, 'all'));
+                end
+                gradNorm_curr = sqrt(gradNorm_curr);
+        
+                if gradNorm_curr < fitting.convergenceGradTol
+                    epochsWithoutImprovementGrad = epochsWithoutImprovementGrad + 1;
+                else
+                    epochsWithoutImprovementGrad = 0;
+                end
+            end
+        end
+
+        function [doStop, stopMsg] = check_stopping(~, loss, epochsWithoutImprovement, ...
+                epochsWithoutImprovementStep, epochsWithoutImprovementGrad, fitting)
+            % Check all stopping criteria and return a flag and message.
+            % Criteria are checked in order: loss convergence, loss tolerance,
+            % step norm, gradient norm.
+            doStop  = false;
+            stopMsg = '';
+        
+            % loss convergence
+            if epochsWithoutImprovement > fitting.patienceConvergence
+                doStop = true;
+                if fitting.robustConvergence
+                    stopMsg = sprintf('Optimisation is done. Main population loss convergence below tolerance %e (patience %d).\n', ...
+                        fitting.convergenceValue, fitting.patienceConvergence);
+                else
+                    stopMsg = sprintf('Optimisation is done. Loss convergence below tolerance %e (patience %d).\n', ...
+                        fitting.convergenceValue, fitting.patienceConvergence);
+                end
+                return
+            end
+        
+            % loss tolerance
+            if loss < fitting.tol
+                doStop  = true;
+                stopMsg = sprintf('Optimisation is done. Loss is less than the tolerance %e.\n', fitting.tol);
+                return
+            end
+        
+            % step norm
+            if fitting.convergenceStepTol > 0 && epochsWithoutImprovementStep > fitting.patienceStep
+                doStop  = true;
+                stopMsg = sprintf('Optimisation is done. Step norm below tolerance %e (patience %d).\n', ...
+                    fitting.convergenceStepTol, fitting.patienceStep);
+                return
+            end
+        
+            % gradient norm
+            if fitting.convergenceGradTol > 0 && epochsWithoutImprovementGrad > fitting.patienceGrad
+                doStop  = true;
+                stopMsg = sprintf('Optimisation is done. Gradient norm below tolerance %e (patience %d).\n', ...
+                    fitting.convergenceGradTol, fitting.patienceGrad);
+                return
+            end
+        end
+
+        function [parameters, averageGrad, averageSqGrad, vel, learningRate] = update_parameters(~, parameters, gradients, averageGrad, averageSqGrad, vel, epoch, fitting)
+            
+            learningRate = askadam.update_learn_rate(fitting.initialLearnRate, fitting.decayRate, epoch);
+            
+            if epoch < fitting.iteration
+                switch lower(fitting.optimiser)
+                    case 'adam'
+                        [parameters, averageGrad, averageSqGrad] = adamupdate(parameters, gradients, ...
+                            averageGrad, averageSqGrad, epoch, learningRate, ...
+                            fitting.adamupdateGradDecay, fitting.adamupdateSqGradDecay, fitting.adamupdateEpsilon);
+                    case 'sgdm'
+                        [parameters, vel] = sgdmupdate(parameters, gradients, vel, ...
+                            learningRate, fitting.sgdmupdateMomentum);
+                    case 'rmsprop'
+                        [parameters, averageSqGrad] = rmspropupdate(parameters, gradients, averageSqGrad, ...
+                            learningRate, fitting.rmspropupdateSqGradDecay, fitting.rmspropupdateEpsilon);
+                end
+            end
+        end
+
+        function [parameters, gradients, movingAvgNorm, parameterBuffer, kBuffer, perVoxelLossInit] = run_deprecated(this, parameters, gradients, residuals, perVoxelLossInit, ...
+                parameterBuffer, kBuffer, NparamBuffer, movingAvgNorm, movingAvgFactor, ...
+                mask_idx, Nmeas, Nvol, epoch, fitting)
+            % Deprecated features kept for backward compatibility.
+            % Will be removed in v1.2.
+        
+            if fitting.isClipGradient
+                [gradients, movingAvgNorm] = this.adaptive_gradient_clipping(gradients, mask_idx, ...
+                    movingAvgNorm, movingAvgFactor, fitting.maxGradientThres);
+            end
+        
+            if fitting.isSampleConsistency
+                if kBuffer < NparamBuffer
+                    perVoxelLoss_sc            = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
+                    maskNoImprove              = perVoxelLoss_sc > perVoxelLossInit;
+                    for kf = 1:numel(fitting.modelParams)
+                        parameters.(fitting.modelParams{kf})(maskNoImprove) = ...
+                            parameterBuffer{kBuffer}.(fitting.modelParams{kf})(maskNoImprove);
+                    end
+                    perVoxelLoss_sc(maskNoImprove) = perVoxelLossInit(maskNoImprove);
+                    perVoxelLossInit               = perVoxelLoss_sc;
+                    parameterBuffer(1:end-1)       = parameterBuffer(2:end);
+                    parameterBuffer(end)           = {parameters};
+                    kBuffer                        = kBuffer + 1;
+                end
+        
+                if mod(epoch, 5) == 0 && epoch > 5*NparamBuffer && epoch < fitting.iteration
+                    perVoxelLoss_sc          = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
+                    maskNoImprove            = perVoxelLoss_sc > perVoxelLossInit;
+                    for kf = 1:numel(fitting.modelParams)
+                        n = randi(NparamBuffer);
+                        parameters.(fitting.modelParams{kf})(maskNoImprove) = ...
+                            parameterBuffer{n}.(fitting.modelParams{kf})(maskNoImprove);
+                    end
+                    perVoxelLossInit         = perVoxelLoss_sc;
+                    parameterBuffer(1:end-1) = parameterBuffer(2:end);
+                    parameterBuffer(end)     = {parameters};
+                end
+            end
+        end
+
+        function print_verbose(~, epoch, loss, loss_fidelity, loss_reg, learningRate, ...
+                convergenceCurr, epochsWithoutImprovement, mainMask, Nvol, ...
+                stepNorm_curr, epochsWithoutImprovementStep, ...
+                gradNorm_curr, epochsWithoutImprovementGrad, fitting, start)
+            % Print iteration status. Reported fields depend on which features are active.
+            if mod(epoch, 100) ~= 0 && epoch ~= 1; return; end
+        
+            D   = duration(0, 0, toc(start), 'Format', 'hh:mm:ss');
+            msg = sprintf('Iteration #%4d | Loss = %.3e (fidelity = %.3e, reg = %.3e) | LR = %.3e', ...
+                epoch, loss, loss_fidelity, loss_reg, learningRate);
+        
+            if fitting.robustConvergence
+                msg = [msg sprintf(' | Conv (main, n=%d) = %.3e [patience %d/%d]', ...
+                    sum(mainMask), convergenceCurr, epochsWithoutImprovement, fitting.patienceConvergence)];
+                msg = [msg sprintf(' | Outliers = %d/%d', sum(~mainMask), Nvol)];
+            else
+                msg = [msg sprintf(' | Conv = %.3e [patience %d/%d]', ...
+                    convergenceCurr, epochsWithoutImprovement, fitting.patienceConvergence)];
+            end
+        
+            if fitting.convergenceStepTol > 0
+                msg = [msg sprintf(' | Step = %.3e [patience %d/%d]', ...
+                    stepNorm_curr, epochsWithoutImprovementStep, fitting.patienceStep)];
+            end
+        
+            if fitting.convergenceGradTol > 0
+                msg = [msg sprintf(' | Grad = %.3e [patience %d/%d]', ...
+                    gradNorm_curr, epochsWithoutImprovementGrad, fitting.patienceGrad)];
+            end
+        
+            msg = [msg sprintf(' | Elapsed: %s\n', string(D))];
+            fprintf(msg);
+        end
+    
+    end
+
     methods(Static)
 
         %% misc.
@@ -661,159 +696,235 @@ classdef askadam < handle
         %   .display            : online display the fitting process on figure, true|false, defualt = false
         %   .isPrior            : Estimation of the starting points, default = true
         % 
-            fitting2 = fitting;
+            fitting2                        = fitting; % copy existing parameter to final output
+            fitting2.defaultRegularisation  = true;
 
-            fitting2.defaultRegularisation = true;
-
-            % get fitting algorithm setting
-            if ~isfield(fitting,'iteration');           fitting2.iteration = 4000;              end     % stopping criteria
-            if isfield(fitting,'Nepoch');               fitting2.iteration = fitting.Nepoch; fitting2 = rmfield(fitting2,'Nepoch'); end % legacy
-            if ~isfield(fitting,'initialLearnRate');    fitting2.initialLearnRate   = 0.001;    end
-            if ~isfield(fitting,'decayRate');           fitting2.decayRate          = 0;        end
-            if ~isfield(fitting,'optimiser');           fitting2.optimiser          = 'adam';   end
-            if ~isfield(fitting,'lossFunction');        fitting2.lossFunction       = 'L1';     end
-            if ~isfield(fitting,'tol');                 fitting2.tol                = 1e-3;     end     % stopping criteria
-            if ~isfield(fitting,'convergenceValue');    fitting2.convergenceValue   = 1e-8;     end     % stopping criteria
-            if ~isfield(fitting,'convergenceWindow');   fitting2.convergenceWindow  = 20;       end     % stopping criteria
-            if ~isfield(fitting,'patience');            fitting2.patience           = 5;        end     % stopping criteria
-            if ~isfield(fitting,'lambda');              fitting2.lambda             = {0};      end     % built-in regularisation
-            if ~isfield(fitting,'TVmode');              fitting2.TVmode             = '2D';     end     % built-in regularisation
-            if ~isfield(fitting,'regmap');              fitting2.regmap             = [];       end     % built-in regularisation
-            if ~isfield(fitting,'voxelSize');           fitting2.voxelSize          = [2,2,2];  end     % built-in regularisation
-            if ~isfield(fitting,'randomness');          fitting2.randomness         = 0;        end     % starting point
-            if ~isfield(fitting,'outputFilename');      fitting2.outputFilename     = [];       end
-            if ~isfield(fitting,'ub');                  fitting2.ub                 = [];       end
-            if ~isfield(fitting,'lb');                  fitting2.lb                 = [];       end
-            if ~isfield(fitting,'debug');               fitting2.debug              = false;    end
-            if ~isfield(fitting,'isDisplay');           fitting2.isDisplay          = 0;        end
-            if ~isfield(fitting,'isSampleConsistency'); fitting2.isSampleConsistency= false;    end
-            if ~isfield(fitting,'isClipGradient');      fitting2.isClipGradient     = 0;        end
-            if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres   = 1;        end
-            if ~isfield(fitting,'enableComplex');       fitting2.enableComplex      = true;     end
-            if ~isfield(fitting,'isOptimiseMemory');    fitting2.isOptimiseMemory   = true;     end    
-            if ~isfield(fitting,'autoMemManage');       fitting2.autoMemManage      = true;     end    
-
-            % v1.1 new convergence mode
-            if ~isfield(fitting,'convergenceModel');    fitting2.convergenceModel  = 'linear';  end    % 'linear" | 'ema'
-            if ~isfield(fitting, 'emaDecay');           fitting2.emaDecay           = 0.95;     end
-
-            % v1.1: outlier handling
-            if ~isfield(fitting, 'robustConvergence');       fitting2.robustConvergence = false;  end
-            if ~isfield(fitting, 'outlierThresholdMethod');  fitting2.outlierThresholdMethod = 'behaviour'; end  % only option for now, placeholder for future
-            if ~isfield(fitting, 'outlierWeight');           fitting2.outlierWeight = 0.1;        end
-            if ~isfield(fitting, 'weightUpdateInterval');    fitting2.weightUpdateInterval = 5;   end
-            if ~isfield(fitting, 'outlierCheckWindow');      fitting2.outlierCheckWindow = 5;     end  % number of checks for criterion A
-            if ~isfield(fitting, 'outlierMinFlagDuration');  fitting2.outlierMinFlagDuration = 5; end  % minimum checks before reinstatement
-            if ~isfield(fitting, 'outlierVoxelThres');       fitting2.outlierVoxelThres = 0.01;   end  % X=1%: voxel improvement threshold per check window
-            if ~isfield(fitting, 'outlierPopThres');         fitting2.outlierPopThres = 0.05;     end  % Y=5%: median population improvement threshold per check window
-            if ~isfield(fitting, 'outlierInitThres');        fitting2.outlierInitThres = 0.05;    end  % 5%: voxel improvement threshold from initialisation
-            if ~isfield(fitting, 'outlierInitPopThres');     fitting2.outlierInitPopThres = 0.20; end  % 20%: median population improvement threshold from initialisation
-            
-            % new convergence tolerence
-            if ~isfield(fitting, 'convergenceStepTol');     fitting2.convergenceStepTol = 0;     end  % 0 = disabled
-            if ~isfield(fitting, 'convergenceGradTol');     fitting2.convergenceGradTol = 0;    end  % 0 = disabled
-
-            if ~isfield(fitting, 'patience'); fitting2.patience = 5; end
-
-            if ~isfield(fitting, 'patienceConvergence'); fitting2.patienceConvergence = fitting2.patience; end
-            if ~isfield(fitting, 'patienceStep');        fitting2.patienceStep        = fitting2.patience; end
-            if ~isfield(fitting, 'patienceGrad');        fitting2.patienceGrad        = fitting2.patience; end
-
-            if ~iscell(fitting2.lambda);                fitting2.lambda = num2cell(fitting2.lambda); end
+            % =====================================================================
+            % Optimiser
+            % =====================================================================
+            if ~isfield(fitting,'optimiser');        fitting2.optimiser        = 'adam';    end
+            if ~isfield(fitting,'initialLearnRate'); fitting2.initialLearnRate = 0.001;     end
+            if ~isfield(fitting,'decayRate');        fitting2.decayRate        = 0;         end
+            if ~isfield(fitting,'enableComplex');    fitting2.enableComplex    = true;      end
+            if ~isfield(fitting,'randomness');       fitting2.randomness       = 0;         end % starting point
 
             switch fitting2.optimiser
                 case 'adam'
-                    if ~isfield(fitting,'adamupdateGradDecay');         fitting2.adamupdateGradDecay        = .9;    end
-                    if ~isfield(fitting,'adamupdateSqGradDecay');       fitting2.adamupdateSqGradDecay      = .999;  end
-                    if ~isfield(fitting,'adamupdateEpsilon');           fitting2.adamupdateEpsilon          = 1e-8;  end
+                    if ~isfield(fitting,'adamupdateGradDecay');         fitting2.adamupdateGradDecay        = 0.9;      end
+                    if ~isfield(fitting,'adamupdateSqGradDecay');       fitting2.adamupdateSqGradDecay      = 0.999;    end
+                    if ~isfield(fitting,'adamupdateEpsilon');           fitting2.adamupdateEpsilon          = 1e-8;     end
                 case 'sgdm'
-                    if ~isfield(fitting,'sgdmupdateMomentum');          fitting2.sgdmupdateMomentum         = .9;    end
+                    if ~isfield(fitting,'sgdmupdateMomentum');          fitting2.sgdmupdateMomentum         = 0.9;      end
                 case 'rmsprop'
-                    if ~isfield(fitting,'rmspropupdateSqGradDecay');    fitting2.rmspropupdateSqGradDecay   = .9;    end
-                    if ~isfield(fitting,'rmspropupdateEpsilon');        fitting2.rmspropupdateEpsilon       = 1e-8;  end
+                    if ~isfield(fitting,'rmspropupdateSqGradDecay');    fitting2.rmspropupdateSqGradDecay   = 0.9;      end
+                    if ~isfield(fitting,'rmspropupdateEpsilon');        fitting2.rmspropupdateEpsilon       = 1e-8;     end
+            end
+
+            % =====================================================================
+            % Loss function
+            % =====================================================================
+            if ~isfield(fitting,'lossFunction'); fitting2.lossFunction = 'L1'; end  % 'L1'|'L2'|'huber'|'mse'
+            if ~isfield(fitting,'tol');          fitting2.tol          = 1e-3; end  % stop if loss < tol
+
+            % =====================================================================
+            % Basic stopping criteria (iteration and loss convergence)
+            % =====================================================================
+            if ~isfield(fitting,'iteration');           fitting2.iteration              = 4000;                 end    % max. iteration
+            if ~isfield(fitting,'convergenceValue');    fitting2.convergenceValue       = 1e-8;                 end    % convergence tolerance
+            if ~isfield(fitting,'patience');            fitting2.patience               = 5;                    end    % shared default for all patience counters
+            if ~isfield(fitting,'patienceConvergence'); fitting2.patienceConvergence    = fitting2.patience;    end
+
+            % legacy field support
+            if isfield(fitting,'Nepoch');               fitting2.iteration = fitting.Nepoch; fitting2 = rmfield(fitting2,'Nepoch'); end
+
+            % =====================================================================
+            % Convergence model (v1.1)
+            % Controls how the convergence signal is computed from the loss
+            % 'linear' : slope of loss over last convergenceWindow iterations (default)
+            % 'ema'    : relative change in exponential moving average of loss
+            % =====================================================================
+            if ~isfield(fitting,'convergenceModel');  fitting2.convergenceModel  = 'linear'; end
+            if ~isfield(fitting,'convergenceWindow'); fitting2.convergenceWindow = 20;       end  % used by 'linear' model
+            if ~isfield(fitting,'emaDecay');          fitting2.emaDecay          = 0.95;     end  % used by 'ema' model
+
+            % =====================================================================
+            % Robust convergence / outlier handling (v1.1)
+            % Detects voxels that are not improving relative to the population and
+            % downweights their gradient contribution. Convergence signal is computed
+            % on the main (non-outlier) population only.
+            % =====================================================================
+            if ~isfield(fitting,'robustConvergence');      fitting2.robustConvergence      = false;        end
+            if ~isfield(fitting,'outlierThresholdMethod'); fitting2.outlierThresholdMethod = 'behaviour';  end  % placeholder for future options
+            if ~isfield(fitting,'outlierWeight');          fitting2.outlierWeight          = 0.1;          end  % gradient contribution of outlier voxels
+            if ~isfield(fitting,'weightUpdateInterval');   fitting2.weightUpdateInterval   = 5;            end  % iterations between outlier mask updates
+            if ~isfield(fitting,'outlierCheckWindow');     fitting2.outlierCheckWindow     = 5;            end  % number of checks for criterion A
+            if ~isfield(fitting,'outlierMinFlagDuration'); fitting2.outlierMinFlagDuration = 5;            end  % minimum checks before reinstatement
+            if ~isfield(fitting,'outlierVoxelThres');      fitting2.outlierVoxelThres      = 0.01;         end  % criterion A: voxel improvement threshold per check window (1%)
+            if ~isfield(fitting,'outlierPopThres');        fitting2.outlierPopThres        = 0.05;         end  % criterion A: median population improvement threshold (5%)
+            if ~isfield(fitting,'outlierInitThres');       fitting2.outlierInitThres       = 0.05;         end  % criterion B: voxel improvement threshold from initialisation (5%)
+            if ~isfield(fitting,'outlierInitPopThres');    fitting2.outlierInitPopThres    = 0.20;         end  % criterion B: median population improvement threshold from initialisation (20%)
+
+            % =====================================================================
+            % Additional convergence signals (v1.1)
+            % Independent of robustConvergence. Disabled by default (value = 0).
+            % =====================================================================
+            if ~isfield(fitting,'convergenceStepTol'); fitting2.convergenceStepTol = 0;                 end  % relative parameter step norm; 0 = disabled
+            if ~isfield(fitting,'convergenceGradTol'); fitting2.convergenceGradTol = 0;                 end  % gradient norm; 0 = disabled
+            if ~isfield(fitting,'patienceStep');       fitting2.patienceStep       = fitting2.patience; end
+            if ~isfield(fitting,'patienceGrad');       fitting2.patienceGrad       = fitting2.patience; end
+
+            % =====================================================================
+            % Regularisation
+            % =====================================================================
+            if ~isfield(fitting,'lambda');    fitting2.lambda    = {0};                 end  % regularisation weight; 0 = no regularisation
+            if ~isfield(fitting,'TVmode');    fitting2.TVmode    = '2D';                end  % '2D'|'3D'
+            if ~isfield(fitting,'regmap');    fitting2.regmap    = [];                  end  % parameter map(s) to regularise
+            if ~isfield(fitting,'voxelSize'); fitting2.voxelSize = [2,2,2];             end  % voxel size in mm
+            
+            if ~iscell(fitting2.lambda); fitting2.lambda = num2cell(fitting2.lambda);   end
+
+            % =====================================================================
+            % Memory management
+            % =====================================================================
+            if ~isfield(fitting,'isOptimiseMemory'); fitting2.isOptimiseMemory = true; end
+            if ~isfield(fitting,'autoMemManage');    fitting2.autoMemManage    = true; end
+
+            % =====================================================================
+            % Miscellaneous
+            % =====================================================================
+            if ~isfield(fitting,'outputFilename'); fitting2.outputFilename = [];        end
+            if ~isfield(fitting,'ub');             fitting2.ub             = [];        end
+            if ~isfield(fitting,'lb');             fitting2.lb             = [];        end
+            if ~isfield(fitting,'debug');          fitting2.debug          = false;     end
+            if ~isfield(fitting,'isDisplay');      fitting2.isDisplay      = 0;     end
+            
+            % =====================================================================
+            % Deprecated (kept for backward compatibility, will be removed in v1.2)
+            % =====================================================================
+            if ~isfield(fitting,'isSampleConsistency'); fitting2.isSampleConsistency = false; end
+            if ~isfield(fitting,'isClipGradient');      fitting2.isClipGradient      = 0;     end
+            if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres    = 1;     end
+
+            if fitting2.isSampleConsistency
+                warning('askadam:deprecated', 'isSampleConsistency is deprecated and will be removed in v1.2.');
+            end
+            if fitting2.isClipGradient
+                warning('askadam:deprecated', 'isClipGradient is deprecated and will be removed in v1.2.');
             end
             
         end
 
-        % display fitting algorithm parameters
         function display_basic_fitting_parameters(fitting)
-            % display optimisation algorithm parameters
+            % Display all active fitting algorithm parameters at the start of optimisation.
+            % Sections mirror check_set_default_basic for consistency.
+            
             disp('============================');
             disp('AskAdam algorithm parameters');
             disp('============================');
-            disp('Optimisation setup');
-            disp('------------------');
-            disp(['Optimiser                = ' num2str(fitting.optimiser)]);
-            disp(['Initial learning rate    = ' num2str(fitting.initialLearnRate)]);
-            disp(['Learning rate decay rate = ' num2str( fitting.decayRate)]);
-            disp(['Max. #iterations         = ' num2str(fitting.iteration)]);
-            disp(['Allow complex-valued?    = ' utils.logical2string(fitting.enableComplex)]);
-
-            disp('--------------------------');
-            disp('Loss and stopping criteria');
-            disp('--------------------------');
+            
+            % --- Optimiser ---
+            disp('Optimiser');
+            disp('---------');
+            disp(['Optimiser                    = ' fitting.optimiser]);
+            disp(['Initial learning rate        = ' num2str(fitting.initialLearnRate)]);
+            disp(['Learning rate decay rate     = ' num2str(fitting.decayRate)]);
+            disp(['Allow complex-valued         = ' utils.logical2string(fitting.enableComplex)]);
+            disp(['Random initialisation        = ' num2str(fitting.randomness)]);
+            
+            switch lower(fitting.optimiser)
+                case 'adam'
+                    disp(['Adam grad decay              = ' num2str(fitting.adamupdateGradDecay)]);
+                    disp(['Adam sq grad decay           = ' num2str(fitting.adamupdateSqGradDecay)]);
+                    disp(['Adam epsilon                 = ' num2str(fitting.adamupdateEpsilon)]);
+                case 'sgdm'
+                    disp(['SGDM momentum                = ' num2str(fitting.sgdmupdateMomentum)]);
+                case 'rmsprop'
+                    disp(['RMSProp sq grad decay        = ' num2str(fitting.rmspropupdateSqGradDecay)]);
+                    disp(['RMSProp epsilon              = ' num2str(fitting.rmspropupdateEpsilon)]);
+            end
+            
+            % --- Loss function ---
+            disp(' ');
+            disp('Loss function');
+            disp('------------');
             disp(['Loss function                = ' fitting.lossFunction]);
             disp(['Loss tolerance               = ' num2str(fitting.tol)]);
+            
+            % --- Basic stopping criteria ---
+            disp(' ');
+            disp('Basic stopping criteria');
+            disp('-----------------------');
+            disp(['Max. iterations              = ' num2str(fitting.iteration)]);
             disp(['Convergence tolerance        = ' num2str(fitting.convergenceValue)]);
             disp(['Patience (convergence)       = ' num2str(fitting.patienceConvergence)]);
             
-            % --- convergence model ---
+            % --- Convergence model ---
+            disp(' ');
+            disp('Convergence model');
+            disp('-----------------');
             disp(['Convergence model            = ' fitting.convergenceModel]);
-            if strcmp(fitting.convergenceModel, 'ema')
-                disp(['EMA decay                    = ' num2str(fitting.emaDecay)]);
-            else
-                disp(['Convergence buffer size      = ' num2str(fitting.convergenceWindow)]);
+            switch fitting.convergenceModel
+                case 'linear'
+                    disp(['Convergence buffer size      = ' num2str(fitting.convergenceWindow)]);
+                case 'ema'
+                    disp(['EMA decay                    = ' num2str(fitting.emaDecay)]);
             end
             
-            % --- robust convergence ---
+            % --- Robust convergence ---
+            disp(' ');
+            disp('Robust convergence');
+            disp('------------------');
             disp(['Robust convergence           = ' utils.logical2string(fitting.robustConvergence)]);
             if fitting.robustConvergence
                 disp(['  Outlier threshold method   = ' fitting.outlierThresholdMethod]);
-                if strcmp(fitting.outlierThresholdMethod, 'percentile')
-                    disp(['  Outlier percentile         = ' num2str(fitting.outlierPercentile)]);
-                end
                 disp(['  Outlier weight             = ' num2str(fitting.outlierWeight)]);
                 disp(['  Weight update interval     = ' num2str(fitting.weightUpdateInterval)]);
-                disp(['  Outlier     check window       = ' num2str(fitting.outlierCheckWindow)]);
-                disp(['  Outlier min flag duration  = ' num2str(fitting.outlierMinFlagDuration)]);
-                disp(['  Voxel improvement thres    = ' num2str(fitting.outlierVoxelThres)  ' (criterion A)']);
-                disp(['  Population improvement thres = ' num2str(fitting.outlierPopThres) ' (criterion A)']);
-                disp(['  Voxel init improvement thres = ' num2str(fitting.outlierInitThres) ' (criterion B)']);
-                disp(['  Population init thres      = ' num2str(fitting.outlierInitPopThres) ' (criterion B)']);
+                disp(['  Outlier check window       = ' num2str(fitting.outlierCheckWindow)]);
+                disp(['  Min flag duration          = ' num2str(fitting.outlierMinFlagDuration)]);
+                disp(['  Criterion A voxel thres    = ' num2str(fitting.outlierVoxelThres)]);
+                disp(['  Criterion A pop thres      = ' num2str(fitting.outlierPopThres)]);
+                disp(['  Criterion B voxel thres    = ' num2str(fitting.outlierInitThres)]);
+                disp(['  Criterion B pop thres      = ' num2str(fitting.outlierInitPopThres)]);
             end
             
-            % --- step norm ---
-            if fitting.convergenceStepTol > 0
-                disp(['Step norm tolerance          = ' num2str(fitting.convergenceStepTol)]);
-                disp(['Patience (step)              = ' num2str(fitting.patienceStep)]);
-            end
-            
-            % --- gradient norm ---
-            if fitting.convergenceGradTol > 0
-                disp(['Gradient norm tolerance      = ' num2str(fitting.convergenceGradTol)]);
-                disp(['Patience (gradient)          = ' num2str(fitting.patienceGrad)]);
-            end
-
-            if fitting.lambda{1} > 0 
-                disp(['Regularisation parameter(s) = ' cell2num2str(fitting.lambda)]);
-                if fitting.defaultRegularisation
-                    disp(['Regularisation Map(s)       = ' cell2str(fitting.regmap)]);
-                    disp(['Total variation mode        = ' fitting.TVmode]);
+            % --- Additional convergence signals ---
+            if fitting.convergenceStepTol > 0 || fitting.convergenceGradTol > 0
+                disp(' ');
+                disp('Additional convergence signals');
+                disp('------------------------------');
+                if fitting.convergenceStepTol > 0
+                    disp(['Step norm tolerance          = ' num2str(fitting.convergenceStepTol)]);
+                    disp(['Patience (step)              = ' num2str(fitting.patienceStep)]);
+                end
+                if fitting.convergenceGradTol > 0
+                    disp(['Gradient norm tolerance      = ' num2str(fitting.convergenceGradTol)]);
+                    disp(['Patience (gradient)          = ' num2str(fitting.patienceGrad)]);
                 end
             end
-
-            % disp('-----------------------------');
-            % disp('Individual sample consistency');
-            % disp('-----------------------------');
-            % disp(['Check sample consistency = ' utils.logical2string(fitting.isSampleConsistency)]);
-            % disp(['Clip gradients           = ' utils.logical2string(fitting.isClipGradient)]);
-            % if fitting.isClipGradient
-            %     disp(['Max. gradient threshold  = ' num2str( fitting.maxGradientThres)]);
-            % end
-            % disp('-----------------------------');
             
-        end
-
+            % --- Regularisation ---
+            if fitting.lambda{1} > 0
+                disp(' ');
+                disp('Regularisation');
+                disp('--------------');
+                disp(['Regularisation parameter(s)  = ' cell2num2str(fitting.lambda)]);
+                if fitting.defaultRegularisation
+                    disp(['Regularisation map(s)        = ' cell2str(fitting.regmap)]);
+                    disp(['Total variation mode         = ' fitting.TVmode]);
+                    disp(['Voxel size (mm)              = ' num2str(fitting.voxelSize)]);
+                end
+            end
+            
+            % --- Memory ---
+            disp(' ');
+            disp('Memory');
+            disp('------');
+            disp(['Optimise memory              = ' utils.logical2string(fitting.isOptimiseMemory)]);
+            disp(['Auto memory management       = ' utils.logical2string(fitting.autoMemManage)]);
+            
+            disp('============================');
+            end
+        
         % save the askadam output structure variable into disk space 
         function save_askadam_output(output_filename,out)
         % Input
@@ -880,7 +991,7 @@ classdef askadam < handle
 
         end
 
-        %% scalling tools
+        %% Scaling tools
 
         % undo rescale the network parameters between the defined lower/upper bounds
         function parameters = unscale_parameters(parameters,lb,ub,modelParams)
@@ -940,7 +1051,7 @@ classdef askadam < handle
 
         %% optmisation tools
 
-        % prevent to big of the step size due to exploding gradient
+        % (deprecated) prevent to big of the step size due to exploding gradient
         function gradients = clip_gradients(gradients, mask, threshold)
             % get field name
             fields = fieldnames(gradients);
@@ -956,7 +1067,7 @@ classdef askadam < handle
 
         end
 
-        % prevent to big of the step size due to exploding gradient
+        % (deprecated) prevent to big of the step size due to exploding gradient
         function [gradients, movingAvgNorm] = adaptive_gradient_clipping(gradients, mask, movingAvgNorm, movingAvgFactor, maxGradientThres)
 
             if nargin < 5
