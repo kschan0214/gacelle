@@ -1,11 +1,11 @@
-addpath(genpath('../../gacelle/'));
+addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/gacelle/'));
 clear;
 %% Simulate data
 
 % for reproducibility
 seed        = 23439; rng(seed); gpurng(seed);
 Nsample     = 1e3;  % #voxel
-SNR         = inf;
+SNR         = Inf;  % at b0
 
 % get current DWI protocol for simulation
 bval_sorted     = [2.3, 3.5, 4.8, 6.5, 2.3, 3.5, 4.8, 6.5, 11.0, 2.3, 3.5, 4.8, 6.5, 11.0, 17.5];
@@ -17,7 +17,6 @@ fa_range    = [0.1, 0.8];
 Da_range    = [1.5, 3];
 De_range    = [0.5, 1.5];
 p2_range    = [0.05, 0.5];
-% noise_range     = [0.01 0.05];
 
 % generate ground truth
 tex_GT  = single(rand(1,Nsample) * diff(tex_range) + min(tex_range));
@@ -34,18 +33,21 @@ pars.Da     = Da_GT;
 pars.De     = De_GT;
 pars.ra     = ra_GT;
 pars.p2     = p2_GT;
-objGPU      = gpuNEXImcmc(bval_sorted, BDELTA_sorted);
-s           = gather(objGPU.FWD(pars, lmax));
+objGPU      = gpuNEXI(bval_sorted, BDELTA_sorted);
+s           = objGPU.FWD(pars,lmax);
 
-% Let assume Gaussian noise to simplify everything
+% Let's assume Gaussian noise for simplicity
 noiseLv = 1/SNR;
 y       = s + randn(size(s)) .* noiseLv;
-y       = permute(y,[2 3 4 1]);
-mask    = ones(size(y,1:3));
+y       = permute(y,[3 2 4 1]);
+mask    = ones(size(y,1:3)) > 0;
 
-%% MCMC estimation
-fitting             = [];
-fitting.algorithm   = 'GW';
+%% askadam estimation
+rng(seed); gpurng(seed);
+
+fitting             = objGPU.check_set_default([]);
+fitting.solver      = 'mcmc';
+fitting.algorithm   = 'ensemble';
 fitting.Nwalker     = 50;
 fitting.StepSize    = 2;
 fitting.iteration   = 5e3;
@@ -56,8 +58,18 @@ fitting.lmax        = 2;
 fitting.start       = 'likelihood';     
 extraData           = [];
 
-objGPU  = gpuNEXImcmc(bval_sorted, BDELTA_sorted);
-out     = objGPU.estimate(y, mask, extraData, fitting);
+out   = objGPU.estimate(y, mask, extraData, fitting);
+
+%% make some plots
+% reset seed
+rng(seed); gpurng(seed);
+
+% get initial starting point based on likelihood method for scatter plots
+fitting.iteration   = 0;
+pars0               = objGPU.estimate(y, mask, [], fitting); 
+
+% get FWD signal based on fitted result
+shat = objGPU.FWD(out.median,fitting.lmax);
 
 %% plot result
 figure;

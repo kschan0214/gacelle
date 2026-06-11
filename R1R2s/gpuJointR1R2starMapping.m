@@ -4,16 +4,18 @@ classdef gpuJointR1R2starMapping < handle
 % kchan2@mgh.harvard.edu
 % Date created: 5 April 2024
 % Date modified: 25 September 2024
+% Date modified: 10 June 2026 (update memory manager, support MCMC under same script)
 
     properties
         % default model parameters and estimation boundary
         % M0    : Proton density weighted signal
         % R1    : (=1/T1) in s^-1
         % R2star: R2* in s^-1   
-        modelParams     = {'M0';'R1';'R2star'};
-        ub              = [  2;   10;  200];
-        lb              = [  0;  0.1;  0.1];
-        startPoint      = [   1;   1;  30];
+        modelParams    = {'M0';'R1';'R2star';'noise'};
+        ub              = [   2;  10;     200;    0.1];
+        lb              = [   0; 0.1;     0.1;  0.001];
+        startPoint      = [   1;   1;      30;   0.05];
+        step            = [0.01;0.01;       1;  0.005];
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -51,6 +53,21 @@ classdef gpuJointR1R2starMapping < handle
 
         end
 
+        % update properties according to lmax
+        function this = updateProperty(this, fitting)
+
+            % property change in related to solver
+            if ~strcmpi(fitting.solver,'mcmc')
+                idx = find(ismember(this.modelParams,'noise'));
+                this.modelParams(idx)       = [];
+                this.lb(idx)                = [];
+                this.ub(idx)                = [];
+                this.startPoint(idx)        = [];
+                this.step(idx)              = [];
+            end
+
+        end
+
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
         function  [out] = estimate(this, data, mask, extraData, fitting)
@@ -77,62 +94,62 @@ classdef gpuJointR1R2starMapping < handle
             this.display_data_model_info;
             
             % get all fitting algorithm parameters 
-            fitting             = this.check_set_default(fitting);
-
-            % get matrix size
-            dims = size(data,1:3);
-
-            % make sure input data are valid
-            [mask,extraData]    = this.validate_input(data,mask,extraData);
+            fitting                     = this.check_set_default(fitting);
 
             % normalised data if needed
-            [data, scaleFactor] = this.prepare_data(data,mask, extraData.b1);
-
-            % mask sure no nan or inf
-            [data,mask] = utils.remove_img_naninf(data,mask);
+            [data, mask, scaleFactor]   = this.prepare_data( data, mask, extraData);
 
             % convert datatype to single
             data    = single(data);
             mask    = mask > 0;
 
-            % determine if we need to divide the data to fit in GPU
-            g = gpuDevice; reset(g);
-            memoryFixPerVoxel       = 0.0013/3;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.05/3;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
+            
+            % --- [Experimental] estimate memory usage using a small batch of data size ---
+            % this method tends to be more conservative than the actual memory ussage
+            [sliceBoundaries,NSegment]  = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
 
             % parameter estimation
-            out     = [];
-            for ks = 1:NSegment
-
-                fprintf('Running #Segment = %d/%d \n',ks,NSegment);
-                disp   ('------------------------')
-    
-                % determine slice# given a segment
-                if ks ~= NSegment
-                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
-                else
-                    slice = 1+(ks-1)*maxSlice : dims(3);
-                end
+            out = [];
+            for kseg = 1:NSegment
                 
-                % divide the data
-                data_tmp    = data(:,:,slice,:,:);
-                mask_tmp    = mask(:,:,slice);
-                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:); end
+                if NSegment > 1
+                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
+                    disp   ('------------------------')
+                end
+    
+                % divide the data if requried
+                slice                           = sliceBoundaries{kseg};
+                [dataSeg, maskSeg, extraDataSeg]    = this.slice_segment(data, mask, slice, extraData);
 
                 % run fitting
-                [out_tmp] = this.fit(data_tmp,mask_tmp,fitting,extraData_tmp);
+                [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg);
 
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
 
             end
-            out.mask        = mask;
-            out.min.M0      = out.min.M0 * scaleFactor; % undo scaling
-            out.final.M0    = out.final.M0 * scaleFactor; % undo scaling
+            out.mask = mask;
+            %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.outputFilename,out)
+            % askadam.save_askadam_output(fitting.outputFilename,out)
+            switch fitting.solver
+                case 'askadam'
+
+                    out.min.M0      = out.min.M0 * scaleFactor; % undo scaling
+                    out.final.M0    = out.final.M0 * scaleFactor; % undo scaling
+
+                    askadam.save_askadam_output(fitting.outputFilename,out)
+                case 'mcmc'
+
+                    % rescale M0
+                    for k = 1:numel(fitting.metric)
+                        out.(fitting.metric{k}).M0 = out.(fitting.metric{k}).M0 *scaleFactor;
+                    end
+                    out.posterior.M0 = out.posterior.M0 *scaleFactor;
+                    mcmc.save_mcmc_output(fitting.outputFilename,out)
+            end
 
         end
 
@@ -205,13 +222,26 @@ classdef gpuJointR1R2starMapping < handle
             % 2.2 display optimisation algorithm parameters
             this.display_algorithm_info(fitting)
 
+            extraData   = utils.gpu_reshape_ND2GD_struct(extraData,mask);
+
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
-            % 3. askAdam optimisation main
-            askadamObj  = askadam();
-            % 3.1. initial global optimisation
-            extraData   = utils.gpu_reshape_ND2GD_struct(extraData,mask);
-            out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData);
+            % 2.3 askAdam optimisation main
+            switch fitting.solver
+                case 'askadam'
+
+                    askadamObj  = askadam();
+                    out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData, fitting.solver);
+                    % out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
+
+                case 'mcmc'
+                    fitting.xStepSize = this.step;
+
+                    mcmcObj     = mcmc();
+                    % 3.1. initial global optimisation
+                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData, fitting.solver, fitting);
+                    
+            end
 
             disp('The process is completed.')
             
@@ -303,11 +333,19 @@ classdef gpuJointR1R2starMapping < handle
         end
 
         %% Signal related functions
+
         % compute the forward model
-        function [s] = FWD(this, pars, extraData)
+        function [s] = FWD(this, pars, extraData, solver, fitting)
+
+            if nargin < 4
+                solver = [];
+            end
+            if nargin < 5
+                fitting = [];
+            end
             
-            TE  = gpuArray(dlarray( permute(this.te,[2 3 4 1 5]))); % TE in 4th dimension
-            FA  = gpuArray(dlarray( permute(deg2rad(this.fa),[2 3 4 5 1]))); % FA in 5th dimension
+            TE  = gpuArray( permute(this.te,[2 3 4 1 5])); % TE in 4th dimension
+            FA  = gpuArray( permute(deg2rad(this.fa),[2 3 4 5 1])); % FA in 5th dimension
 
             if ~isfield(extraData,'trueFlipAngle')
                 trueFlipAngle = extraData.b1 .* FA;
@@ -318,20 +356,44 @@ classdef gpuJointR1R2starMapping < handle
             M0      = pars.M0;
             R1      = pars.R1;
             R2star  = pars.R2star;
-            % R2star(R1>R2star) = R1(R1>R2star);
             
-            s = this.model_jointR1R2s(M0, R2star, R1, TE,this.tr,trueFlipAngle);
-            % vectorise to match maksed measurement data
-            s = utils.reshape_ND2GD(s,[]);
+            if strcmpi(solver, 'mcmc')
+
+                % MCMC
+
+                s = arrayfun(@model_jointR1R2s_singlecompartment,M0, R2star, R1, TE,this.tr,trueFlipAngle);
+
+                % vectorise to match masked measurement data
+                s = utils.reshape_ND2GD(s,[]);
+                % reshape s for GW
+                if ~isempty(fitting)
+                    if strcmpi(fitting.algorithm,'ensemble')
+                        s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
+                    end
+                end
+
+            else
+
+                % askadam
+
+                s = this.model_jointR1R2s(M0, R2star, R1, TE,this.tr,trueFlipAngle);
+                % vectorise to match maksed measurement data
+                s = utils.reshape_ND2GD(s,[]);
+
+            end
                 
         end
         
         %% utility
+        
+        % make sure input data are valid
         function [mask,extradata] = validate_input(this,data,mask,extradata)
+           
             %%%%%%%%%% 2. check data integrity %%%%%%%%%%
             disp('-----------------------');
             disp('Checking data integrity');
             disp('-----------------------');
+
             % check if the number of echo times matches with the data
             if numel(this.te) ~= size(data,4)
                 error('The size of TE does not match with the 4th dimension of the image.');
@@ -339,10 +401,11 @@ classdef gpuJointR1R2starMapping < handle
             if numel(this.fa) ~= size(data,5)
                 error('The size of flip angle does not match with the 5th dimension of the image.');
             end
+
             % check signal mask
             if ~isempty(mask)
                 disp('Mask input                : True');
-                if min(size(data(:,:,:,1,1)) == size(mask)) == 0
+                if ~isequal(size(data,1:3), size(mask,1:3))
                     error('The dimension of the mask does not match the inpt image.');
                 end
             else
@@ -371,14 +434,36 @@ classdef gpuJointR1R2starMapping < handle
         end
 
         % normalise input data based on masked signal intensity at 98%
-        function [img, scaleFactor] = prepare_data(this,img, mask, b1)
+        function [img, mask, scaleFactor] = prepare_data(this, img, mask, extradata)
+
+            % make sure input data are valid
+            [mask,extradata] = this.validate_input(img,mask,extradata);
 
             despot1_obj          = despot1(this.tr,this.fa);
-            [~, m0, mask_fitted] = despot1_obj.estimate(permute(abs(img(:,:,:,1,:)),[1 2 3 5 4]), mask, b1);
+            [~, m0, mask_fitted] = despot1_obj.estimate(permute(abs(img(:,:,:,1,:)),[1 2 3 5 4]), mask, extradata.b1);
 
             scaleFactor = prctile( m0(mask_fitted>0), 98);
 
             img = img ./ scaleFactor;
+
+            % mask sure no nan or inf
+            [img,mask] = utils.remove_img_naninf(img,mask);
+
+        end
+
+        % segment data based on slice
+        function [dataSeg, maskSeg, extraDataSeg] = slice_segment(this, data, mask, slice, extraData)
+
+            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
+            maskSeg     = mask(:,:,slice);
+            if ~isempty(extraData)
+                fields      = fieldnames(extraData); 
+                for kfield = 1:numel(fields)
+                    extraDataSeg.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); 
+                end
+            else                                                    
+                extraDataSeg = [];                 
+            end
 
         end
 
@@ -431,6 +516,8 @@ classdef gpuJointR1R2starMapping < handle
             % get basic fitting setting check
             fitting2 = askadam.check_set_default_basic(fitting);
 
+            if ~isfield(fitting,'solver');      fitting2.solver = 'askadam';        end
+
             % get customised fitting setting check
             if ~isfield(fitting,'weightMethod');        fitting2.weightMethod   = '1stecho';        end
             if ~isfield(fitting,'isWeighted');          fitting2.isWeighted     = false;            end
@@ -473,7 +560,7 @@ classdef gpuJointR1R2starMapping < handle
                     case '1stecho'
                         p = fitting.weightPower;
                         % weights using the 1st echo intensity of each flip angle
-                        w       = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1,:)).^p);
+                        w = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1,:)).^p);
                 end
             else
                 % compute the cost without weights

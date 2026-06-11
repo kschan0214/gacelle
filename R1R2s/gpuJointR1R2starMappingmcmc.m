@@ -4,6 +4,7 @@ classdef gpuJointR1R2starMappingmcmc < handle
 % kchan2@mgh.harvard.edu
 % Date created: 5 April 2024
 % Date modified: 25 September 2024
+% Date modified: 10 June 2026 (deprecated)
 
     properties
         % default model parameters and estimation boundary

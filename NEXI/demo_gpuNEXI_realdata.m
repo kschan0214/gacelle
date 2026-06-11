@@ -3,9 +3,9 @@ clear
 
 %% basic I/O
 subj_label  ='sub-NEXIC2HC006';
-sess_label  = 'ses-C2';
+% sess_label  = 'ses-C2';
 reco_label  = 'recon-ORIG';
-acq         = {'D13ms_64dirs', 'D21ms_64dirs', 'D30ms_64dirs'};
+acq         = {'D13ms', 'D21ms', 'D30ms'};
 
 model_label = 'model-nexi';
 solver_label= 'solver-AskAdam';
@@ -23,9 +23,9 @@ data_dir = fullfile(preprocessed_dir,subj_label,'dwi');
 dwi_nii     = [];
 dwi_bval    = [];
 for k = 1:numel(acq)
-dwi_nii{k}  = strcat(subj_label,'_',sess_label,'_',['acq-' acq{k}],'_',reco_label,"_dwi_denoise_degibbs_eddy_gncorr.nii.gz");
-dwi_bval{k} = strcat(subj_label,'_',sess_label,'_',['acq-' acq{k}],'_',reco_label,"_dwi_corr_bvals.txt");
-dwi_bvec{k} = strcat(subj_label,'_',sess_label,'_',['acq-' acq{k}],'_',reco_label,"_dwi.bvec");
+dwi_nii{k}  = strcat(subj_label,'_',['acq-' acq{k}],'_',reco_label,"_dwi_denoise_degibbs_eddy_gncorr.nii.gz");
+dwi_bval{k} = strcat(subj_label,'_',['acq-' acq{k}],'_',reco_label,"_dwi_corr_bvals.txt");
+dwi_bvec{k} = strcat(subj_label,'_',['acq-' acq{k}],'_',reco_label,"_dwi.bvec");
 end
 % DWI data
 dwi_D13 = niftiread(fullfile(data_dir,dwi_nii{1}));
@@ -40,7 +40,7 @@ bvecs_D13 = readmatrix(fullfile(data_dir,dwi_bvec{1}),"FileType","text");
 bvecs_D21 = readmatrix(fullfile(data_dir,dwi_bvec{2}),"FileType","text");
 bvecs_D30 = readmatrix(fullfile(data_dir,dwi_bvec{3}),"FileType","text");
 % mask
-nii_info    = niftiinfo(fullfile(data_dir ,strcat(subj_label,'_',sess_label,'_',reco_label,'_dwi_brain_mask_gncorr.nii.gz')));
+nii_info    = niftiinfo(fullfile(data_dir ,strcat(subj_label,'_',reco_label,'_dwi_brain_mask_gncorr.nii.gz')));
 mask        = niftiread(nii_info)>0;
 
 %% prepare data for data fitting
@@ -69,10 +69,12 @@ dwi_bgt1 = obj.get_Sl_all(dwi_bgt1,bvals_bgt1,bvecs_bgt1,ldelta_bgt1,BDELTA_bgt1
 dwi_bgt1 = dwi_bgt1(:,:,:,1:numel(bval_fit)*2);
 
 % create fit object
-nexi_obj = gpuNEXI(bval_fit, BDELTA_fit);
+% nexi_obj = gpuNEXI(bval_fit, BDELTA_fit);
+nexi_obj = gpuNEXI(bvals_bgt1, BDELTA_bgt1);
 
 %% Model fitting
 fitting = [];
+fitting.solver              = 'askadam';
 fitting.iteration           = 4000;
 fitting.initialLearnRate    = 0.001;
 fitting.decayRate           = 0.0001;
@@ -83,9 +85,10 @@ fitting.patience            = 5;
 fitting.isDisplay           = false;
 fitting.lmax                = 2;
 fitting.start               = 'likelihood'; 
-% fitting.lambda              = 0.001;
-% fitting.TVmode              = '2D';
-% fitting.voxelSize           = [2,2,2];
+fitting.autoMemManage       = 1;
+fitting.lambda              = 0.001;
+fitting.TVmode              = '2D';
+fitting.voxelSize           = [2,2,2];
 
 % Optional, in case the input dwi is full dataset
 extradata.bval      = bvals_bgt1;
@@ -96,5 +99,23 @@ extradata.BDELTA    = BDELTA_bgt1;
 disp(subj_label);
 
 % askadam optimisation
-[out, fa, Da, De, r, p2] = nexi_obj.estimate(dwi_bgt1, mask, extradata, fitting);
+[out] = nexi_obj.estimate(dwi_bgt1, mask, extradata, fitting);
 
+%%
+nexi_obj = gpuNEXI(bvals_bgt1, BDELTA_bgt1);
+% nexi_obj = gpuNEXImcmc(bval_fit, BDELTA_fit);
+
+fitting                     = [];
+fitting.solver              = 'mcmc';
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 30;
+fitting.StepSize            = 2;
+fitting.iteration           = 5e3;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+fitting.burnin              = 0.1;       % 10% burn-in
+fitting.start               = 'default';
+fitting.lmax                = 2;
+fitting.autoMemManage       = 0;
+
+[out] = nexi_obj.estimate(dwi_bgt1, mask, extradata, fitting);

@@ -11,11 +11,14 @@ classdef gpuSANDI < handle
         % Da        : longitudinal diffusivity of neurite [ms/us^2]
         % De        : diffusivity of extracellular water [ms/us^2]
         % noise     : noise
-        modelParams     = {'Rs';'fs'; 'f';'Da';'De';'noise'};
-        ub              = [  15;   1;   1;   3;   3;    0.1];
-        lb              = [1e-6;1e-6;1e-6;1e-6;1e-6;  0.001];
-        startPoint      = [   7; 0.2; 0.4;   2;   1;  0.005];
-        step            = [0.79;0.05;0.05;0.15;0.15;  0.005];
+
+        epsilon = utils.epsilon;
+
+        modelParams     = {'Rs'     ;'fs'   ; 'f'   ;'Da'   ;'De'   ;'noise'};
+        ub              = [  15     ;   1   ;   1   ;   3   ;   3   ;    0.1];
+        lb              = [epsilon  ;epsilon;epsilon;epsilon;epsilon;  0.001];
+        startPoint      = [   7     ; 0.2   ; 0.4   ;      2;      1;  0.005];
+        step            = [0.79     ;0.05   ;0.05   ;0.15   ;0.15   ;  0.005];
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -86,10 +89,10 @@ classdef gpuSANDI < handle
                 this.startPoint(idx)        = [];
                 this.step(idx)              = [];
             end
-            this.b      = gpuArray(this.b);
-            this.ldelta = gpuArray(this.ldelta);
-            this.BDelta = gpuArray(this.BDelta);
-            this.g      = gpuArray(this.g);
+            % this.b      = gpuArray(this.b);
+            % this.ldelta = gpuArray(this.ldelta);
+            % this.BDelta = gpuArray(this.BDelta);
+            % this.g      = gpuArray(this.g);
 
         end
 
@@ -111,7 +114,7 @@ classdef gpuSANDI < handle
 
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out] = estimate(this, dwi, mask, fitting, extradata,  pars0)
+        function  [out] = estimate(this, data, mask, fitting, extradata,  pars0)
         % Perform NEXI model parameter estimation based on askAdam
         % Input data are expected in multi-dimensional image
         % 
@@ -139,65 +142,55 @@ classdef gpuSANDI < handle
             fitting = this.check_set_default(fitting);
 
             % get matrix size
-            dims = size(dwi,1:3);
+            dims = size(data,1:3);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [this,dwi] = this.prepare_dwi_data(dwi,extradata,fitting.lmax);
+            [this,data] = this.prepare_dwi_data(data,extradata,fitting.lmax);
 
             % mask sure no nan or inf
-            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
+            [data,mask] = utils.remove_img_naninf(data,mask);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
 
             % convert datatype to single
-            dwi     = single(dwi);
+            data    = single(data);
             mask    = mask >0;
             if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
-            %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
-            % determine if we need to divide the data to fit in GPU
-            % g = gpuDevice; reset(g);
-            memoryFixPerVoxel       = 0.00;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.0;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
+            
+            % --- [Experimental] estimate memory usage using a small batch of data size ---
+            % this method tends to be more conservative than the actual memory ussage
+            [sliceBoundaries,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
 
             % parameter estimation
             out = [];
-            for ks = 1:NSegment
+            for kseg = 1:NSegment
                 
-                if NSegment ~= 1
-                    fprintf('Running #Segment = %d/%d \n',ks,NSegment);
+                if NSegment > 1
+                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
                     disp   ('------------------------')
                 end
     
-                % determine slice# given a segment
-                if ks ~= NSegment
-                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
-                else
-                    slice = 1+(ks-1)*maxSlice : dims(3);
-                end
-                
-                % divide the data
-                dwi_tmp     = dwi(:,:,slice,:);
-                mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end
-                else;               pars0_tmp = [];                 end
+                % divide the data if requried
+                slice                           = sliceBoundaries{kseg};
+                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, slice, pars0);
 
                 % run fitting
-                [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
 
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
 
             end
             out.mask = mask;
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
-            % % save the estimation results if the output filename is provided
+            % save the estimation results if the output filename is provided
             % askadam.save_askadam_output(fitting.outputFilename,out)
             switch fitting.solver
                 case 'askadam'
@@ -276,6 +269,8 @@ classdef gpuSANDI < handle
                     askadamObj  = askadam();
                     out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
                 case 'mcmc'
+                    fitting.xStepSize = this.step;
+                    
                     mcmcObj     = mcmc(); 
                     out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
             end
@@ -286,7 +281,7 @@ classdef gpuSANDI < handle
             disp('The estimation is completed.');
             
             % clear GPU
-            reset(gpool)
+            % reset(gpool)
             
         end
 
@@ -565,6 +560,21 @@ classdef gpuSANDI < handle
                     end
                 end
             end
+        end
+
+        % segment data based on slice
+        function [dataSeg, maskSeg, pars0Seg] = slice_segment(this, data, mask, slice, pars0)
+
+            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
+            maskSeg     = mask(:,:,slice);
+            if ~isempty(pars0)
+                for km = 1:numel(this.modelParams)
+                    pars0Seg.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); 
+                end
+            else      
+                pars0Seg = [];                 
+            end
+
         end
 
         %% SANDI signal related functions

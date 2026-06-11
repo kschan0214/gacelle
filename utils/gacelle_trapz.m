@@ -43,7 +43,8 @@ end
         q = sum( (y(idxA{:}) + y(idxB{:})) .* (dx/2), dim );
     else
         % Nonuniform spacing: use segment widths diff(x)
-        w   = diff(x);                       % [n-1]
+        % w   = diff(x);                       % [n-1]
+        w   = x(2:end) - x(1:end-1); 
         shp = ones(1, ndims(y)); shp(dim) = numel(w);
         w   = reshape(w, shp);               % broadcast along other dims
         q   = sum( (y(idxA{:}) + y(idxB{:})) .* (w/2), dim );

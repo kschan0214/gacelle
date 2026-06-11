@@ -3,6 +3,7 @@ classdef gpumcmicro < handle
 % kchan2@mgh.harvard.edu
 % Date created: 29 September 2025
 % Date modified: 13 November 2025
+% Date modified: 9 June 2026 (add memory manager)
 
 % TODO: sort b and te and input full DWI
 
@@ -121,12 +122,12 @@ classdef gpumcmicro < handle
 
         % This is a wrapper of the 'fit' function.
         % The main purpose of this function is to handle memory issue and ensure the input data is correct for 'fit'
-        function  [out] = estimate(this, dwi, mask, fitting, extraData, pars0)
+        function  [out] = estimate(this, data, mask, fitting, extraData, pars0)
         % Input data are expected in multi-dimensional image
         % 
         % Input
         % -----------
-        % dwi       : 4D DWI, [x,y,z,dwi]
+        % data      : 4D DWI, [x,y,z,dwi]
         % mask      : 3D signal mask, [x,y,z]
         % extradata : Optional additional data
         %   .bval       : 1D bval in ms/um2, [1,dwi]                (Optional, only needed if dwi is full acquisition)
@@ -147,7 +148,7 @@ classdef gpumcmicro < handle
             fitting = this.check_set_default(fitting);
 
             % get matrix size
-            dims = size(dwi,1:3);
+            dims = size(data,1:3);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % if no pars input at all (not even empty) then use prior
@@ -155,53 +156,44 @@ classdef gpumcmicro < handle
             if nargin < 5; extraData    = []; end
 
             % compute rotationally invariant signal if needed
-            [this,dwi] = this.prepare_dwi_data(dwi,extraData,0);
+            [this,data] = this.prepare_dwi_data(data,extraData,0);
 
             % mask sure no nan or inf in data
-            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
+            [data,mask] = utils.remove_img_naninf(data,mask);
 
             % convert datatype to single or logical
-            dwi     = single(dwi);
+            data     = single(data);
             mask    = mask >0;
             if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
-            %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
-            % TODO: memory management
-            % determine if we need to divide the data to fit in GPU
-            % gpool = gpuDevice;  reset(gpool);
-            % memoryFixPerVoxel       = 0;   % get this number based on mdl fit
-            % memoryDynamicPerVoxel   = 0;     % get this number based on mdl fit
-            % [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
             
-            % % parameter estimation
-            % out = [];
-            % for ks = 1:NSegment
-            % 
-            %     fprintf('Running #Segment = %d/%d \n',ks,NSegment);
-            %     disp   ('------------------------')
-            % 
-            %     if ks ~= NSegment
-            %         slice = 1+(ks-1)*maxSlice : ks*maxSlice;
-            %     else
-            %         slice = 1+(ks-1)*maxSlice : dims(3);
-            %     end
-            % 
-            %     dwi_tmp     = dwi(:,:,slice,:);
-            %     mask_tmp    = mask(:,:,slice);
-            %     if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end
-            %     else;                                                    pars0_tmp = [];                 end
-            %     if ~isempty(extraData); fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); end
-            %     else;                                                    extraData_tmp = [];                 end
-            % 
-            %     [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp,pars0_tmp);
-            % 
-            %     % restore 'out' structure from segment
-            %     out = utils.restore_segment_structure(out,out_tmp,slice,ks);
-            % 
-            % end
-            [out]  = this.fit(dwi,mask,fitting,extraData,pars0);
+            % --- [Experimental] estimate memory usage using a small batch of data size ---
+            % this method tends to be more conservative than the actual memory ussage
+            [sliceBoundaries,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+
+            % parameter estimation
+            out = [];
+            for kseg = 1:NSegment
+                
+                if NSegment > 1
+                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
+                    disp   ('------------------------')
+                end
+    
+                % divide the data if requried
+                slice                                       = sliceBoundaries{kseg};
+                [dataSeg, maskSeg, extraDataSeg, pars0Seg]  = this.slice_segment(data, mask, slice, extraData, pars0);
+
+                % run fitting
+                [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg,pars0Seg);
+
+                % restore 'out' structure from segment
+                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
+
+            end
             out.mask = mask;
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
@@ -550,6 +542,31 @@ classdef gpumcmicro < handle
 
         end
     
+        % segment data based on slice
+        function [dataSeg, maskSeg, extraDataSeg, pars0Seg] = slice_segment(this, data, mask, slice, extraData, pars0)
+
+            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
+            maskSeg     = mask(:,:,slice);
+
+            if ~isempty(pars0)
+                for km = 1:numel(this.modelParams)
+                    pars0Seg.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); 
+                end
+            else      
+                pars0Seg = [];                 
+            end
+
+            if ~isempty(extraData)
+                fields      = fieldnames(extraData); 
+                for kfield = 1:numel(fields)
+                    extraDataSeg.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); 
+                end
+            else                                                    
+                extraDataSeg = [];                 
+            end
+
+        end
+
         %%  Signal related functions
         
         % Forward model

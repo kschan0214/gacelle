@@ -319,6 +319,99 @@ classdef utils < handle
 
         %%%%%% Memory management
 
+        function [nvidiaPID, logFile, matlabPID] = start_probe_logging()
+            matlabPID = feature('getpid');
+            logFile   = strcat(tempname, '_gacelle_probe.csv');
+            
+            % Log total GPU memory AND per-process breakdown
+            % Two columns: total_used, matlab_process_used
+            % We poll total (high time resolution) and correct for non-MATLAB usage
+            cmd = sprintf(['nvidia-smi --query-gpu=memory.used ' ...
+                           '--format=csv,noheader,nounits -lms 5 > %s &'], logFile);
+            system(cmd);
+            [~, pidStr] = system('pgrep -n nvidia-smi');
+            nvidiaPID   = strtrim(pidStr);
+        end
+        
+        function otherMem_MB = get_other_process_memory(matlabPID)
+        % Query memory used by all GPU processes EXCEPT MATLAB.
+        % This is used to correct the total-GPU readings.
+            [status, cmdout] = system('nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits');
+            if status ~= 0 || isempty(strtrim(cmdout))
+                otherMem_MB = 0;
+                return
+            end
+            
+            lines       = strtrim(splitlines(strtrim(cmdout)));
+            otherMem_MB = 0;
+            for k = 1:numel(lines)
+                if isempty(lines{k}); continue; end
+                parts = strsplit(lines{k}, ',');
+                if numel(parts) < 2; continue; end
+                pid = str2double(strtrim(parts{1}));
+                mem = str2double(strtrim(parts{2}));
+                if pid ~= matlabPID && ~isnan(mem)
+                    otherMem_MB = otherMem_MB + mem;
+                end
+            end
+        end
+
+        function absolutePeak_MiB = read_absolute_peak_from_log(logFile)
+        % Return the absolute maximum GPU memory used during the probe window,
+        % after discarding early startup samples.
+        % Caller is responsible for subtracting other-process memory.
+        
+            try
+                attempts = 0;
+                while ~isfile(logFile) && attempts < 20
+                    pause(0.05); attempts = attempts + 1;
+                end
+        
+                T    = readtable(logFile, 'FileType','text', 'Delimiter',',', ...
+                                 'VariableNamingRule','preserve');
+                vals = T{:,1};
+                if ~isnumeric(vals)
+                    vals = str2double(erase(string(vals), ' MiB'));
+                end
+                vals = vals(~isnan(vals));
+        
+                if numel(vals) < 5
+                    warning('GACELLE:memoryLog', 'Too few samples (%d) in %s', numel(vals), logFile);
+                    absolutePeak_MiB = max(vals);
+                    return
+                end
+        
+                % Discard first 5% - nvidia-smi startup + fit initialisation noise
+                nDiscard         = max(2, round(0.05 * numel(vals)));
+                vals             = vals(nDiscard+1:end);
+                absolutePeak_MiB = max(vals);
+        
+                fprintf('    [mem log] samples=%d, discarded=%d, peak=%.0f MiB\n', ...
+                    numel(vals)+nDiscard, nDiscard, absolutePeak_MiB);
+        
+            catch ME
+                warning('GACELLE:memoryLog', 'Could not read %s: %s', logFile, ME.message);
+                g                = gpuDevice;
+                absolutePeak_MiB = (g.TotalMemory - g.FreeMemory) / 1024^2;
+            end
+        end
+
+        % Add get_available_vram to utils.m
+        function memAvail_MiB = get_available_vram(gpuIndex)
+            if nargin < 1; gpuIndex = 0; end
+            [status, cmdout] = system(sprintf(...
+                'nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id=%d', gpuIndex));
+            if status == 0
+                lines        = strtrim(splitlines(strtrim(cmdout)));
+                memAvail_MiB  = str2double(lines{1});
+            else
+                warning('GACELLE:memoryQuery', ...
+                    'nvidia-smi unavailable; falling back to gpu.AvailableMemory. May be inaccurate on shared HPC nodes.');
+                g            = gpuDevice;
+                memAvail_MiB  = g.AvailableMemory / 1024^2;
+            end
+        end
+
         function [sliceBoundaries,NSegment] = find_optimal_segment_3D(modelObj, data, mask, fitting, varargin)
         % modelObj : the model object (e.g. gpuMCRMWI, gpuJointR1R2starMapping)
         %            must implement: fit_probe, slice_segment, fit_segment, postprocess_segments
@@ -328,29 +421,38 @@ classdef utils < handle
 
             gpu = gpuDevice; reset(gpu);
 
-            Nvoxel    = nnz(mask);
-            probeSize = round(logspace(2, 3, 5)) * 2;
-        
+            Nvoxel      = nnz(mask);
+            probeMin    = 100;
+            probeMax    = min(round(Nvoxel*0.1),1e5);
+            probeSize = [probeMin probeMax];
+            if probeMax <= probeMin
+                fitting.autoMemManage = 0;  % size too small
+            end
+
             if fitting.autoMemManage && Nvoxel > max(probeSize)
         
                 fprintf('Checking GPU memory requirements...\n');
-                memUsage = nan(1, numel(probeSize));
-        
+
+                matlabPID     = feature('getpid');
+                matlabPeak_MB = nan(1, numel(probeSize));   % absolute MATLAB peak, not delta
+
                 for kp = 1:numel(probeSize)
                     mask_probe                  = zeros(size(mask));
                     mask_probe(1:probeSize(kp)) = 1;
                     fitting_probe               = fitting;
                     fitting_probe.iteration     = 0;
                     fitting_probe.start         = 'default';
-        
+                
                     logFile   = strcat(tempname, '_gacelle_probe.csv');
                     cmd       = sprintf('nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 5 > %s &', logFile);
                     system(cmd);
                     [~, pidStr] = system('pgrep -n nvidia-smi');
                     nvidiaPID   = strtrim(pidStr);
-        
+                
+                    % Other-process memory snapshot before fit
+                    otherMem_before_MB = utils.get_other_process_memory(matlabPID);
+                
                     try
-                        % modelObj passed explicitly - no 'this' needed
                         [~, ~] = evalc('modelObj.fit(data, mask_probe, fitting_probe, varargin{:})');
                     catch ME
                         system(sprintf('kill %s 2>/dev/null', nvidiaPID));
@@ -362,40 +464,62 @@ classdef utils < handle
                             rethrow(ME);
                         end
                     end
-        
+                
                     system(sprintf('kill %s 2>/dev/null', nvidiaPID));
                     pause(0.1);
-        
-                    memUsage(kp) = utils.read_peak_from_log(logFile) / 1024;
-                    fprintf('  Probe %d/%d (N=%4d voxels): peak = %.0f MiB\n', ...
-                        kp, numel(probeSize), probeSize(kp), memUsage(kp)*1024);
-        
+                
+                    % Other-process memory snapshot after fit
+                    otherMem_after_MB  = utils.get_other_process_memory(matlabPID);
+                
+                    % Best estimate of other-process memory during probe peak:
+                    % use max(before, after) - conservative, assumes worst-case contamination
+                    otherMem_peak_MB   = max(otherMem_before_MB, otherMem_after_MB);
+                
+                    % Absolute peak total GPU usage from log (includes other processes)
+                    totalPeak_MB       = utils.read_absolute_peak_from_log(logFile);
+                
+                    % MATLAB-only absolute peak
+                    matlabPeak_MB(kp)  = max(0, totalPeak_MB - otherMem_peak_MB);
+                
+                    fprintf('  Probe %d/%d (N=%4d voxels): MATLAB peak = %.0f MiB (total=%.0f, other=%.0f)\n', ...
+                        kp, numel(probeSize), probeSize(kp), ...
+                        matlabPeak_MB(kp), totalPeak_MB, otherMem_peak_MB);
+                
                     if isfile(logFile); delete(logFile); end
                 end
-        
-                % [sliceBoundaries, NSegment] = utils.find_optimal_segment_3D(mask, probeSize, memUsage);
+                
+                % Fit absolute MATLAB peak vs probe size
+                % mem_matlab_peak = slope * Nvoxels + intercept
+                validIdx  = ~isnan(matlabPeak_MB);
+                coef      = polyfit(probeSize(validIdx), matlabPeak_MB(validIdx), 1);
+                slope     = coef(1);      % MB per voxel (all costs: baseline + autodiff)
+                intercept = coef(2);      % MB fixed MATLAB overhead
 
-                coef        = polyfit(probeSize, memUsage,1);
-                memPred     = polyval(coef, Nvoxel);
-                slope       = coef(1);                     % GB per voxel
-                intercept   = coef(2);                     % GB fixed overhead
-    
-                % Available memory with safety margin
-                memAvail      = gpu.AvailableMemory / 1024^3 * safetyFactor;  % GB
-    
-                if gpu.AvailableMemory/(1024^3) < memPred
+                % Predict full-problem MATLAB peak memory
+                memPred_MB = polyval(coef, Nvoxel);
+                
+                % Compare against available VRAM from nvidia-smi (other-process-aware)
+                memAvail_MB   = utils.get_available_vram();
+                memBudget_MB  = memAvail_MB * safetyFactor;
+                
+                fprintf('Memory prediction:\n');
+                fprintf('  Predicted MATLAB peak : %.0f MB\n', memPred_MB);
+                fprintf('  Available VRAM (smi)  : %.0f MB\n', memAvail_MB);
+                fprintf('  Budget (%.0f%%)         : %.0f MB\n', safetyFactor*100, memBudget_MB);
+        
+                if memAvail_MB < memPred_MB
                     warning('GACELLE:memoryWarning', ...
-                            'Predicted memory (%.2f GB) exceeds 100%% of available GPU memory (%.2f GB). Segmenting data.', ...
-                            memPred, memAvail);
+                            'Predicted memory (%.2f MB) exceeds 100%% of available GPU memory (%.2f MB). Segmenting data.', ...
+                            memPred_MB, memAvail_MB);
     
                     % Solve for max voxels per segment:
                     % slope * NvoxPerSeg + intercept <= memAvail
-                    NvoxPerSeg = floor((memAvail - intercept) / slope);
+                    NvoxPerSeg = floor((memAvail_MB - intercept) / slope);
     
                     if NvoxPerSeg <= 0
                         error('GACELLE:memoryError', ...
                               'Insufficient GPU memory even for a single segment. Predicted fixed overhead (%.2f GB) already exceeds available memory (%.2f GB).', ...
-                              intercept, memAvail);
+                              intercept, memAvail_MB);
                     end
     
                     % Build density-balanced slice boundaries
@@ -409,7 +533,7 @@ classdef utils < handle
                     sliceBoundaries = {1:size(mask,3)};
                     NSegment        = 1;
                     fprintf('Full data fits in GPU memory (predicted %.2f GB / available %.2f GB)\n', ...
-                        memPred, memAvail/safetyFactor);
+                        memPred_MB, memAvail_MB/safetyFactor);
                 end
             
             else
@@ -530,7 +654,7 @@ classdef utils < handle
             end
         end
         
-        function peak_MiB = read_peak_from_log(logFile)
+        function [peakDelta_MiB,baseline_MiB,peak_MiB] = read_peak_from_log(logFile)
         % function peakDelta_MiB = read_peak_from_log(logFile)
         % get the peak memory usage from nvidia-smi log file
 

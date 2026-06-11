@@ -2,8 +2,8 @@ classdef gpuJointR1R2starChiMapping < handle
 % This is the method to perform joint R1-R2* mapping using variable flip angle (vFA), multiecho GRE (mGRE) data
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 5 April 2024
-% Date modified: 25 September 2024
+% Date created: 6 June 2026 (only support askadam.m)
+% Date modified: 
 
     properties (Constant)
             gyro = 42.57747892;

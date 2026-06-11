@@ -5,7 +5,7 @@ classdef gpuNEXI < handle
 % Date modified: 29 March 2024 (v0.2.0)
 % Date modified: 4 April 2024 (v0.3.0)
 % Date modified: 20 August 2024 (v0.4.0)
-% Date modified: 8 June 2026 (v0.5.0) (update memory management)
+% Date modified: 8 June 2026 (v0.5.0) (update memory management, support mcmc in the same function)
 
     properties
         % default model parameters and estimation boundary
@@ -14,10 +14,18 @@ classdef gpuNEXI < handle
         % De        : diffusivity of extracellular water [ms/us^2]
         % ra        : exchange rate from neurite to extracellular space [1/s]
         % p2        : non-linear neurite dispersion index
-        modelParams     = {'fa';'Da';'De';'ra';'p2'};
-        ub              = [   1;   3;   3;   1;  1];
-        lb              = [ eps; eps; eps;1/250; eps];
-        startPoint      = [ 0.4;   2;   1; 0.05; 0.2];
+        modelParams     = {'fa'  ;'Da'  ;'De'   ;'ra'   ;'p2'; 'noise'};
+        ub              = [   1  ;   3  ;   3   ;   1   ;  1 ;     0.1];
+        lb              = [ eps  ; eps  ; eps   ;1/250  ; eps;    0.01];
+        startPoint      = [ 0.4  ;   2  ;   1   ; 0.05  ; 0.2;   0.005];
+        step            = [  0.05;  0.15;   0.15;  0.005;0.05;   0.005];
+
+        epsilon             = utils.epsilon;
+
+        % default threshold for data exclusion
+        thres_similarity    = 0.1; 
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -43,15 +51,6 @@ classdef gpuNEXI < handle
         % ----------
         % obj       : object of a fitting class
         %
-        % Usage
-        % ----------
-        % obj                   = NEXI(b, Delta, Nav);
-        % [out, fa, Da, De, r]  = obj.fit(S, mask, fitting,);
-        % Sfit                  = smt.FWD([fa, Da, De, r]);
-        % [x_train, S_train]    = obj.traindata(1e4);
-        % pars0                 = smt.likelihood(S, x_train, S_train);
-        % [out, fa, Da, De, r]  = smt.fit(S, mask, fitting, pars0);
-        %
         % Author:
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu) 
         %  Hong-Hsi Lee (hlee84@mgh.harvard.edu)
@@ -61,12 +60,15 @@ classdef gpuNEXI < handle
         %  Dmitry Novikov (dmitry.novikov@nyulangone.org)
         %  Copyright (c) 2023 New York University
             
-            this.b      = b(:) ;
-            this.Delta  = Delta(:) ;
+            % handle full b-value vector and Big delta vector
+            [bval_sorted,~,BDELTA_sorted,~] = DWIutility.unique_shell_keepb0(b,[],Delta,[],true);
+
+            this.b      = single(bval_sorted(:)) ;
+            this.Delta  = single(BDELTA_sorted(:)) ;
             if nargin > 2
                 this.Nav = varargin{1} ;
             else
-                this.Nav =  ones(size(b)) ;
+                this.Nav = ones(size(this.b)) ;
             end
             this.Nav = this.Nav(:) ;
         end
@@ -74,7 +76,17 @@ classdef gpuNEXI < handle
         % update properties according to lmax
         function this = updateProperty(this, fitting)
 
-            % DIMWI
+            % property change in related to solver
+            if ~strcmpi(fitting.solver,'mcmc')
+                idx = find(ismember(this.modelParams,'noise'));
+                this.modelParams(idx)       = [];
+                this.lb(idx)                = [];
+                this.ub(idx)                = [];
+                this.startPoint(idx)        = [];
+                this.step(idx)              = [];
+            end
+
+            % lmax = 0
             if fitting.lmax == 0
                 idx = find(ismember(this.modelParams,'p2'));
                 this.modelParams(idx)     = [];
@@ -88,9 +100,9 @@ classdef gpuNEXI < handle
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('========================');
-            disp('NEXI with askAdam solver');
-            disp('========================');
+            disp('=============================================');
+            disp('Neurite Exchange Imaging (NEXI): Narrow pulse');
+            disp('=============================================');
 
             disp('----------------')
             disp('Data Information');
@@ -133,17 +145,11 @@ classdef gpuNEXI < handle
             this.display_data_model_info;
 
             % get all fitting algorithm parameters 
-            fitting = this.check_set_default(fitting);
-
-            % get matrix size
-            dims = size(data,1:3);
+            fitting     = this.check_set_default(fitting);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             [data,mask] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax);
-
-            % mask sure no nan or inf
-            [data,mask] = utils.remove_img_naninf(data,mask);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -185,7 +191,13 @@ classdef gpuNEXI < handle
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.outputFilename,out)
+            % askadam.save_askadam_output(fitting.outputFilename,out)
+            switch fitting.solver
+                case 'askadam'
+                    askadam.save_askadam_output(fitting.outputFilename,out)
+                case 'mcmc'
+                    mcmc.save_mcmc_output(fitting.outputFilename,out)
+            end
 
         end
 
@@ -228,11 +240,6 @@ classdef gpuNEXI < handle
         %       .ra         : exchange rate from intra- to extra-neurite compartment
         %       .p2         : dispersion index (if fitting.lax=2)
         %       .loss       : loss metric      
-        % fa        : final Intraneurite volume fraction
-        % Da        : final Intraneurite diffusivity (um2/ms)
-        % De        : final Extraneurite diffusivity (um2/ms)
-        % ra        : final exchange rate from intra- to extra-neurite compartment
-        % p2        : final dispersion index (if fitting.lax=2)
         %
         % Description: askAdam Image-based NEXI model fitting
         %
@@ -284,9 +291,16 @@ classdef gpuNEXI < handle
             disp('---------------------------');
 
             % 2.3 askAdam optimisation main
-            askadamObj = askadam();
-            % initiate starting points arrays
-            out = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax);
+            switch fitting.solver
+                case 'askadam'
+                    askadamObj  = askadam();
+                    out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
+                case 'mcmc'
+                    fitting.xStepSize = this.step;
+                    
+                    mcmcObj     = mcmc(); 
+                    out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
+            end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
@@ -326,46 +340,87 @@ classdef gpuNEXI < handle
 
         % compute rotationally invariant DWI signal if necessary
         function [dwi, mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
-            % full DWI data then compute rotaionally invariant signal
+
+            % --- Step 1: compute rotationally invariant signal if needed ---
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
                 % compute spherical mean signal
                 fprintf('Computing rotationally invariant signal...')
 
                 % if the inout little delta is one value then create a vector
-                if numel(extradata.ldelta) == 1
-                    extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
-                end
-                DWIutilityObj = DWIutility();
-                [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
+                % if isscalar(extradata.ldelta)
+                %     extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
+                % end
+                DWIutilityObj   = DWIutility();
+                [dwi]           = DWIutilityObj.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,[],extradata.BDELTA,[],lmax);
+                % [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
 
                 fprintf('done.\n');
 
-            elseif size(dwi,4) < numel(this.b)
-                error('There are more b-shells in the class object than available in the input data. Please check your input data.');
+            elseif size(dwi,4) < numel(this.b) * (lmax/2+1)
+                error('GACELLE:inputMismatch', ...
+                    'Input has %d volumes but model expects %d. Check lmax or input data.', ...
+                    size(dwi,4), numel(this.b)*(lmax/2+1));
             end
 
-            % make sure no NaN/Inf in signal
-            [dwi, mask_naninf] = utils.set_nan_inf_zero(dwi); mask_naninf = max(mask_naninf,[],4);
-            mask_valid         = and(and(mask, max(dwi,[],4)<=1.01),~mask_naninf);
+            % --- Step 2: exclude biophysically impossible signal ---
+            % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
+            % works for both magnitude and real-valued data
+            Nshells         = numel(this.b);
+            dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
+            mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
+            mask_valid      = ~mask_impossible;
 
-            % check signal similarity
-            dwi_2D          = utils.reshape_ND2GD(dwi,mask_valid);
-            signalTemplate  = mean(dwi_2D,2,"omitmissing");         % assuming the majority of the signal are from tissues
-            signalTemplate  = (signalTemplate - mean(signalTemplate)) ./ std(signalTemplate);
-            Rcorr           = zeros(1,size(dwi_2D,2));
-            for k = 1:size(dwi_2D,2)
-                signalVoxel = dwi_2D(:,k);
-                signalVoxel = (signalVoxel - mean(signalVoxel)) ./ std(signalVoxel);
-                Rcorr(k)    = corr(signalTemplate,signalVoxel);
+            % --- Step 3: exclude near-zero signal (background voxels) ---
+            % Sl0 of lowest b-value shell should be well above zero for tissue
+            % very small value indicates background noise with no diffusion signal
+            mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+            mask_valid      = mask_valid & ~mask_background;
+
+            % --- Step 4: exclude incoherent signal (random noise pattern) ---
+            % correlate each voxel's Sl0 signal with the median tissue template
+            % median is more robust to outliers than mean
+            % low correlation indicates random noise rather than coherent diffusion decay
+            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0, mask_valid);
+            if size(dwi_2D, 2) > 0
+                signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
+                signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
+                                  std(signalTemplate,'omitmissing');
+        
+                Rcorr = zeros(1, size(dwi_2D,2));
+                for k = 1:size(dwi_2D,2)
+                    signalVoxel = dwi_2D(:,k);
+                    denom       = std(signalVoxel);
+                    if denom < eps
+                        Rcorr(k) = 0;   % flat signal -> zero correlation
+                    else
+                        signalVoxel = (signalVoxel - mean(signalVoxel)) ./ denom;
+                        Rcorr(k)    = corr(signalTemplate, signalVoxel);
+                    end
+                end
+        
+                Rcorr           = utils.reshape_GD2ND(Rcorr, mask_valid);
+                mask_incoherent = Rcorr < this.thres_similarity;
+                mask_valid      = mask_valid & ~mask_incoherent;
             end
-            Rcorr            = utils.reshape_GD2ND(Rcorr,mask_valid);
-            mask_dissimilar  = Rcorr < 0.1;
-            mask_valid       = and(mask_valid,~mask_dissimilar);
 
-            if numel(mask_valid(mask_valid)) ~= numel(mask(mask)) 
-                disp('Signal mask is updated! Please use the fitted mask in your subsequent analysis.');
+            % --- Step 5: remove NaN/Inf ---
+            [dwi,mask_naninf] = utils.remove_img_naninf(dwi,mask);
+            mask_naninf        = max(mask_naninf, [], 4);
+            mask_valid         = mask_valid & mask_naninf;
+
+            % --- Report and update mask ---
+            Nexcluded = sum(mask(:)) - sum(mask_valid(:));
+            if Nexcluded > 0
+                fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
+                    Nexcluded, 100*Nexcluded/sum(mask(:)));
+                fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
+                fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
+                fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
+                fprintf('  Incoherent     : %d\n', sum(mask_incoherent(:) & mask(:)));
+                disp('Please use the updated mask in subsequent analysis.');
                 mask = mask_valid;
             end
+
         end
 
         %%%%% Prior estimation related functions %%%%%
@@ -487,6 +542,11 @@ classdef gpuNEXI < handle
                 pars0.(this.modelParams{km}) = pars(:,:,:,km); ...
             end
 
+            % noise
+            if strcmpi(this.modelParams{end},'noise')
+                pars0.(this.modelParams{end}) = single(ones(size(mask)) * this.startPoint(end));
+            end
+
         end
 
         % create training data for likelihood
@@ -598,37 +658,112 @@ classdef gpuNEXI < handle
         %% NEXI signal related functions
 
         % Forward model to generate NEXI signal
-        function [s] = FWD(this, pars, lmax)
+        function [s] = FWD(this, pars, lmax, solver)
+
+            if nargin < 4 || isempty(solver)
+                solver = [];
+            end
         
-            fa   = max(pars.fa, askadam.epsilon); % avoid division by zeros when computing re
+            fa   = max(pars.fa, this.epsilon); % avoid division by zeros when computing re
             Da   = pars.Da;
             De   = pars.De;
             ra   = pars.ra;
     
-            % Sl0
-            s = this.Sl0(fa, Da, De, ra);
+            % % Sl0
+            % s = this.Sl0(fa, Da, De, ra,solver);
             
             % Sl2
             if lmax == 2
                 p2  = pars.p2;
-                s   = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
+                % s   = cat(1,s,this.Sl2(fa, Da, De, ra, p2));
+            else
+                p2 = [];
             end
+
+            % Forward model
+            s = this.Slmax2(fa, Da, De, ra, p2, solver);
 
             % make sure s cannot be greater than 1
             s = min(s,1);   % s = [Nb, Nvoxel]
                 
         end
+
+        function S = Slmax2(this, fa, Da, De, ra, p2, solver)
+
+            if nargin < 7; solver = []; end
+
+            bval    = this.b;
+            DELTA   = this.Delta;
+
+            Da      = bval.*Da;
+            De      = bval.*De;
+            ra      = DELTA.*ra;
+            re      = ra.*fa./(1-fa);
+
+            % Trapezoidal's rule replacement
+            Nx  = 14;    % NRMSE<0.05% for Nx=14 for Sl0 and 0.5% for Sl2
+            x   = zeros([ones(1,ndims(fa)), Nx],'like',De); x(:) = linspace(0,1,Nx);
+            % x   = zeros([ones(1,ndims(fa)), Nx], 'single', 'gpuArray'); x(:) = linspace(0,1,Nx);
+
+            % Sl0
+            if strcmpi(solver,'mcmc') 
+                dx  = x(2) - x(1);
+
+                M   = arrayfun(@NEXI_M,x,fa,Da,De,ra,re);
+
+                if ndims(M) == 3
+                    S = sum((M(:,:,2:end) + M(:,:,1:end-1)) * (dx) / 2, ndims(x));
+                elseif ndims(M) == 4
+                    S = sum((M(:,:,:,2:end) + M(:,:,:,1:end-1)) * (dx) / 2, ndims(x));
+                end
+
+            else
+                % askadam
+                M = this.M(x, fa, Da, De, ra, re);
+
+                % S = trapz(x(:),M,ndims(x));
+                S = gacelle_trapz(M,x(:),ndims(x));
+                
+            end
+
+            % Sl2
+            if ~isempty(p2)
+
+                if strcmpi(solver,'mcmc') 
+                    % M = M.*(3*x.^2-1)/2; 
+                    M = arrayfun(@NEXI_MSl2,M,x);
+                    % bypass Matlab's trapz for speed
+                    if ndims(M) == 3
+                        Sl2 = sum((M(:,:,2:end) + M(:,:,1:end-1)) * (dx) / 2, ndims(x));
+                    elseif ndims(M) == 4
+                        Sl2 = sum((M(:,:,:,2:end) + M(:,:,:,1:end-1)) * (dx) / 2, ndims(x));
+                    end
+                else
+                    % askadam
+                    % Sl2 = trapz(x(:),M.*(3*x.^2-1)/2,ndims(x));
+                    Sl2 = gacelle_trapz(M.*(3*x.^2-1)/2,x(:),ndims(x));
+                end
+                Sl2 = p2.*abs(Sl2);
+
+                S = cat(1,S,Sl2);
+            end
+
+        end
         
         % 0th order rotational invariant
-        function S = Sl0(this, fa, Da, De, ra)
+        function S = Sl0(this, fa, Da, De, ra, solver)
 
-            if isgpuarray(fa)
-                bval    = gpuArray(single(this.b));
-                DELTA   = gpuArray(single(this.Delta));
-            else
-                bval = this.b;
-                DELTA   = this.Delta;
+            if nargin < 6
+                solver = [];
             end
+
+            % if isgpuarray(fa)
+            %     bval    = gpuArray(single(this.b));
+            %     DELTA   = gpuArray(single(this.Delta));
+            % else
+            bval    = this.b;
+            DELTA   = this.Delta;
+            % end
             
             Da = bval.*Da;
             De = bval.*De;
@@ -638,22 +773,40 @@ classdef gpuNEXI < handle
             % Trapezoidal's rule replacement
             Nx  = 14;    % NRMSE<0.05% for Nx=14
             x   = zeros([ones(1,ndims(fa)), Nx],'like',bval); x(:) = linspace(0,1,Nx);
-            S   = trapz(x(:),this.M(x, fa, Da, De, ra, re),ndims(x));
+            if strcmpi(solver,'mcmc') 
+                dx  = x(2) - x(1);
+                M   = arrayfun(@NEXI_M,x,fa,Da,De,ra,re);
+
+                if ndims(M) == 3
+                    S = sum((M(:,:,2:end) + M(:,:,1:end-1)) * (dx) / 2, ndims(x));
+                elseif ndims(M) == 4
+                    S = sum((M(:,:,:,2:end) + M(:,:,:,1:end-1)) * (dx) / 2, ndims(x));
+                end
+
+            else
+                % askadam
+                S   = trapz(x(:),this.M(x, fa, Da, De, ra, re),ndims(x));
+            end
+
             % myfun = @(x) this.M(x, fa, Da, De, ra, re);
             % S = integral(myfun, 0, 1, 'AbsTol', 1e-14, 'ArrayValued', true);
 
         end
         
         % 2nd order rotational invariant
-        function S = Sl2(this, fa, Da, De, ra, p2)
+        function S = Sl2(this, fa, Da, De, ra, p2, solver)
 
-            if isgpuarray(fa)
-                bval    = gpuArray(single(this.b));
-                DELTA   = gpuArray(single(this.Delta));
-            else
-                bval = this.b;
-                DELTA   = this.Delta;
+            if nargin < 7
+                solver = [];
             end
+
+            % if isgpuarray(fa)
+            %     bval    = gpuArray(single(this.b));
+            %     DELTA   = gpuArray(single(this.Delta));
+            % else
+            bval = this.b;
+            DELTA   = this.Delta;
+            % end
 
             Da = bval.*Da;
             De = bval.*De;
@@ -663,7 +816,24 @@ classdef gpuNEXI < handle
             % Trapezoidal's rule replacement
             Nx  = 14;    % NRMSE<0.5% for Nx=14
             x   = zeros([ones(1,ndims(fa)), Nx],'like',bval); x(:) = linspace(0,1,Nx);
-            S   = trapz(x(:),this.M(x, fa, Da, De, ra, re).*(3*x.^2-1)/2,ndims(x));
+
+            if strcmpi(solver,'mcmc') 
+
+                dx  = x(2) - x(1);
+
+                % M = M.*(3*x.^2-1)/2; 
+                M = arrayfun(@NEXI_MSl2,arrayfun(@NEXI_M,x,fa,Da,De,ra,re),x);
+                % bypass Matlab's trapz for speed
+                if ndims(M) == 3
+                    S = sum((M(:,:,2:end) + M(:,:,1:end-1)) * (dx) / 2, ndims(x));
+                elseif ndims(M) == 4
+                    S = sum((M(:,:,:,2:end) + M(:,:,:,1:end-1)) * (dx) / 2, ndims(x));
+                end
+            else
+                % askadam
+                S   = trapz(x(:),this.M(x, fa, Da, De, ra, re).*(3*x.^2-1)/2,ndims(x));
+            end
+
             S   = p2.*abs(S);
 
         end
@@ -684,17 +854,36 @@ classdef gpuNEXI < handle
         %% Utilities
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting)
+
+            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
+
             % get basic fitting setting check
-            fitting2 = askadam.check_set_default_basic(fitting);
+            if strcmpi(fitting.solver,'mcmc')
 
-            % get customised fitting setting check
-            if ~isfield(fitting,'regmap');          fitting2.regmap     = 'fa';             end
-            if ~isfield(fitting,'lmax');            fitting2.lmax       = 0;                end
-            if ~isfield(fitting,'start');           fitting2.start      = 'likelihood';     end
+                % mcmc
+                
+                fitting2 = mcmc.check_set_default_basic(fitting);
 
-            if ~iscell(fitting2.regmap)
+            else
+
+                % askadam
+                
+                fitting2 = askadam.check_set_default_basic(fitting);
+
+                if ~isfield(fitting,'regmap');              fitting2.regmap             = 'fa';             end
+
+                if ~iscell(fitting2.regmap)
                 fitting2.regmap = cellstr(fitting2.regmap);
             end
+
+            end
+
+
+            % get customised fitting setting check
+            if ~isfield(fitting,'lmax');                fitting2.lmax               = 0;                end
+            if ~isfield(fitting,'start');               fitting2.start              = 'likelihood';     end
+
+            
 
         end
 
