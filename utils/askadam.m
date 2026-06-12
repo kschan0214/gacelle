@@ -254,12 +254,12 @@ classdef askadam < handle
                                                                                                                             minLoss, minLossFidelity, minLossRegularisation, minResiduals, parameters_minLoss, minIteration, epoch);
 
                     %%%%%%%%%%%%%%%%%%%% 3.3. Outlier detection and weight update %%%%%%%%%%%%%%%%%%%%
-                    [mainMask, weights, outlierFlagCount, perVoxelLossHistory] = this.update_outlier_mask(residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
-                                                                                                            perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting);
+                    [mainMask, weights, outlierFlagCount, perVoxelLossHistory, perVoxelLoss] = this.update_outlier_mask(residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
+                                                                                                                            perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting);
 
                     %%%%%%%%%%%%%%%%%%%% 3.4. Convergence signals %%%%%%%%%%%%%%%%%%%%
                     [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, ...
-                         epochsWithoutImprovementGrad, gradNorm_curr] = this.update_convergence_signals(loss, residuals, mainMask, Nmeas, Nvol, ...
+                         epochsWithoutImprovementGrad, gradNorm_curr] = this.update_convergence_signals(loss, mainMask, perVoxelLoss, ...
                                                                                                             parameters, parameters_prev, gradients, ema_loss, convergenceBuffer, ...
                                                                                                             epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, ...
                                                                                                             epochsWithoutImprovementGrad, gradNorm_curr, minLoss, epoch, fitting);
@@ -396,8 +396,8 @@ classdef askadam < handle
             end
         end
 
-        function [mainMask, weights, outlierFlagCount, perVoxelLossHistory] = update_outlier_mask(~, residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
-                                                                                                    perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting)
+        function [mainMask, weights, outlierFlagCount, perVoxelLossHistory, perVoxelLoss] = update_outlier_mask(~, residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
+                                                                                                                    perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting)
             % Detect outlier voxels based on improvement behaviour over time and
             % downweight their gradient contribution. Only active when
             % fitting.robustConvergence = true.
@@ -415,7 +415,8 @@ classdef askadam < handle
             % pass through defaults — returned unchanged if robustConvergence is false
             % or if weightUpdateInterval has not been reached
             % weights is reassigned below only when outlier mask is updated
-            weights = weights_original;
+            weights         = weights_original;
+            perVoxelLoss    = [];              % default: empty when robustConvergence is false
 
             if ~fitting.robustConvergence
                 return
@@ -459,9 +460,9 @@ classdef askadam < handle
             end
         end
 
-        function [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovement, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, epochsWithoutImprovementGrad, gradNorm_curr] = update_convergence_signals(~, loss, residuals, mainMask, Nmeas, Nvol, ...
+        function [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, epochsWithoutImprovementGrad, gradNorm_curr] = update_convergence_signals(this, loss, mainMask, perVoxelLoss, ...
                                                                                                                                                                                                                                     parameters, parameters_prev, gradients, ema_loss, convergenceBuffer, ...
-                                                                                                                                                                                                                                    epochsWithoutImprovement, epochsWithoutImprovementStep, stepNorm_curr, ...
+                                                                                                                                                                                                                                    epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, ...
                                                                                                                                                                                                                                     epochsWithoutImprovementGrad, gradNorm_curr, minLoss, epoch, fitting)
             % Compute all active convergence signals and update their patience counters.
             %
@@ -474,25 +475,24 @@ classdef askadam < handle
         
             % --- signal 1: loss-based ---
             if fitting.robustConvergence
-                perVoxelLoss     = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
-                loss_convergence = mean(perVoxelLoss(mainMask));
+                loss_convergence = mean(perVoxelLoss(mainMask));  % use precomputed perVoxelLoss
             else
                 loss_convergence = loss;
             end
         
             switch fitting.convergenceModel
                 case 'ema'
-                    [ema_loss, convergenceCurr] = askadam.update_convergence_ema(loss_convergence, ema_loss, fitting.emaDecay);
+                    [ema_loss, convergenceCurr]             = this.update_convergence_ema(loss_convergence, ema_loss, fitting.emaDecay);
                 case 'linear'
-                    [convergenceCurr, convergenceBuffer] = askadam.update_convergence([convergenceBuffer(2:end); loss_convergence]);
+                    [convergenceCurr, convergenceBuffer]    = this.update_convergence([convergenceBuffer(2:end); loss_convergence]);
             end
         
             if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
-                epochsWithoutImprovement = 0;
+                epochsWithoutImprovementConv = 0;
             elseif (minLoss - loss) > fitting.convergenceValue
-                epochsWithoutImprovement = 0;
+                epochsWithoutImprovementConv = 0;
             else
-                epochsWithoutImprovement = epochsWithoutImprovement + 1;
+                epochsWithoutImprovementConv = epochsWithoutImprovementConv + 1;
             end
         
             % --- signal 2: step norm ---
@@ -531,8 +531,7 @@ classdef askadam < handle
             end
         end
 
-        function [doStop, stopMsg] = check_stopping(~, loss, epochsWithoutImprovement, ...
-                epochsWithoutImprovementStep, epochsWithoutImprovementGrad, fitting)
+        function [doStop, stopMsg] = check_stopping(~, loss, epochsWithoutImprovementConv, epochsWithoutImprovementStep, epochsWithoutImprovementGrad, fitting)
             % Check all stopping criteria and return a flag and message.
             % Criteria are checked in order: loss convergence, loss tolerance,
             % step norm, gradient norm.
@@ -540,7 +539,7 @@ classdef askadam < handle
             stopMsg = '';
         
             % loss convergence
-            if epochsWithoutImprovement > fitting.patienceConvergence
+            if epochsWithoutImprovementConv > fitting.patienceConvergence
                 doStop = true;
                 if fitting.robustConvergence
                     stopMsg = sprintf('Optimisation is done. Main population loss convergence below tolerance %e (patience %d).\n', ...
@@ -576,9 +575,9 @@ classdef askadam < handle
             end
         end
 
-        function [parameters, averageGrad, averageSqGrad, vel, learningRate] = update_parameters(~, parameters, gradients, averageGrad, averageSqGrad, vel, epoch, fitting)
+        function [parameters, averageGrad, averageSqGrad, vel, learningRate] = update_parameters(this, parameters, gradients, averageGrad, averageSqGrad, vel, epoch, fitting)
             
-            learningRate = askadam.update_learn_rate(fitting.initialLearnRate, fitting.decayRate, epoch);
+            learningRate = this.update_learn_rate(fitting.initialLearnRate, fitting.decayRate, epoch);
             
             if epoch < fitting.iteration
                 switch lower(fitting.optimiser)
@@ -596,53 +595,16 @@ classdef askadam < handle
             end
         end
 
-        function [parameters, gradients, movingAvgNorm, parameterBuffer, kBuffer, perVoxelLossInit] = run_deprecated(this, parameters, gradients, residuals, perVoxelLossInit, ...
-                parameterBuffer, kBuffer, NparamBuffer, movingAvgNorm, movingAvgFactor, ...
-                mask_idx, Nmeas, Nvol, epoch, fitting)
-            % Deprecated features kept for backward compatibility.
-            % Will be removed in v1.2.
-        
-            if fitting.isClipGradient
-                [gradients, movingAvgNorm] = this.adaptive_gradient_clipping(gradients, mask_idx, ...
-                    movingAvgNorm, movingAvgFactor, fitting.maxGradientThres);
-            end
-        
-            if fitting.isSampleConsistency
-                if kBuffer < NparamBuffer
-                    perVoxelLoss_sc            = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
-                    maskNoImprove              = perVoxelLoss_sc > perVoxelLossInit;
-                    for kf = 1:numel(fitting.modelParams)
-                        parameters.(fitting.modelParams{kf})(maskNoImprove) = ...
-                            parameterBuffer{kBuffer}.(fitting.modelParams{kf})(maskNoImprove);
-                    end
-                    perVoxelLoss_sc(maskNoImprove) = perVoxelLossInit(maskNoImprove);
-                    perVoxelLossInit               = perVoxelLoss_sc;
-                    parameterBuffer(1:end-1)       = parameterBuffer(2:end);
-                    parameterBuffer(end)           = {parameters};
-                    kBuffer                        = kBuffer + 1;
-                end
-        
-                if mod(epoch, 5) == 0 && epoch > 5*NparamBuffer && epoch < fitting.iteration
-                    perVoxelLoss_sc          = extractdata(mean(reshape(residuals, Nmeas, Nvol), 1));
-                    maskNoImprove            = perVoxelLoss_sc > perVoxelLossInit;
-                    for kf = 1:numel(fitting.modelParams)
-                        n = randi(NparamBuffer);
-                        parameters.(fitting.modelParams{kf})(maskNoImprove) = ...
-                            parameterBuffer{n}.(fitting.modelParams{kf})(maskNoImprove);
-                    end
-                    perVoxelLossInit         = perVoxelLoss_sc;
-                    parameterBuffer(1:end-1) = parameterBuffer(2:end);
-                    parameterBuffer(end)     = {parameters};
-                end
-            end
-        end
-
         function print_verbose(~, epoch, loss, loss_fidelity, loss_reg, learningRate, ...
-                convergenceCurr, epochsWithoutImprovement, mainMask, Nvol, ...
-                stepNorm_curr, epochsWithoutImprovementStep, ...
-                gradNorm_curr, epochsWithoutImprovementGrad, fitting, start)
+                                convergenceCurr, epochsWithoutImprovementConv, mainMask, Nvol, ...
+                                stepNorm_curr, epochsWithoutImprovementStep, ...
+                                gradNorm_curr, epochsWithoutImprovementGrad, fitting, start)
             % Print iteration status. Reported fields depend on which features are active.
             if mod(epoch, 100) ~= 0 && epoch ~= 1; return; end
+
+            % extract from dlarray if needed
+            loss_fidelity = utils.dlarray2single(loss_fidelity);
+            loss_reg      = utils.dlarray2single(loss_reg);
         
             D   = duration(0, 0, toc(start), 'Format', 'hh:mm:ss');
             msg = sprintf('Iteration #%4d | Loss = %.3e (fidelity = %.3e, reg = %.3e) | LR = %.3e', ...
@@ -650,11 +612,11 @@ classdef askadam < handle
         
             if fitting.robustConvergence
                 msg = [msg sprintf(' | Conv (main, n=%d) = %.3e [patience %d/%d]', ...
-                    sum(mainMask), convergenceCurr, epochsWithoutImprovement, fitting.patienceConvergence)];
+                    sum(mainMask), convergenceCurr, epochsWithoutImprovementConv, fitting.patienceConvergence)];
                 msg = [msg sprintf(' | Outliers = %d/%d', sum(~mainMask), Nvol)];
             else
                 msg = [msg sprintf(' | Conv = %.3e [patience %d/%d]', ...
-                    convergenceCurr, epochsWithoutImprovement, fitting.patienceConvergence)];
+                    convergenceCurr, epochsWithoutImprovementConv, fitting.patienceConvergence)];
             end
         
             if fitting.convergenceStepTol > 0
@@ -806,10 +768,10 @@ classdef askadam < handle
             if ~isfield(fitting,'maxGradientThres');    fitting2.maxGradientThres    = 1;     end
 
             if fitting2.isSampleConsistency
-                warning('askadam:deprecated', 'isSampleConsistency is deprecated and will be removed in v1.2.');
+                warning('askadam:deprecated', 'isSampleConsistency is deprecated.');
             end
             if fitting2.isClipGradient
-                warning('askadam:deprecated', 'isClipGradient is deprecated and will be removed in v1.2.');
+                warning('askadam:deprecated', 'isClipGradient is deprecated.');
             end
             
         end

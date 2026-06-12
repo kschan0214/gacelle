@@ -722,8 +722,208 @@ classdef utils < handle
             end
         end
         
+        function [memory, time, cmd_output] = run_and_profile(cmd, interval_ms)
+        % =========================================================================
+        % utils.run_and_profile  —  profile GPU memory and wall-clock time for any
+        %                           GACELLE command run from the caller workspace.
+        %
+        % USAGE
+        %   [memory, time, cmd_output] = utils.run_and_profile(cmd)
+        %   [memory, time, cmd_output] = utils.run_and_profile(cmd, interval_ms)
+        %
+        % INPUT
+        %   cmd         : (char) Command string exactly as you would type it at the
+        %                 command line or in a script, e.g.:
+        %                   'out = objGPU.estimate(y, mask, [], fitting);'
+        %                 All variables referenced must exist in the caller
+        %                 workspace. The function uses evalin('caller',...) so any
+        %                 variable visible to the calling script is accessible.
+        %                 NOTE: this utility is designed to be called directly from
+        %                 a script or the command line, not from inside a function.
+        %
+        %   interval_ms : (optional, default 500) nvidia-smi polling interval in
+        %                 milliseconds. Smaller values give finer time resolution
+        %                 but produce larger log files for long runs.
+        %
+        % OUTPUT
+        %   memory      : struct with fields
+        %                   .total_MB       — 1-D array of raw nvidia-smi GPU memory
+        %                                     readings (MiB), one per poll, all
+        %                                     processes on the GPU
+        %                   .matlab_MB      — 1-D array of best-estimate MATLAB-only
+        %                                     memory (total minus other-process peak).
+        %                                     Assumes other-process usage is roughly
+        %                                     constant during the run; less reliable
+        %                                     on busy shared HPC nodes
+        %                   .timestamps_s   — 1-D array of elapsed seconds matching
+        %                                     each reading (relative to cmd start)
+        %                   .peak_total_MB  — scalar peak of total_MB
+        %                   .peak_matlab_MB — scalar peak of matlab_MB
+        %
+        %   time        : struct with fields
+        %                   .elapsed_s    — wall-clock elapsed time in seconds
+        %
+        %   cmd_output  : the variable assigned by cmd, if cmd assigns exactly one
+        %                 output variable (detected by parsing the left-hand side).
+        %                 Empty if cmd assigns nothing or assigns multiple variables.
+        %
+        % EXAMPLE
+        %   fitting.iteration = 4000;
+        %   [mem, t, out] = utils.run_and_profile( ...
+        %       'out = objGPU.estimate(y, mask, [], fitting);', 200);
+        %
+        %   figure;
+        %   plot(mem.timestamps_s, mem.total_MB, 'DisplayName', 'Total (all processes)');
+        %   hold on;
+        %   plot(mem.timestamps_s, mem.matlab_MB, 'DisplayName', 'MATLAB only (estimated)');
+        %   xlabel('Time (s)'); ylabel('GPU memory used (MiB)');
+        %   legend; title('GPU memory profile');
+        %   fprintf('Peak GPU memory (total):  %.0f MiB\n', mem.peak_total_MB);
+        %   fprintf('Peak GPU memory (MATLAB): %.0f MiB\n', mem.peak_matlab_MB);
+        %   fprintf('Elapsed time:             %.1f s\n',   t.elapsed_s);
+        % =========================================================================
+            % --- defaults ---------------------------------------------------------
+            if nargin < 2 || isempty(interval_ms)
+                interval_ms = 500;
+            end
+        
+            % --- parse LHS variable name from cmd --------------------------------
+            % Matches single-variable assignment: out = ...
+            % Multi-output patterns [a,b] = ... are not supported; cmd_output = [].
+            lhs_token  = regexp(cmd, '^\s*(\w+)\s*=', 'tokens', 'once');
+            has_lhs    = ~isempty(lhs_token);
+            lhs_name   = '';
+            if has_lhs
+                lhs_name = lhs_token{1};
+            end
+        
+            % --- get MATLAB PID for other-process subtraction --------------------
+            matlabPID = feature('getpid');
+        
+            % --- prepare nvidia-smi log ------------------------------------------
+            logFile = strcat(tempname, '_gacelle_profile.csv');
+        
+            cmd_smi = sprintf( ...
+                'nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms %d > %s &', ...
+                round(interval_ms), logFile);
+        
+            system(cmd_smi);
+        
+            % Give nvidia-smi a moment to start and write its first line
+            pause(0.05);
+        
+            % Retrieve nvidia-smi PID for clean shutdown
+            [~, pidStr] = system('pgrep -n nvidia-smi');
+            nvidiaPID   = strtrim(pidStr);
+        
+            % --- snapshot other-process memory before cmd ------------------------
+            otherMem_before_MB = utils.get_other_process_memory(matlabPID);
+        
+            % --- run the command -------------------------------------------------
+            t_start = tic;
+        
+            try
+                evalin('caller', cmd);
+            catch ME
+                utils.run_and_profile_cleanup_(nvidiaPID);
+                if isfile(logFile); delete(logFile); end
+                rethrow(ME);
+            end
+        
+            elapsed_s = toc(t_start);
+        
+            % --- snapshot other-process memory after cmd -------------------------
+            otherMem_after_MB = utils.get_other_process_memory(matlabPID);
+        
+            % Conservative estimate: assume worst-case other-process usage during run
+            otherMem_peak_MB = max(otherMem_before_MB, otherMem_after_MB);
+        
+            % --- shut down nvidia-smi --------------------------------------------
+            utils.run_and_profile_cleanup_(nvidiaPID);
+        
+            % --- parse log and compute MATLAB-only series ------------------------
+            memory = utils.run_and_profile_parse_log_(logFile, elapsed_s, otherMem_peak_MB);
+        
+            % --- package time ----------------------------------------------------
+            time.elapsed_s = elapsed_s;
+        
+            % --- retrieve cmd output from caller workspace -----------------------
+            cmd_output = [];
+            if has_lhs
+                try
+                    cmd_output = evalin('caller', lhs_name);
+                catch
+                    % variable may not have been created (e.g. cmd errored quietly)
+                end
+            end
+        
+            % --- clean up log ----------------------------------------------------
+            if isfile(logFile); delete(logFile); end
+        
+        end % run_and_profile
 
+        function run_and_profile_cleanup_(nvidiaPID)
+        % Kill the background nvidia-smi process and wait briefly for it to flush.
+            if ~isempty(nvidiaPID)
+                system(sprintf('kill %s 2>/dev/null', nvidiaPID));
+            end
+            pause(0.15);   % allow final writes to flush to disk
+        end
 
+        function memory = run_and_profile_parse_log_(logFile, elapsed_s, otherMem_peak_MB)
+        % Read nvidia-smi CSV log and return the memory struct.
+        %
+        % Timestamps are assigned by uniform spacing across elapsed_s — a
+        % reasonable approximation for diagnostic use at typical polling intervals.
+        
+            memory = struct( ...
+                'total_MB',       [], ...
+                'matlab_MB',      [], ...
+                'timestamps_s',   [], ...
+                'peak_total_MB',  NaN, ...
+                'peak_matlab_MB', NaN);
+        
+            if ~isfile(logFile)
+                warning('GACELLE:run_and_profile:noLog', ...
+                    'nvidia-smi log not found. Is nvidia-smi available on this system?');
+                return
+            end
+        
+            try
+                raw = readtable(logFile, ...
+                    'ReadVariableNames', false, ...
+                    'FileType',          'text', ...
+                    'Delimiter',         '\n');
+                vals = raw{:,1};
+        
+                if iscell(vals)
+                    vals = cellfun(@str2double, vals);
+                end
+        
+                vals(isnan(vals)) = [];
+        
+                if isempty(vals)
+                    warning('GACELLE:run_and_profile:emptyLog', ...
+                        'nvidia-smi log is empty. Polling may not have captured any samples.');
+                    return
+                end
+        
+                n          = numel(vals);
+                timestamps = linspace(0, elapsed_s, n)';
+                matlab_MB  = max(0, vals - otherMem_peak_MB);
+        
+                memory.total_MB       = vals(:);
+                memory.matlab_MB      = matlab_MB(:);
+                memory.timestamps_s   = timestamps;
+                memory.peak_total_MB  = max(vals);
+                memory.peak_matlab_MB = max(matlab_MB);
+        
+            catch ME
+                warning('GACELLE:run_and_profile:parseFail', ...
+                    'Failed to parse nvidia-smi log: %s', ME.message);
+            end
+        
+        end % run_and_profile_parse_log_
 
         %%%%%%%%%%%%%%%%%%%
         % compute masked statistics

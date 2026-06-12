@@ -113,6 +113,10 @@ fitting.tol                 = 1e-8;
 fitting.isDisplay           = false;
 fitting.start               = 'prior';   
 fitting.patience            = 20;   
+fitting.convergenceModel        = 'ema';
+fitting.emaDecay                = 0.95;
+fitting.robustConvergence       = true;
+fitting.outlierWeight           = 0.1;
 % extraData                   = [];
 
 objGPU     = gpuMCRMWI(te,tr,fa,fixed_params);

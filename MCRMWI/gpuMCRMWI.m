@@ -802,7 +802,7 @@ classdef gpuMCRMWI < handle
 
             despot1_obj          = despot1(this.tr,this.fa);
             [t1, ~, mask_fitted] = despot1_obj.estimate(permute(abs(data(:,:,:,1,:)),[1 2 3 5 4]), mask, extraData.b1);
-            [R2star,~]           = R2star_trapezoidal(mean(abs(data),5),this.te);
+            [R2star,~]           = this.R2star_trapezoidal(mean(abs(data),5),this.te);
 
             % DIMWI
             if ~fitting.DIMWI.isFitFreqMW || ~fitting.DIMWI.isFitFreqIW || ~fitting.DIMWI.isFitR2sEW
