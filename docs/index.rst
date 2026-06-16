@@ -50,6 +50,8 @@ Table of Contents
    :name: sec-advanced
 
    advanced/automatic_memory_management
+   advanced/askadam-convergence
+   advanced/askadam-parameter-transform
 
 .. toctree::
    :maxdepth: 1

@@ -26,7 +26,7 @@ Two small *probe fits* are run on sub-samples of the brain mask: one on a minimu
 
    matlabPeak_MB = totalPeak_MB - max(otherMem_before_MB, otherMem_after_MB)
 
-where ``totalPeak_MB`` is read from the nvidia-smi log (discarding the first 15% of samples to avoid transient artefacts), and the other-process contribution is taken as the more conservative of the snapshots before and after the probe fit.
+where ``totalPeak_MB`` is read from the nvidia-smi log (discarding the first 5% of samples to avoid transient artefacts), and the other-process contribution is taken as the more conservative of the snapshots before and after the probe fit.
 
 .. note::
    ``nvidia-smi`` polls at 5 ms intervals, so the peak estimate is an approximation. It captures the gradient materialisation spike during the backward pass, which ``gpuDevice().AvailableMemory`` cannot reliably measure because it only reflects instantaneous free memory rather than the true peak.
@@ -70,7 +70,7 @@ When the flag is active, GACELLE will print a brief report to the console::
      Available VRAM (smi)  : 12288 MB
      Budget (100%)         : 12288 MB
    Data divided into 4 segments (max 62500 voxels/segment)
-   The estimation will not be exactly the same as 1 segment.
+   The estimation may not be exactly the same as 1 segment.
 
 If the full volume fits, you will instead see::
 
@@ -110,5 +110,5 @@ The memory manager calls the following internal utilities, which are documented 
 
 - ``utils.get_other_process_memory(pid)`` — returns the current GPU memory (MB) used by all processes except the MATLAB process with the given PID.
 - ``utils.get_available_vram()`` — returns current free GPU VRAM (MB) as reported by nvidia-smi.
-- ``utils.read_absolute_peak_from_log(logFile)`` — reads a nvidia-smi CSV log and returns the peak total GPU memory usage (MB), discarding the first 15% of samples as a warm-up period.
+- ``utils.read_absolute_peak_from_log(logFile)`` — reads a nvidia-smi CSV log and returns the peak total GPU memory usage (MB), discarding the first 5% of samples as a warm-up period.
 - ``utils.build_balanced_boundaries(mask, NvoxPerSeg)`` — partitions a 3D binary mask into slice groups such that each group contains at most ``NvoxPerSeg`` masked voxels, with group sizes as equal as possible.

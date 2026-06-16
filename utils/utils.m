@@ -527,7 +527,7 @@ classdef utils < handle
                     sliceBoundaries = utils.build_balanced_boundaries(mask, NvoxPerSeg);
                     NSegment        = numel(sliceBoundaries);
                     fprintf('Data divided into %d segments (max %d voxels/segment)\n', NSegment, NvoxPerSeg);
-                    fprintf('The estimation will not be exactly the same as 1 segment.');
+                    fprintf('The estimation may not be exactly the same as 1 segment.');
     
                 else
                     sliceBoundaries = {1:size(mask,3)};
