@@ -46,6 +46,13 @@ Table of Contents
 
 .. toctree::
    :maxdepth: 1
+   :caption: Advanced
+   :name: sec-advanced
+
+   advanced/automatic_memory_management
+
+.. toctree::
+   :maxdepth: 1
    :caption: Tips and Tricks
    :name: sec-tips
 

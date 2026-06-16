@@ -45,13 +45,7 @@ bval_tmp = DWIutils.rectify_bval_v2(bval_tmp,0.01);
 objGPU                      = gpumcmicro(bval_sorted/1e3);
 fitting                     = [];
 fitting.solver              = 'askadam';
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false; 
-fitting.patience            = 10;    
+fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood'; 
 
 extraData                   = [];

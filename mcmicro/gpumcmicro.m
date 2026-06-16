@@ -19,6 +19,9 @@ classdef gpumcmicro < handle
         startPoint      = [ 0.6;    2;   12;   30; 0.005];
         step            = [0.05; 0.04; 2.58; 2.58; 0.005];
 
+        % default threshold for data exclusion
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -46,18 +49,17 @@ classdef gpumcmicro < handle
         %  Authors: 
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu)
         %
-            
-            this.b      = (single( b(:)) );
-            % relaxation
+
             if nargin<2 || isempty(te)
-                this.te = zeros(size(this.b));    % no input te assume single TE
-            else
-                if isscalar(unique(te))
-                    this.te = zeros(size(this.b),'like',this.b);    % only 1 TE then set TE to 0
-                else
-                    this.te = (single(te(:)));    % same length as b or scalar (if Nt==1)
-                end
+                te = zeros(size(b));    % no input te assume single TE
+            elseif isscalar(te)
+                te = ones(size(b),'like',b)*te;
             end
+    
+            [bval_sorted,~,~,te_sorted] = DWIutility.unique_shell_keepb0(b,[],[],te,true);
+            
+            this.b      = single(bval_sorted(:)) ;
+            this.te     = single(te_sorted(:)) ;
 
         end
 
@@ -95,8 +97,8 @@ classdef gpumcmicro < handle
                 this.startPoint(idx)        = [];
                 this.step(idx)              = [];
             else
-                this.b  = gpuArray(single(this.b));
-                this.te = gpuArray(single(this.te));
+                this.b  = (single(this.b));
+                this.te = (single(this.te));
             end
 
         end
@@ -147,22 +149,16 @@ classdef gpumcmicro < handle
             % get all fitting algorithm parameters 
             fitting = this.check_set_default(fitting);
 
-            % get matrix size
-            dims = size(data,1:3);
-
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0        = []; end
             if nargin < 5; extraData    = []; end
 
             % compute rotationally invariant signal if needed
-            [this,data] = this.prepare_dwi_data(data,extraData,0);
-
-            % mask sure no nan or inf in data
-            [data,mask] = utils.remove_img_naninf(data,mask);
+            [data, mask] = this.prepare_dwi_data(data,mask,extraData,0);
 
             % convert datatype to single or logical
-            data     = single(data);
+            data    = single(data);
             mask    = mask >0;
             if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
@@ -210,7 +206,7 @@ classdef gpumcmicro < handle
 
         % Data fitting function
         % This is a wapper of the askadam class 'fit' function
-        function [out] = fit(this,dwi,mask,fitting, extraData, pars0)
+        function [out] = fit(this,data,mask,fitting, extraData, pars0)
         %
         % Input
         % -----------
@@ -248,7 +244,7 @@ classdef gpumcmicro < handle
             gpool = gpuDevice;
             
             % check image size
-            dims = size(dwi,1:3);
+            dims = size(data,1:3);
 
             %%%%%%%%%%%%%%%%%%%% Step 1. Validate and parse input %%%%%%%%%%%%%%%%%%%%
             if nargin < 3 || isempty(mask); mask = ones(dims,'logical'); end % if no mask input then fit everthing
@@ -276,7 +272,7 @@ classdef gpumcmicro < handle
             w = this.compute_optimisation_weights(mask,fitting.lossFunction,0); % This is a customised funtion
 
             % 2.2 estimate prior if neede
-            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
+            if isempty(pars0);  pars0 = this.determine_x0(data,mask,fitting); end
 
             if ~isempty(extraData); extraData   = utils.masking_ND2GD_preserve_struct(extraData,mask) ; end
 
@@ -284,10 +280,12 @@ classdef gpumcmicro < handle
             switch fitting.solver
                 case 'askadam'
                     askadamObj  = askadam(); 
-                    out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, extraData,fitting.solver);
+                    out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData,fitting.solver);
                 case 'mcmc'
+                    fitting.xStepSize = this.step;
+                    
                     mcmcObj     = mcmc(); 
-                    out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, extraData,fitting.solver);
+                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData,fitting.solver);
             end
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
@@ -301,7 +299,7 @@ classdef gpumcmicro < handle
         %% Data preparation
 
         % compute rotationally invariant DWI signal if necessary
-        function [this,dwi] = prepare_dwi_data(this,dwi,extradata,lmax)
+        function [dwi,mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
 
@@ -309,19 +307,48 @@ classdef gpumcmicro < handle
                 if ~isfield(extradata,'te')
                     extradata.te = zeros(size(extradata.bval));
                 end
-                DWIutils                        = DWIutility();
-                [dwi,bval_sorted,~,~,te_sorted] = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,[],[],extradata.te,lmax);
+                DWIutils    = DWIutility();
+                dwi         = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,[],[],extradata.te,lmax);
                 
-                % update b and te order
-                this.b  = single(bval_sorted);
-                this.te = single(te_sorted);
-
             elseif size(dwi,4) < numel(this.b)
                 error('There are more b-shells in the class object than available in the input data. Please check your input data.');
             end
 
-            % normalised by the first volume
-            dwi = dwi ./ dwi(:,:,:,1);
+            % --- Step 2: exclude biophysically impossible signal ---
+            % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
+            % works for both magnitude and real-valued data
+            Nshells         = numel(this.b);
+            dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
+            mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
+            mask_valid      = ~mask_impossible;
+
+            % --- Step 3: exclude near-zero signal (background voxels) ---
+            % Sl0 of lowest b-value shell should be well above zero for tissue
+            % very small value indicates background noise with no diffusion signal
+            mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+            mask_valid      = mask_valid & ~mask_background;
+
+            % --- Step 4: remove NaN/Inf ---
+            [dwi,mask_naninf] = utils.remove_img_naninf(dwi,mask);
+            mask_naninf        = max(mask_naninf, [], 4);
+            mask_valid         = mask_valid & mask_naninf;
+
+            % % normalised by the first volume if NTE >1
+            if ~isscalar(unique(this.te))
+                dwi = dwi ./ dwi(:,:,:,1);
+            end
+
+            % --- Report and update mask ---
+            Nexcluded = sum(mask(:)) - sum(mask_valid(:));
+            if Nexcluded > 0
+                fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
+                    Nexcluded, 100*Nexcluded/sum(mask(:)));
+                fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
+                fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
+                fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
+                disp('Please use the updated mask in subsequent analysis.');
+                mask = mask_valid;
+            end
         end
 
         % compute weights for optimisation
@@ -460,7 +487,7 @@ classdef gpumcmicro < handle
         function [x_train, S_train, intervals] = traindata(this, N_samples, varargin)
             if nargin < 3
                 intervals = [0.1 0.9      ;   % neurite fraction
-                             1.7 2.9      ;   % intrinsic diffusivity
+                             1.5 2.3      ;   % intrinsic diffusivity
                                7 15     ;   % neurite R2
                               20 50]   ;   % extra-cellular R2
             else
@@ -547,6 +574,7 @@ classdef gpumcmicro < handle
 
             dataSeg     = data(:,:,slice,:,:,:,:,:,:);
             maskSeg     = mask(:,:,slice);
+            extraDataSeg= [];
 
             if ~isempty(pars0)
                 for km = 1:numel(this.modelParams)
@@ -559,7 +587,9 @@ classdef gpumcmicro < handle
             if ~isempty(extraData)
                 fields      = fieldnames(extraData); 
                 for kfield = 1:numel(fields)
-                    extraDataSeg.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); 
+                    if ~ismatrix(extraData.(fields{kfield}))
+                        extraDataSeg.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); 
+                    end
                 end
             else                                                    
                 extraDataSeg = [];                 
@@ -596,8 +626,10 @@ classdef gpumcmicro < handle
             else
                 s = this.diffusion_relaxation_spherical_mean_combine(f, D, R2a, R2e, this.b,this.te);
             end
-            % normalised to 1st echo, b=0
-            s = s ./ s(1,:,:,:,:);
+            % normalised to 1st echo, b=0 if Nte > 1
+            if ~isscalar(unique(this.te))
+                s = s ./ s(1,:,:,:,:);
+            end
                 
             % make sure s cannot be greater than 1
             s = min(s,1);
@@ -642,8 +674,8 @@ classdef gpumcmicro < handle
                 end
 
             else
-                fitting2 = mcmc.check_set_default_basic(fitting);
-                fitting2.lossFunction = [];
+                fitting2                = mcmc.check_set_default_basic(fitting);
+                fitting2.lossFunction   = [];
             end
 
             % get customised fitting setting check

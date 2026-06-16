@@ -82,15 +82,9 @@ GT.p2 = pl(2,:);
 %% askadam estimation
 objGPU = gpuNEXI(bval, Delta);
 
-fitting                     = objGPU.check_set_default([]);
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false; 
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting);
 fitting.lmax                = 2;  
-fitting.patience            = 5;    
 fitting.start               = 'likelihood'; 
 
 mask = ones(size(S_SH_NEXI_n,1:3),'logical');

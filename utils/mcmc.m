@@ -668,6 +668,9 @@ classdef mcmc < handle
                 if ~isfield(fitting,'Nbin');            fitting2.Nbin     = 1001;                end 
             end
 
+            if ~isfield(fitting,'autoMemManage');          fitting2.autoMemManage     = true;            end
+            
+
             if ~iscell(fitting2.metric)
                 fitting2.metric = cellstr(fitting2.metric);
             end

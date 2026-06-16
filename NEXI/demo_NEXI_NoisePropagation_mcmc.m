@@ -45,17 +45,10 @@ mask    = ones(size(y,1:3)) > 0;
 %% askadam estimation
 rng(seed); gpurng(seed);
 
-fitting             = objGPU.check_set_default([]);
 fitting.solver      = 'mcmc';
-fitting.algorithm   = 'ensemble';
-fitting.Nwalker     = 50;
-fitting.StepSize    = 2;
-fitting.iteration   = 5e3;
-fitting.thinning    = 20;        % Sample every 20 iteration
-fitting.metric      = 'median';
-fitting.burnin      = 0.1;       % 10% burn-in
-fitting.lmax        = 2;     
-fitting.start       = 'likelihood';     
+fitting             = objGPU.check_set_default(fitting);
+fitting.lmax        = 2;  
+fitting.start       = 'likelihood'; 
 extraData           = [];
 
 out   = objGPU.estimate(y, mask, extraData, fitting);
@@ -69,7 +62,7 @@ fitting.iteration   = 0;
 pars0               = objGPU.estimate(y, mask, [], fitting); 
 
 % get FWD signal based on fitted result
-shat = objGPU.FWD(out.median,fitting.lmax);
+shat = objGPU.FWD(out.mean,fitting.lmax);
 
 %% plot result
 figure;
@@ -77,14 +70,14 @@ field = fieldnames(pars);
 tiledlayout(1,numel(field)+1);
 for k = 1:numel(field)
     nexttile;
-    scatter(pars.(field{k}),out.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out.mean.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
 end
 nexttile;
-scatter((1-pars.fa)./pars.ra,(1-out.median.fa)./out.median.ra,5,'filled','MarkerFaceAlpha',.4);
+scatter((1-pars.fa)./pars.ra,(1-out.mean.fa)./out.mean.ra,5,'filled','MarkerFaceAlpha',.4);
 h = refline(1);
 h.Color = 'k';
 title('tex');

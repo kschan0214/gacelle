@@ -105,18 +105,19 @@ y = Sgpu_GT + noise_sigma*randn(size(Sgpu_GT)) + 1i*noise_sigma*randn(size(Sgpu_
 fitting                     = [];
 fitting.optimiser           = 'adam';
 fitting.iteration           = 10000;
-fitting.initialLearnRate    = 0.002;
+fitting.initialLearnRate    = 0.01;
 fitting.decayRate           = 0.001;
-fitting.convergenceValue    = 1e-8;
+fitting.convergenceValue    = 1e-6;
 fitting.lossFunction        = 'l1';
 fitting.tol                 = 1e-8;
 fitting.isDisplay           = false;
 fitting.start               = 'prior';   
-fitting.patience            = 20;   
+fitting.patience            = 5;   
 fitting.convergenceModel        = 'ema';
 fitting.emaDecay                = 0.95;
 fitting.robustConvergence       = true;
 fitting.outlierWeight           = 0.1;
+fitting.parameterTransform      = 'sigmoid';
 % extraData                   = [];
 
 objGPU     = gpuMCRMWI(te,tr,fa,fixed_params);
@@ -127,7 +128,7 @@ objGPU     = gpuMCRMWI(te,tr,fa,fixed_params);
 pars0   = objGPU.estimate_prior(y,mask,extraData);
 
 %% plot result
-figure(99);
+figure;
 field = fieldnames(pars);
 tiledlayout(1,numel(field)-1);
 for k = 1:numel(field)-1

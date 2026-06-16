@@ -861,20 +861,19 @@ classdef gpuNEXI < handle
             if strcmpi(fitting.solver,'mcmc')
 
                 % mcmc
-                
-                fitting2 = mcmc.check_set_default_basic(fitting);
+                fitting2                = mcmc.check_set_default_basic(fitting);
+                fitting2.lossFunction   = 'l2'; % for computing weights
 
             else
 
                 % askadam
-                
                 fitting2 = askadam.check_set_default_basic(fitting);
 
                 if ~isfield(fitting,'regmap');              fitting2.regmap             = 'fa';             end
 
                 if ~iscell(fitting2.regmap)
-                fitting2.regmap = cellstr(fitting2.regmap);
-            end
+                    fitting2.regmap = cellstr(fitting2.regmap);
+                end
 
             end
 

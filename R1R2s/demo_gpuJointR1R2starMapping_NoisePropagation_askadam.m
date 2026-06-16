@@ -33,7 +33,7 @@ pars.R2star = R2star_GT;
 
 b1      = ones(size(M0_GT)); extraData.b1 = b1;
 objGPU  = gpuJointR1R2starMapping(t,tr,fa);
-s       = gather(extractdata(objGPU.FWD(pars, extraData)));
+s       = gather((objGPU.FWD(pars, extraData)));
 s       = permute(reshape(s,[Nt, Nfa, Nsample]),[3 4 5 1 2]);
 mask    = ones(size(s,1:3),'logical');
 
@@ -42,15 +42,8 @@ noiseLv = (M0_GT.')./SNR;
 s       = s + randn(size(s)) .* noiseLv;
 
 %% askadam estimation
-fitting                     = [];
-fitting.optimiser           = 'adam';
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isdisplay           = false;
-fitting.start               = 'prior';   
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting);
 extraData                   = [];
 extraData.b1                = b1.';
 
@@ -58,15 +51,8 @@ objGPU  = gpuJointR1R2starMapping(t,tr,fa);
 out     = objGPU.estimate(s, mask, extraData, fitting);
 
 %% askadam estimation
-fitting                     = [];
-fitting.optimiser           = 'adam';
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isdisplay           = false;
-fitting.start               = 'prior';   
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting);
 fitting.isWeighted          = true;
 fitting.weightMethod        = '1stecho';
 fitting.weightPower         = 2;

@@ -73,7 +73,7 @@ classdef askadam < handle
 
             % Forward signal simulation
             % signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),varargin{:});
-            signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),modelInput{:});
+            signal_FWD = FWDfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams,fitting.parameterTransform),modelInput{:});
             % masking Forward signal if the 'signal_FWD' is not 2D
             if ~ismatrix(signal_FWD); signal_FWD = utils.reshape_ND2GD(signal_FWD, mask); end
             % ensure numerical output
@@ -96,7 +96,7 @@ classdef askadam < handle
             loss_fidelity = mean(residuals);
 
             % regularisation term
-            loss_reg = REGfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams),regulInput{:});
+            loss_reg = REGfunc(this.unscale_parameters(parameters,fitting.lb,fitting.ub,fitting.modelParams,fitting.parameterTransform),regulInput{:});
             
             % compute loss
             loss = loss_fidelity + loss_reg;
@@ -177,8 +177,12 @@ classdef askadam < handle
             if numel(userfuncCell) > 1; fitting.defaultRegularisation = false; end
 
             % --- 2.2 Parameters ---
-            % normalise to [0,1] using parameter bounds
-            parameters = this.set_boundary01(this.initialise_parameter(dims, parameters, fitting, mask), fitting.enableComplex);
+            % linear mode: normalise to [0,1] using parameter bounds, then clamp
+            % sigmoid mode: initialise as unconstrained z values (logit of rescaled theta0); no clamping
+            parameters = this.initialise_parameter(dims, parameters, fitting, mask);
+            if strcmp(fitting.parameterTransform, 'linear')
+                parameters = this.set_boundary01(parameters, fitting.enableComplex);
+            end
 
             % --- 2.3 Optimiser state ---
             averageGrad   = []; averageSqGrad = []; vel           = [];
@@ -288,18 +292,21 @@ classdef askadam < handle
                 fprintf('Final convergence  =  %e\n',double(convergenceCurr));
                 fprintf('Final #iterations  =  %d\n',epoch);
             end
-            % make sure the final results stay within boundary
-            parameters         = this.set_boundary01(parameters,fitting.enableComplex);
-            parameters_minLoss = this.set_boundary01(parameters_minLoss,fitting.enableComplex);
+            % make sure the final results stay within boundary (linear mode only;
+            % sigmoid mode guarantees bounds via sigmoid recovery so clamping is not needed)
+            if strcmp(fitting.parameterTransform, 'linear')
+                parameters         = this.set_boundary01(parameters,fitting.enableComplex);
+                parameters_minLoss = this.set_boundary01(parameters_minLoss,fitting.enableComplex);
+            end
 
             if fitting.isOptimiseMemory
                 parameters          = utils.undo_masking_ND2GD_preserve_struct(parameters,mask);
                 parameters_minLoss  = utils.undo_masking_ND2GD_preserve_struct(parameters_minLoss,mask);
             end
             
-            % rescale the network parameters
-            parameters          = this.unscale_parameters(parameters,           fitting.lb,fitting.ub,fitting.modelParams);
-            parameters_minLoss  = this.unscale_parameters(parameters_minLoss,   fitting.lb,fitting.ub,fitting.modelParams);
+            % rescale the network parameters back to physical units
+            parameters          = this.unscale_parameters(parameters,           fitting.lb,fitting.ub,fitting.modelParams,fitting.parameterTransform);
+            parameters_minLoss  = this.unscale_parameters(parameters_minLoss,   fitting.lb,fitting.ub,fitting.modelParams,fitting.parameterTransform);
             for k = 1:numel(fitting.modelParams)
                 % final iteration result
                 % if ~isscalar(parameters.(fitting.modelParams{k}))
@@ -347,13 +354,28 @@ classdef askadam < handle
                
                 % if starting points are provided
                 if ~isempty(pars0)
-                    % random initialisation
-                    tmp =   rand(size(pars0.(modelParams{k})),'single') ;     % values between [0,1]
-                    tmp =  (1-randomness)* this.rescale01(pars0.(modelParams{k}), lb(k), ub(k)) + randomness*tmp;     % values between [0,1]
+                    if strcmp(fitting.parameterTransform, 'sigmoid')
+                        % Logit initialisation: map physical theta0 -> z in (-inf,+inf)
+                        % Clamp away from exact bounds before logit to avoid -Inf/+Inf
+                        eps_bound      = 1e-4 * (ub(k) - lb(k));
+                        theta0_clamped = max(min(single(pars0.(modelParams{k})), ub(k) - eps_bound), lb(k) + eps_bound);
+                        tmp_norm       = askadam.rescale01(theta0_clamped, lb(k), ub(k));   % maps to (0,1)
+                        tmp_z0         = log(tmp_norm ./ (1 - tmp_norm));                   % logit: (0,1) -> (-inf,+inf)
+                        % random perturbation in z-space is Gaussian (not uniform) since z is unbounded
+                        tmp            = (1 - randomness) * tmp_z0 + randomness * randn(size(tmp_z0), 'single');
+                    else
+                        % linear mode: existing rescale01 behaviour
+                        tmp =   rand(size(pars0.(modelParams{k})),'single') ;     % values between [0,1]
+                        tmp =  (1-randomness)* this.rescale01(pars0.(modelParams{k}), lb(k), ub(k)) + randomness*tmp;     % values between [0,1]
+                    end
                 else
-                     % random initialisation
-                    tmp = rand(img_size,'single') ;     % values between [0,1]
-
+                    if strcmp(fitting.parameterTransform, 'sigmoid')
+                        % No starting point: initialise z=0 (midpoint of parameter range) + Gaussian noise
+                        tmp = randomness * randn(img_size, 'single');
+                    else
+                        % random initialisation
+                        tmp = rand(img_size,'single') ;     % values between [0,1]
+                    end
                 end
                 % put it into dlarray
                 parameters.(modelParams{k}) = gpuArray( dlarray( tmp ));
@@ -372,9 +394,13 @@ classdef askadam < handle
 
         function [gradients, loss, loss_fidelity, loss_reg, residuals] = forward_pass(this, accfun, parameters, data, mask, weights, fitting, userfuncCell, varargin)
             % Evaluate forward model, compute loss and gradients via autodiff.
-            % Parameters are clipped to [0,1] before evaluation to enforce bounds.
+            % In linear mode, parameters are clipped to [0,1] before evaluation to enforce bounds.
+            % In sigmoid mode, parameters are unconstrained z-values; clamping is skipped
+            % because the sigmoid in unscale_parameters guarantees physical bounds are satisfied.
 
-            parameters = this.set_boundary01(parameters, fitting.enableComplex);
+            if strcmp(fitting.parameterTransform, 'linear')
+                parameters = this.set_boundary01(parameters, fitting.enableComplex);
+            end
 
             [gradients, loss, loss_fidelity, loss_reg, residuals] = dlfeval(accfun, parameters, data, mask, weights, fitting, userfuncCell, varargin{:});
 
@@ -664,11 +690,16 @@ classdef askadam < handle
             % =====================================================================
             % Optimiser
             % =====================================================================
-            if ~isfield(fitting,'optimiser');        fitting2.optimiser        = 'adam';    end
-            if ~isfield(fitting,'initialLearnRate'); fitting2.initialLearnRate = 0.001;     end
-            if ~isfield(fitting,'decayRate');        fitting2.decayRate        = 0;         end
-            if ~isfield(fitting,'enableComplex');    fitting2.enableComplex    = true;      end
-            if ~isfield(fitting,'randomness');       fitting2.randomness       = 0;         end % starting point
+            if ~isfield(fitting,'optimiser');            fitting2.optimiser            = 'adam';    end
+            if ~isfield(fitting,'initialLearnRate');     fitting2.initialLearnRate     = 0.001;     end
+            if ~isfield(fitting,'decayRate');            fitting2.decayRate            = 0;         end
+            if ~isfield(fitting,'enableComplex');        fitting2.enableComplex        = true;      end
+            if ~isfield(fitting,'randomness');           fitting2.randomness           = 0;         end % starting point
+            % Parameter space transform
+            % 'linear'  : existing rescale01/unscale01 mapping to [0,1] with hard clamping (default, fully backward compatible)
+            % 'sigmoid' : logit initialisation + sigmoid recovery; Adam optimises unconstrained z in (-inf,+inf),
+            %             eliminating artificial boundary sticking at the cost of modified loss surface geometry near bounds
+            if ~isfield(fitting,'parameterTransform'); fitting2.parameterTransform = 'sigmoid'; end
 
             switch fitting2.optimiser
                 case 'adam'
@@ -691,8 +722,8 @@ classdef askadam < handle
             % =====================================================================
             % Basic stopping criteria (iteration and loss convergence)
             % =====================================================================
-            if ~isfield(fitting,'iteration');           fitting2.iteration              = 4000;                 end    % max. iteration
-            if ~isfield(fitting,'convergenceValue');    fitting2.convergenceValue       = 1e-8;                 end    % convergence tolerance
+            if ~isfield(fitting,'iteration');           fitting2.iteration              = 1e4;                  end    % max. iteration
+            if ~isfield(fitting,'convergenceValue');    fitting2.convergenceValue       = 1e-6;                 end    % convergence tolerance
             if ~isfield(fitting,'patience');            fitting2.patience               = 5;                    end    % shared default for all patience counters
             if ~isfield(fitting,'patienceConvergence'); fitting2.patienceConvergence    = fitting2.patience;    end
 
@@ -705,7 +736,7 @@ classdef askadam < handle
             % 'linear' : slope of loss over last convergenceWindow iterations (default)
             % 'ema'    : relative change in exponential moving average of loss
             % =====================================================================
-            if ~isfield(fitting,'convergenceModel');  fitting2.convergenceModel  = 'linear'; end
+            if ~isfield(fitting,'convergenceModel');  fitting2.convergenceModel  = 'ema'; end
             if ~isfield(fitting,'convergenceWindow'); fitting2.convergenceWindow = 20;       end  % used by 'linear' model
             if ~isfield(fitting,'emaDecay');          fitting2.emaDecay          = 0.95;     end  % used by 'ema' model
 
@@ -715,7 +746,7 @@ classdef askadam < handle
             % downweights their gradient contribution. Convergence signal is computed
             % on the main (non-outlier) population only.
             % =====================================================================
-            if ~isfield(fitting,'robustConvergence');      fitting2.robustConvergence      = false;        end
+            if ~isfield(fitting,'robustConvergence');      fitting2.robustConvergence      = true;         end
             if ~isfield(fitting,'outlierThresholdMethod'); fitting2.outlierThresholdMethod = 'behaviour';  end  % placeholder for future options
             if ~isfield(fitting,'outlierWeight');          fitting2.outlierWeight          = 0.1;          end  % gradient contribution of outlier voxels
             if ~isfield(fitting,'weightUpdateInterval');   fitting2.weightUpdateInterval   = 5;            end  % iterations between outlier mask updates
@@ -730,8 +761,8 @@ classdef askadam < handle
             % Additional convergence signals (v1.1)
             % Independent of robustConvergence. Disabled by default (value = 0).
             % =====================================================================
-            if ~isfield(fitting,'convergenceStepTol'); fitting2.convergenceStepTol = 0;                 end  % relative parameter step norm; 0 = disabled
-            if ~isfield(fitting,'convergenceGradTol'); fitting2.convergenceGradTol = 0;                 end  % gradient norm; 0 = disabled
+            if ~isfield(fitting,'convergenceStepTol'); fitting2.convergenceStepTol = 1e-6;                 end  % relative parameter step norm; 0 = disabled
+            if ~isfield(fitting,'convergenceGradTol'); fitting2.convergenceGradTol = 1e-6;                 end  % gradient norm; 0 = disabled
             if ~isfield(fitting,'patienceStep');       fitting2.patienceStep       = fitting2.patience; end
             if ~isfield(fitting,'patienceGrad');       fitting2.patienceGrad       = fitting2.patience; end
 
@@ -792,6 +823,7 @@ classdef askadam < handle
             disp(['Learning rate decay rate     = ' num2str(fitting.decayRate)]);
             disp(['Allow complex-valued         = ' utils.logical2string(fitting.enableComplex)]);
             disp(['Random initialisation        = ' num2str(fitting.randomness)]);
+            disp(['Parameter transform          = ' fitting.parameterTransform]);
             
             switch lower(fitting.optimiser)
                 case 'adam'
@@ -956,19 +988,34 @@ classdef askadam < handle
         %% Scaling tools
 
         % undo rescale the network parameters between the defined lower/upper bounds
-        function parameters = unscale_parameters(parameters,lb,ub,modelParams)
+        % parameterTransform: 'linear' (default) uses unscale01; 'sigmoid' applies sigmoid recovery
+        % The sigmoid branch is differentiable for all finite z, preventing boundary sticking.
+        function parameters = unscale_parameters(parameters, lb, ub, modelParams, parameterTransform)
+            if nargin < 5; parameterTransform = 'linear'; end
             for k = 1:numel(ub)
-                parameters.(modelParams{k}) = askadam.unscale01(parameters.(modelParams{k}), lb(k), ub(k));
+                if strcmp(parameterTransform, 'sigmoid')
+                    % z is unconstrained; sigmoid maps it to (0,1), then scale to (lb, ub)
+                    parameters.(modelParams{k}) = lb(k) + (ub(k) - lb(k)) .* (1 ./ (1 + exp(-parameters.(modelParams{k}))));
+                else
+                    parameters.(modelParams{k}) = askadam.unscale01(parameters.(modelParams{k}), lb(k), ub(k));
+                end
             end
-
         end
 
         % rescale the network parameters between the defined lower/upper bounds
-        function parameters = rescale_parameters(parameters,lb,ub,modelParams)
+        % parameterTransform: 'linear' (default) uses rescale01; 'sigmoid' applies logit
+        function parameters = rescale_parameters(parameters, lb, ub, modelParams, parameterTransform)
+            if nargin < 5; parameterTransform = 'linear'; end
             for k = 1:numel(ub)
-                parameters.(modelParams{k}) = askadam.rescale01(parameters.(modelParams{k}), lb(k), ub(k));
+                if strcmp(parameterTransform, 'sigmoid')
+                    eps_bound  = 1e-4 * (ub(k) - lb(k));
+                    theta_clamped = max(min(parameters.(modelParams{k}), ub(k) - eps_bound), lb(k) + eps_bound);
+                    tmp_norm   = askadam.rescale01(theta_clamped, lb(k), ub(k));
+                    parameters.(modelParams{k}) = log(tmp_norm ./ (1 - tmp_norm));  % logit
+                else
+                    parameters.(modelParams{k}) = askadam.rescale01(parameters.(modelParams{k}), lb(k), ub(k));
+                end
             end
-
         end
 
         % rescale input between 0 and 1 given lower and upper bounds

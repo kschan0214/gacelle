@@ -24,7 +24,7 @@ classdef gpuMCRMWI < handle
         modelParams     = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW'; 'R2sIW'; 'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
         ub              = [    2;     0.3;      1;       2;      10;     200;      50;      50;     0.25;    0.05;       0.4;   pi/2];
         lb              = [ 1e-8;    1e-8;   1e-8;     1/3;    1e-8;      50;1/150e-3;1/150e-3;    -0.05;    -0.1;      -0.4;  -pi/2];
-        startPoint      = [    1;     0.1;    0.6;       1;    1e-8;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8];
+        startPoint      = [    1;     0.1;    0.6;       1;    1;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8];
 
     end
 

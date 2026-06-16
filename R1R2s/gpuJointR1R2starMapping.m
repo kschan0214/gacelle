@@ -38,9 +38,9 @@ classdef gpuJointR1R2starMapping < handle
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('========================================================');
-            disp('Joint R1-R2* mapping with vFA-mGRE data - askAdam solver');
-            disp('========================================================');
+            disp('=======================================');
+            disp('Joint R1-R2* mapping with vFA-mGRE data');
+            disp('=======================================');
 
             
             disp('----------------')
@@ -119,7 +119,7 @@ classdef gpuJointR1R2starMapping < handle
                 end
     
                 % divide the data if requried
-                slice                           = sliceBoundaries{kseg};
+                slice                               = sliceBoundaries{kseg};
                 [dataSeg, maskSeg, extraDataSeg]    = this.slice_segment(data, mask, slice, extraData);
 
                 % run fitting
@@ -308,7 +308,7 @@ classdef gpuJointR1R2starMapping < handle
 
             % DESPOT1 linear inversion
             despot1Obj  = despot1(this.tr,this.fa);
-            [t10, m00]  = despot1Obj.estimate(permute(abs(data(:,:,:,1,:)),[1 2 3 5 4]),mask,extraData.b1);
+            [t10, m00]  = despot1Obj.estimate(double(permute(abs(data(:,:,:,1,:)),[1 2 3 5 4])),mask,extraData.b1);
             R10 = 1./t10;
             mask_valid = and(~isnan(m00),~isinf(m00));
             m00(mask_valid == 0) = this.lb(1); m00(m00<this.lb(1)) = this.lb(1); m00(m00>this.ub(1)) = this.ub(1);
@@ -439,8 +439,8 @@ classdef gpuJointR1R2starMapping < handle
             % make sure input data are valid
             [mask,extradata] = this.validate_input(img,mask,extradata);
 
-            despot1_obj          = despot1(this.tr,this.fa);
-            [~, m0, mask_fitted] = despot1_obj.estimate(permute(abs(img(:,:,:,1,:)),[1 2 3 5 4]), mask, extradata.b1);
+            despot1_obj          = despot1(double(this.tr),double(this.fa));
+            [~, m0, mask_fitted] = despot1_obj.estimate(permute(abs(double(img(:,:,:,1,:))),[1 2 3 5 4]), mask, extradata.b1);
 
             scaleFactor = prctile( m0(mask_fitted>0), 98);
 
@@ -513,10 +513,21 @@ classdef gpuJointR1R2starMapping < handle
         %% Utilities
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting)
-            % get basic fitting setting check
-            fitting2 = askadam.check_set_default_basic(fitting);
 
-            if ~isfield(fitting,'solver');      fitting2.solver = 'askadam';        end
+            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
+
+            % get basic fitting setting check
+            if strcmpi(fitting.solver,'mcmc')
+
+                % mcmc
+                fitting2 = mcmc.check_set_default_basic(fitting);
+
+            else
+
+                % askadam
+                fitting2 = askadam.check_set_default_basic(fitting);
+
+            end
 
             % get customised fitting setting check
             if ~isfield(fitting,'weightMethod');        fitting2.weightMethod   = '1stecho';        end
