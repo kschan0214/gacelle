@@ -1,4 +1,4 @@
-addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/gacelle'))
+addpath(genpath('../gacelle'))
 addpath('/autofs/space/linen_001/users/kwokshing/tools/sepia/sepia_master');
 sepia_addpath;
 
@@ -75,18 +75,18 @@ fitting                     = objGPU.check_set_default(fitting);
 obj     = gpuJointR1R2starMapping(te,tr,fa);
 [out]   = obj.estimate(img, mask, extradata, fitting);
 
-%% MCMC
-% Magnitude fitting
-% setup algorithm parameters
-fitting                     = [];
-fitting.solver              = 'mcmc';
-fitting                     = objGPU.check_set_default(fitting);
-fitting.algorithm           = 'ensemble';
-fitting.iteration           = 1e4;
-fitting.thinning            = 10;        % Sample every 20 iteration
-fitting.metric              = {'median','iqr'};
-fitting.burnin              = 0.1;       % 10% burn-in
-fitting.Nwalker             = 30;
-
-obj         = gpuJointR1R2starMapping(te,tr,fa);
-[out_mcmc]  = obj.estimate(img, mask, extradata, fitting);
+% %% MCMC
+% % Magnitude fitting
+% % setup algorithm parameters
+% fitting                     = [];
+% fitting.solver              = 'mcmc';
+% fitting                     = objGPU.check_set_default(fitting);
+% fitting.algorithm           = 'ensemble';
+% fitting.iteration           = 1e4;
+% fitting.thinning            = 10;        % Sample every 20 iteration
+% fitting.metric              = {'median','iqr'};
+% fitting.burnin              = 0.1;       % 10% burn-in
+% fitting.Nwalker             = 30;
+% 
+% obj         = gpuJointR1R2starMapping(te,tr,fa);
+% [out_mcmc]  = obj.estimate(img, mask, extradata, fitting);

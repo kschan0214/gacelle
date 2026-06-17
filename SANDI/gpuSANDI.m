@@ -12,13 +12,19 @@ classdef gpuSANDI < handle
         % De        : diffusivity of extracellular water [ms/us^2]
         % noise     : noise
 
-        epsilon = utils.epsilon;
-
         modelParams     = {'Rs'     ;'fs'   ; 'f'   ;'Da'   ;'De'   ;'noise'};
         ub              = [  15     ;   1   ;   1   ;   3   ;   3   ;    0.1];
-        lb              = [epsilon  ;epsilon;epsilon;epsilon;epsilon;  0.001];
+        lb              = [1e-8     ;1e-8   ;1e-8   ;1e-8   ;1e-8   ;  0.001];
         startPoint      = [   7     ; 0.2   ; 0.4   ;      2;      1;  0.005];
         step            = [0.79     ;0.05   ;0.05   ;0.15   ;0.15   ;  0.005];
+
+        epsilon = utils.epsilon;
+
+        % default threshold for data exclusion
+        thres_similarity    = 0.1; 
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
+
     end
 
     properties (GetAccess = public, SetAccess = protected)
@@ -49,30 +55,24 @@ classdef gpuSANDI < handle
         % ----------
         % obj       : object of a fitting class
         %
-        % Usage
-        % ----------
-        % obj                   = gpuSANDI(b, Delta, Nav);
-        % [out, fa, Da, De, r]  = obj.fit(S, mask, fitting,);
-        % Sfit                  = smt.FWD([fa, Da, De, r]);
-        % [x_train, S_train]    = obj.traindata(1e4);
-        % pars0                 = smt.likelihood(S, x_train, S_train);
-        % [out, fa, Da, De, r]  = smt.fit(S, mask, fitting, pars0);
-        %
         % Author:
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu) 
         %  
             this.Ds     = single(Ds);           % intrinsic diffusivity of soma 
 
-            this.b      = single(b(:)) ;
-            this.ldelta = single(ldelta(:));
-            this.BDelta = single(BDelta(:)) ;
+            % handle full b-value vector and Big delta vector
+            [bval_sorted,ldelta_sorted,BDELTA_sorted,~] = DWIutility.unique_shell_keepb0(b,ldelta,BDelta,[],true);
+
+            this.b      = single(bval_sorted(:)) ;
+            this.ldelta = single(ldelta_sorted(:));
+            this.BDelta = single(BDELTA_sorted(:)) ;
             this.g      = sqrt(this.b./this.ldelta.^2./(this.BDelta-this.ldelta/3));
 
             if nargin > 4
                 this.Nav = varargin{1} ;
                 this.Nav = this.Nav(:) ;
             else
-                this.Nav =  ones(size(b)) ;
+                this.Nav =  ones(size(this.b)) ;
             end
             
         end
@@ -89,10 +89,6 @@ classdef gpuSANDI < handle
                 this.startPoint(idx)        = [];
                 this.step(idx)              = [];
             end
-            % this.b      = gpuArray(this.b);
-            % this.ldelta = gpuArray(this.ldelta);
-            % this.BDelta = gpuArray(this.BDelta);
-            % this.g      = gpuArray(this.g);
 
         end
 
@@ -106,10 +102,16 @@ classdef gpuSANDI < handle
             disp('----------------')
             disp('Data Information');
             disp('----------------')
-            fprintf('b-shells [ms/um2]              : [%s] \n',num2str(this.b.',' %.2f'));
-            fprintf('Gradient duration [ms]         : [%s] \n',num2str(this.ldelta.',' %.2f'));
-            fprintf('Diffusion time [ms]            : [%s] \n',num2str(this.BDelta.',' %i'));
+            fprintf('b-shells [ms/um2]                      : [%s] \n',num2str(this.b.',' %.2f'));
+            fprintf('Gradient duration [ms]                 : [%s] \n',num2str(this.ldelta.',' %.2f'));
+            fprintf('Diffusion time [ms]                    : [%s] \n',num2str(this.BDelta.',' %i'));
             disp('----------------');
+            disp('----------------');
+            disp('Tissue Parameter');
+            disp('----------------');
+            fprintf('Intrinsic diffusivity of soma [um2/ms] : %s \n', num2str(this.Ds,' %.2f'));
+            disp('----------------');
+            
         end
 
         %% higher-level data fitting functions
@@ -139,17 +141,11 @@ classdef gpuSANDI < handle
             this.display_data_model_info;
 
             % get all fitting algorithm parameters 
-            fitting = this.check_set_default(fitting);
-
-            % get matrix size
-            dims = size(data,1:3);
+            fitting     = this.check_set_default(fitting);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [this,data] = this.prepare_dwi_data(data,extradata,fitting.lmax);
-
-            % mask sure no nan or inf
-            [data,mask] = utils.remove_img_naninf(data,mask);
+            [data, mask] = this.prepare_dwi_data(data,mask,extradata,0);  % spherical mean
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -223,9 +219,6 @@ classdef gpuSANDI < handle
         %
         %
             
-            % check GPU
-            gpool = gpuDevice;
-            
             % get image size
             dims = size(dwi,1:3);
 
@@ -270,7 +263,7 @@ classdef gpuSANDI < handle
                     out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
                 case 'mcmc'
                     fitting.xStepSize = this.step;
-                    
+
                     mcmcObj     = mcmc(); 
                     out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
             end
@@ -281,7 +274,7 @@ classdef gpuSANDI < handle
             disp('The estimation is completed.');
             
             % clear GPU
-            % reset(gpool)
+            reset(gpuDevice)
             
         end
 
@@ -313,9 +306,11 @@ classdef gpuSANDI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [this,dwi] = prepare_dwi_data(this,dwi,extradata,lmax)
+        function [dwi,mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
+                % compute spherical mean signal
+                fprintf('Computing rotationally invariant signal...')
 
                 % compute rotationally invariant signal
                 if isscalar(extradata.ldelta)
@@ -324,18 +319,75 @@ classdef gpuSANDI < handle
                 if isscalar(extradata.BDELTA)
                     extradata.BDELTA = ones(size(extradata.bval))*extradata.BDELTA;
                 end
-                DWIutils                        = DWIutility();
-                [dwi,bval_sorted,BDELTA_sorted,ldelta_sorted] = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,[],lmax);
+                DWIutils    = DWIutility();
+                [dwi]       = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,[],lmax);
                 
-                % update obj
-                this = gpuSANDI(bval_sorted,ldelta_sorted,BDELTA_sorted,this.Ds,this.Nav);
+                fprintf('done.\n');
 
-            elseif size(dwi,4) < numel(this.b)
-                error('There are more b-shells in the class object than available in the input data. Please check your input data.');
+            elseif size(dwi,4) < numel(this.b) * (lmax/2+1)
+                error('GACELLE:inputMismatch', ...
+                    'Input has %d volumes but model expects %d. Check lmax or input data.', ...
+                    size(dwi,4), numel(this.b)*(lmax/2+1));
             end
 
-            % normalised by the first volume
-            dwi = dwi ./ dwi(:,:,:,1);
+            % --- Step 2: exclude biophysically impossible signal ---
+            % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
+            % works for both magnitude and real-valued data
+            Nshells         = numel(this.b);
+            dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
+            mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
+            mask_valid      = ~mask_impossible;
+
+            % --- Step 3: exclude near-zero signal (background voxels) ---
+            % Sl0 of lowest b-value shell should be well above zero for tissue
+            % very small value indicates background noise with no diffusion signal
+            mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+            mask_valid      = mask_valid & ~mask_background;
+
+            % --- Step 4: exclude incoherent signal (random noise pattern) ---
+            % correlate each voxel's Sl0 signal with the median tissue template
+            % median is more robust to outliers than mean
+            % low correlation indicates random noise rather than coherent diffusion decay
+            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0, mask_valid);
+            if size(dwi_2D, 2) > 0
+                signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
+                signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
+                                  std(signalTemplate,'omitmissing');
+        
+                Rcorr = zeros(1, size(dwi_2D,2));
+                for k = 1:size(dwi_2D,2)
+                    signalVoxel = dwi_2D(:,k);
+                    denom       = std(signalVoxel);
+                    if denom < eps
+                        Rcorr(k) = 0;   % flat signal -> zero correlation
+                    else
+                        signalVoxel = (signalVoxel - mean(signalVoxel)) ./ denom;
+                        Rcorr(k)    = corr(signalTemplate, signalVoxel);
+                    end
+                end
+        
+                Rcorr           = utils.reshape_GD2ND(Rcorr, mask_valid);
+                mask_incoherent = Rcorr < this.thres_similarity;
+                mask_valid      = mask_valid & ~mask_incoherent;
+            end
+
+            % --- Step 5: remove NaN/Inf ---
+            [dwi,mask_naninf] = utils.remove_img_naninf(dwi,mask);
+            mask_naninf        = max(mask_naninf, [], 4);
+            mask_valid         = mask_valid & mask_naninf;
+
+            % --- Report and update mask ---
+            Nexcluded = sum(mask(:)) - sum(mask_valid(:));
+            if Nexcluded > 0
+                fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
+                    Nexcluded, 100*Nexcluded/sum(mask(:)));
+                fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
+                fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
+                fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
+                fprintf('  Incoherent     : %d\n', sum(mask_incoherent(:) & mask(:)));
+                disp('Please use the updated mask in subsequent analysis.');
+                mask = mask_valid;
+            end
 
         end
 
@@ -410,12 +462,11 @@ classdef gpuSANDI < handle
 
             % find masked voxels
             ind     = find(mask(:));
-            Nparam  = numel(this.modelParams);
-            % if lmax == 0
-            %     Nparam = numel(this.modelParams);
-            % elseif lmax == 2
-            %     Nparam = 7;
-            % end
+            if lmax == 0
+                Nparam = 5;
+            elseif lmax == 2
+                Nparam = 6;
+            end
 
             pars0_mask  = zeros(Nparam,length(ind));
             if ~isempty(pool)
@@ -455,17 +506,13 @@ classdef gpuSANDI < handle
                 delete(pool);
             end
 
-            % smooth out outliers
-            for kp = 1:size(pars,4)
-                if size(pars,1) > 1 && size(pars,2) > 1
-                    for kz = 1:size(pars,3)
-                        pars(:,:,kz,kp) = medfilt2(pars(:,:,kz,kp), [3 3]);
-                    end
-                end
-            end
-
             for km = 1:size(pars,4)
                 pars0.(this.modelParams{km}) = pars(:,:,:,km); ...
+            end
+
+            % noise
+            if strcmpi(this.modelParams{end},'noise')
+                pars0.(this.modelParams{end}) = single(ones(size(mask)) * this.startPoint(end));
             end
 
         end
@@ -483,13 +530,13 @@ classdef gpuSANDI < handle
                 intervals = varargin{1};
             end
             
-            numParam = numel(this.modelParams);
-            numBSample = numel(this.b) * (lmax/2+1);
-            % if lmax == 0
-            %     numBSample = numel(this.b);
-            % elseif lmax == 2
-            %     numBSample = numel(this.b)*2;
-            % end
+            if lmax == 0
+                numBSample = numel(this.b);
+                numParam   = size(intervals,1) - 1;
+            elseif lmax == 2
+                numBSample = numel(this.b)*2;
+                numParam   = size(intervals,1);
+            end
             
             % batch size can be modified according to available hardware
             batch_size  = 1e3;
@@ -643,8 +690,8 @@ classdef gpuSANDI < handle
                 S = signal_SANDI(fs,f,Ssoma,Sneurite,Sextra);
             end
 
-            % normalised to 1st data point
-            S = S ./ S(1,:,:,:,:);
+            % % normalised to 1st data point
+            % S = S ./ S(1,:,:,:,:);
             
         end
         
@@ -668,11 +715,16 @@ classdef gpuSANDI < handle
                 end
 
             else
-                fitting2 = mcmc.check_set_default_basic(fitting);
-                fitting2.lossFunction = [];
+                fitting2                = mcmc.check_set_default_basic(fitting);
+                fitting2.lossFunction   = [];
             end
 
+            if isfield(fitting2,'lmax') && fitting2.lmax >0
+                warning('gpuSANDI:warning',...
+                        'Higher order rotationally invariant model is not yet supported. Using lmax=0 instead.');
+            end
             fitting2.lmax = 0; % No lmax = 2 for now
+            
             if ~isfield(fitting,'start');       fitting2.start      = 'likelihood';     end
             if ~isfield(fitting,'pulseType');   fitting2.pulseType  = 'wide';           end
 

@@ -16,16 +16,21 @@ classdef gpuMEAxCaliberSMT < handle
         % k2a   : rate of axon radius induced T2 [um/s]
         % R2a   : Intrinsic neurite R2 [1/s]
         % 
-        modelParams     = {'f'; 'fcsf';'DeR';  'r';'R2e';'k2a';'R2a'};
-        ub              = [  1;      1;  1.7;    5;   50;    4; 20];
-        lb              = [  0;      0;    0;1e-10;    1;    0;  5];
-        startPoint      = [0.6;      0;    2;    1;   30;  2.4;  8];
+        modelParams     = {'f'; 'fcsf';'DeR';  'r';'R2e';'k2a';'R2a';'noise'};
+        ub              = [  1;      1;  1.7;    5;   50;    4;   20;   0.1];
+        lb              = [  0;      0;    0;1e-10;    1;    0;    5;  0.01];
+        startPoint      = [0.6;   0.05;    1;    1;   30;  2.4;    8; 0.005];
+        step            = [0.05;   0.1; 0.48;  0.8;  3.5; 0.29; 1.07; 0.005];
 
+        % default threshold for data exclusion
+        thres_similarity    = 0.1; 
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
     end
 
     properties (Constant)
 
-        epsilon = 1e-10;
+        epsilon = utils.epsilon;
 
         bm  = [1.8412    5.3314    8.5363   11.7060   14.8636   18.0155   21.1644   24.3113   27.4571   30.6019 ...
               33.7462   36.8900   40.0334   43.1766   46.3196   49.4624   52.6050   55.7476   58.8900   62.0323];
@@ -90,22 +95,25 @@ classdef gpuMEAxCaliberSMT < handle
         %  Authors: 
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu)
         %
-            
+            % handle full b-value vector and Big delta vector
+            [bval_sorted,ldetla_sorted,BDELTA_sorted,te_sorted] = DWIutility.unique_shell_keepb0(b,delta,Delta,te,true);
+
             % sequence parameters
             % diffusion
-            b           = max(b,1e-10); % make sure b is not zero
-            this.b      = (single( b(:)) );
-            this.delta  = (single( delta(:))) ;
-            this.Delta  = (single( Delta(:))) ;
-            this.g      = (single( sqrt(b(:)./delta(:).^2./(Delta(:)-delta(:)/3)))) ;
+            bval_sorted = max(bval_sorted,1e-10); % make sure b is not zero
+            this.b      = (single( bval_sorted(:)) );
+            this.delta  = (single( ldetla_sorted(:))) ;
+            this.Delta  = (single( BDELTA_sorted(:))) ;
+
+            this.g      = (single( sqrt(this.b(:)./this.delta(:).^2./(this.Delta(:)-this.delta(:)/3)))) ;
             % relaxation
-            if isempty(te)
+            if isempty(te_sorted)
                 this.te = zeros(size(this.b));    % no input te assume single TE
             else
-                if isscalar(unique(te))
+                if isscalar(unique(te_sorted))
                     this.te = zeros(size(this.b));    % only 1 TE then set TE to 0
                 else
-                    this.te = single(te(:));    % same length as b or scalar (if Nt==1)
+                    this.te = single(te_sorted(:));    % same length as b or scalar (if Nt==1)
                 end
             end
             
@@ -120,7 +128,7 @@ classdef gpuMEAxCaliberSMT < handle
             if isfield(tissueProperties,'R2c');     this.R2c    = (single( R2c ));      end
             if isfield(tissueProperties,'rho2');    this.rho2   = (single( rho2 ));     end
 
-            if ~isempty(model); this.model  = model;                        end  
+            if ~isempty(model);                     this.model  = model;                end  
 
             this.Scsf   = ( single(exp(-this.b*this.Dcsf).*exp(-this.te*this.R2csf)) );
 
@@ -128,6 +136,16 @@ classdef gpuMEAxCaliberSMT < handle
 
         % update properties according to lmax
         function this = updateProperty(this, fitting)
+
+            % property change in related to solver
+            if ~strcmpi(fitting.solver,'mcmc')
+                idx = find(ismember(this.modelParams,'noise'));
+                this.modelParams(idx)       = [];
+                this.lb(idx)                = [];
+                this.ub(idx)                = [];
+                this.startPoint(idx)        = [];
+                this.step(idx)              = [];
+            end
 
             % only 1 TE, reduce the model to standard AxCaliberSMT
             if unique(this.te) == 0
@@ -171,9 +189,9 @@ classdef gpuMEAxCaliberSMT < handle
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('==================================================');
-            disp('Multi-echo (ME) AxCaliberSMT with askadam.m solver');
-            disp('==================================================');
+            disp('============================');
+            disp('Multi-echo (ME) AxCaliberSMT');
+            disp('============================');
 
             disp('----------------')
             disp('Data Information');
@@ -186,9 +204,9 @@ classdef gpuMEAxCaliberSMT < handle
             end
             disp('----------------')
 
-            disp('----------------')
-            disp('Fixed parameters');
-            disp('----------------')
+            disp('-----------------')
+            disp('Tissue parameters');
+            disp('-----------------')
             disp(['Diffusivity intra-cellular intrinsic (um2/ms): ' num2str(this.D0,'%.2f')]);
             disp(['Diffusivity intra-cellular axial (um2/ms)    : ' num2str(this.Da,'%.2f')]);
             disp(['Diffusivity extra-cellular axial (um2/ms)    : ' num2str(this.DeL,'%.2f')]);
@@ -205,7 +223,7 @@ classdef gpuMEAxCaliberSMT < handle
 
         % This is a wrapper of the 'fit' function.
         % The main purpose of this function is to handle memory issue and ensure the input data is correct for 'fit'
-        function  [out] = estimate(this, dwi, mask, fitting, extraData, pars0)
+        function  [out] = estimate(this, data, mask, fitting, extraData, pars0)
         % Input data are expected in multi-dimensional image
         % 
         % Input
@@ -231,67 +249,63 @@ classdef gpuMEAxCaliberSMT < handle
             this.display_data_model_info;
 
             % get all fitting algorithm parameters 
-            fitting = this.check_set_default(fitting);
-
-            % get matrix size
-            dims = size(dwi,1:3);
+            fitting     = this.check_set_default(fitting);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             lmax        = 0;    % only spherical mean
-            [this,dwi]  = this.prepare_dwi_data(dwi,extraData,lmax);
-
-            % mask sure no nan or inf in data
-            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
+            [data,mask] = this.prepare_dwi_data(data,mask,extraData,lmax);
 
             % convert datatype to single or logical
-            dwi     = single(dwi);
+            data    = single(data);
             mask    = mask >0;
             if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
-            %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
-            % determine if we need to divide the data to fit in GPU
-            gpool = gpuDevice;  reset(gpool);
-            memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.01;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
             
+            % --- [Experimental] estimate memory usage using a small batch of data size ---
+            % this method tends to be more conservative than the actual memory ussage
+            [sliceBoundaries,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+
             % parameter estimation
             out = [];
-            for ks = 1:NSegment
-
-                fprintf('Running #Segment = %d/%d \n',ks,NSegment);
-                disp   ('------------------------')
-    
-                if ks ~= NSegment
-                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
-                else
-                    slice = 1+(ks-1)*maxSlice : dims(3);
+            for kseg = 1:NSegment
+                
+                if NSegment > 1
+                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
+                    disp   ('------------------------')
                 end
-                
-                dwi_tmp     = dwi(:,:,slice,:);
-                mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end; else; pars0_tmp = []; end
-                
-                [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+    
+                % divide the data if requried
+                slice                           = sliceBoundaries{kseg};
+                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, slice, pars0);
+
+                % run fitting
+                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
 
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
 
             end
             out.mask = mask;
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
-            askadam.save_askadam_output(fitting.outputFilename,out)
+            % askadam.save_askadam_output(fitting.outputFilename,out)
+            switch fitting.solver
+                case 'askadam'
+                    askadam.save_askadam_output(fitting.outputFilename,out)
+                case 'mcmc'
+                    mcmc.save_mcmc_output(fitting.outputFilename,out)
+            end
 
         end
 
         % Data fitting function
         % This is a wapper of the askadam class 'fit' function
-        function [out] = fit(this,dwi,mask,fitting, pars0)
+        function [out] = fit(this,data,mask,fitting, pars0)
         %
         % Input
         % -----------
@@ -324,12 +338,9 @@ classdef gpuMEAxCaliberSMT < handle
         % Date created: 1 Oct 2025
         % Date modified:
         %
-            
-            % check GPU
-            gpool = gpuDevice;
-            
+
             % check image size
-            dims = size(dwi,1:3);
+            dims = size(data,1:3);
 
             %%%%%%%%%%%%%%%%%%%% Step 1. Validate and parse input %%%%%%%%%%%%%%%%%%%%
             if nargin < 3 || isempty(mask); mask = ones(dims,'logical'); end % if no mask input then fit everthing
@@ -357,18 +368,26 @@ classdef gpuMEAxCaliberSMT < handle
             w       = this.compute_optimisation_weights(mask,fitting.lossFunction,lmax); % This is a customised funtion
 
             % 2.2 estimate prior if needed
-            if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
+            if isempty(pars0);  pars0 = this.determine_x0(data,mask,fitting); end
 
-            % 2.3 askAdam optimisation main
-            askadamObj  = askadam(); 
-            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD);
+            % 2.3 optimisation main
+            switch fitting.solver
+                case 'askadam'
+                    askadamObj  = askadam();
+                    out         = askadamObj.optimisation( data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+                case 'mcmc'
+                    fitting.xStepSize = this.step;
+                    
+                    mcmcObj     = mcmc(); 
+                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+            end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
             disp('The estimation is completed.');
             
             % clear GPU
-            reset(gpool)
+            reset(gpuDevice)
 
         end
 
@@ -376,7 +395,7 @@ classdef gpuMEAxCaliberSMT < handle
 
         % compute rotationally invariant DWI signal if necessary
         % TODO
-        function [this,dwi] = prepare_dwi_data(this,dwi,extradata,lmax)
+        function [dwi,mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
             
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
@@ -397,23 +416,70 @@ classdef gpuMEAxCaliberSMT < handle
 
                 fprintf('done.\n');
 
-            elseif size(dwi,4) < numel(this.b)
-                error('There are more b-shells in the class object than available in the input data. Please check your input data.');
+            elseif size(dwi,4) < numel(this.b) * (lmax/2+1)
+                error('GACELLE:inputMismatch', ...
+                    'Input has %d volumes but model expects %d. Check lmax or input data.', ...
+                    size(dwi,4), numel(this.b)*(lmax/2+1));
             end
 
-            % sort the order of the signal based on TE, Delta, delta and b, then normalise the signal by the smallest b-value and shortest TE
-            acqTable = [this.b, this.te, this.Delta, this.delta, (1:numel(this.te)).'];
-            
-            % Sort rows first by TE, Delta, delta and finally b
-            sorted_data = sortrows(acqTable, [2,3,4,1]);
-            idx         = uint16(sorted_data(:,end));
+            % --- Step 2: exclude biophysically impossible signal ---
+            % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
+            % works for both magnitude and real-valued data
+            Nshells         = numel(this.b);
+            dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
+            mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
+            mask_valid      = ~mask_impossible;
 
-            % sort b,te,Delta,delta
-            this.b      = this.b(idx);
-            this.te     = this.te(idx);
-            this.Delta  = this.Delta(idx);
-            this.Delta  = this.Delta(idx);
-            dwi         = dwi(:,:,:,idx);
+            % --- Step 3: exclude near-zero signal (background voxels) ---
+            % Sl0 of lowest b-value shell should be well above zero for tissue
+            % very small value indicates background noise with no diffusion signal
+            mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+            mask_valid      = mask_valid & ~mask_background;
+
+            % --- Step 4: exclude incoherent signal (random noise pattern) ---
+            % correlate each voxel's Sl0 signal with the median tissue template
+            % median is more robust to outliers than mean
+            % low correlation indicates random noise rather than coherent diffusion decay
+            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0, mask_valid);
+            if size(dwi_2D, 2) > 0
+                signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
+                signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
+                                  std(signalTemplate,'omitmissing');
+        
+                Rcorr = zeros(1, size(dwi_2D,2));
+                for k = 1:size(dwi_2D,2)
+                    signalVoxel = dwi_2D(:,k);
+                    denom       = std(signalVoxel);
+                    if denom < eps
+                        Rcorr(k) = 0;   % flat signal -> zero correlation
+                    else
+                        signalVoxel = (signalVoxel - mean(signalVoxel)) ./ denom;
+                        Rcorr(k)    = corr(signalTemplate, signalVoxel);
+                    end
+                end
+        
+                Rcorr           = utils.reshape_GD2ND(Rcorr, mask_valid);
+                mask_incoherent = Rcorr < this.thres_similarity;
+                mask_valid      = mask_valid & ~mask_incoherent;
+            end
+
+            % --- Step 5: remove NaN/Inf ---
+            [dwi,mask_naninf] = utils.remove_img_naninf(dwi,mask);
+            mask_naninf        = max(mask_naninf, [], 4);
+            mask_valid         = mask_valid & mask_naninf;
+
+            % --- Report and update mask ---
+            Nexcluded = sum(mask(:)) - sum(mask_valid(:));
+            if Nexcluded > 0
+                fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
+                    Nexcluded, 100*Nexcluded/sum(mask(:)));
+                fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
+                fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
+                fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
+                fprintf('  Incoherent     : %d\n', sum(mask_incoherent(:) & mask(:)));
+                disp('Please use the updated mask in subsequent analysis.');
+                mask = mask_valid;
+            end
 
             % normalised by the first volume
             dwi = dwi ./ dwi(:,:,:,1);
@@ -525,7 +591,11 @@ classdef gpuMEAxCaliberSMT < handle
             % find masked voxels
             ind     = find(mask(:));
 
-            Nparam = numel(this.modelParams) ;
+            if ~strcmpi(this.modelParams{end},'noise')
+                Nparam = numel(this.modelParams) ;
+            else
+                Nparam = numel(this.modelParams) -1;
+            end
 
             pars0_mask  = zeros(Nparam,length(ind),'single');
             if ~isempty(pool)
@@ -560,6 +630,9 @@ classdef gpuMEAxCaliberSMT < handle
                 pars0.k2a  = unique(pars0.k2a);
             end
 
+            % noise
+            pars0.(this.modelParams{end}) = single(ones(size(mask)) * this.startPoint(end));
+
         end
 
         % generate training data for likelihood
@@ -578,7 +651,12 @@ classdef gpuMEAxCaliberSMT < handle
             end
 
             numBSample  = numel(gather(this.b));
-            numParam    = numel(this.modelParams);
+            if ~strcmpi(this.modelParams{end},'noise')
+                numParam    = numel(this.modelParams);
+            else
+                numParam    = numel(this.modelParams) - 1;
+            end
+
             % batch size can be modified according to available hardware
             batch_size  = 1e3;
             reps        = ceil(N_samples/batch_size);
@@ -662,10 +740,29 @@ classdef gpuMEAxCaliberSMT < handle
 
         end
     
+        % segment data based on slice
+        function [dataSeg, maskSeg, pars0Seg] = slice_segment(this, data, mask, slice, pars0)
+
+            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
+            maskSeg     = mask(:,:,slice);
+            if ~isempty(pars0)
+                for km = 1:numel(this.modelParams)
+                    pars0Seg.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); 
+                end
+            else      
+                pars0Seg = [];                 
+            end
+
+        end
+
         %%  Signal related functions
         
         % Forward model
-        function s = FWD(this, pars)
+        function s = FWD(this, pars, solver)
+
+            if nargin < 3 
+                solver = [];
+            end
 
             % minimal fitting parameters
             f   = pars.f;
@@ -694,11 +791,15 @@ classdef gpuMEAxCaliberSMT < handle
             end
 
             % intra-axonal signal
-            Sa = this.diffusion_relaxation_SMT_stick(this.g, this.delta, this.Delta, this.b,this.te,this.D0,r,this.Da, R2a, k2a, this.model) ;
+            Sa = this.diffusion_relaxation_SMT_stick(this.g, this.delta, this.Delta, this.b,this.te,this.D0,r,this.Da, R2a, k2a, this.model, solver) ;
             % extracellular signal
-            Se = this.diffusion_relaxation_SMT_zeppelin(this.b,this.te,this.DeL,DeR, R2e);
+            Se = this.diffusion_relaxation_SMT_zeppelin(this.b,this.te,this.DeL,DeR, R2e, solver);
             % Combined signal
-            s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
+            if strcmpi(solver,'mcmc')
+                s = arrayfun(@MEAxCaliberSMT_signal_combine,f,fcsf,Sa,Se,this.Scsf);
+            else
+                s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
+            end
 
             % normalised to 1st echo, b=0
             s = s ./ s(1,:,:,:,:);
@@ -715,26 +816,44 @@ classdef gpuMEAxCaliberSMT < handle
         %% Utility
         %%%%%%%%%% Compartmental signal
         % restricted stick
-        function S = diffusion_relaxation_SMT_stick(g, delta, Delta,b,te,D0,r,Da, R2a, k2a, model)
+        function S = diffusion_relaxation_SMT_stick(g, delta, Delta,b,te,D0,r,Da, R2a, k2a, model, solver)
+
+            if nargin < 12; solver = []; end
 
             switch lower(model)
                 case 'narrow'
                     C = gpuMEAxCaliberSMT.neuman(g, delta, r, D0);
                 case 'wide'
-                    C = gpuMEAxCaliberSMT.widepulse_r(g, delta, Delta, r, D0);    % less memory efficient but faster
+                    C = gpuMEAxCaliberSMT.widepulse_r(g, delta, Delta, r, D0, solver);    % less memory efficient but faster
             end
 
-            S = sqrt(pi./(4*(b.*Da - C))) .* exp(-C) .* erf(sqrt(b.*Da - C)) .* exp(-te.*( R2a + k2a./r));
+            if strcmpi(solver,'mcmc') 
+
+                S = arrayfun(@diffusion_relaxation_SMT_stick,b,te,C,r,Da, R2a, k2a);
+
+            else
+    
+                S = sqrt(pi./(4*(b.*Da - C))) .* exp(-C) .* erf(sqrt(b.*Da - C)) .* exp(-te.*( R2a + k2a./r));
+            end
 
         end
 
         % zeppelin
-        function S = diffusion_relaxation_SMT_zeppelin(b,te,Da,Dr,R2e)
+        function S = diffusion_relaxation_SMT_zeppelin(b,te,Da,Dr,R2e,solver)
 
-            dDe = Da - Dr;              
-            dDe = max(dDe, gpuMEAxCaliberSMT.epsilon);    % avoid division by zeros and negative values for sqrt
+            if nargin < 6; solver = []; end
 
-            S = sqrt(pi./(4.*b.*dDe)) .* exp(-b.*Dr) .* erf(sqrt(b *dDe)) .* exp(-te.*R2e);
+            if strcmpi(solver,'mcmc') 
+                Dr  = min(Dr,Da-gpuMEAxCaliberSMTmcmc.epsilon);
+                S   = arrayfun(@diffusion_relaxation_SMT_zeppelin,b,te,Da,Dr,R2e);
+
+            else
+
+                dDe = Da - Dr;              
+                dDe = max(dDe, gpuMEAxCaliberSMT.epsilon);    % avoid division by zeros and negative values for sqrt
+    
+                S = sqrt(pi./(4.*b.*dDe)) .* exp(-b.*Dr) .* erf(sqrt(b *dDe)) .* exp(-te.*R2e);
+            end
 
         end
         
@@ -764,43 +883,73 @@ classdef gpuMEAxCaliberSMT < handle
         end
 
         % wide pulse solution
-        function s = widepulse_r(g, ldelta, BDELTA,r, D0)
+        function s = widepulse_r(g, ldelta, BDELTA,r, D0, solver)
+
+            if nargin < 6; solver = []; end
 
             k           = 10;
-            bm2_tmp     = gpuMEAxCaliberSMT.bm2(1:k); if isgpuarray(r); bm2_tmp = gpuArray(single(bm2_tmp)); end
-            bm2_tmp     = permute(bm2_tmp(:),[2 3 1]);
+            bm2_tmp     = gpuMEAxCaliberSMT.bm2(1:k); 
 
-            td          = r.^2./D0;
-            bardelta    = ldelta./td ;
-            barDelta    = BDELTA./td ;
-            bm2bardelta = bm2_tmp.*bardelta;
-            bm2barDelta = bm2_tmp.*barDelta;
-            s = (2/(bm2_tmp.^3.*(bm2_tmp-1))).*(-2 ...
-                        + 2*bm2bardelta ...
-                        + 2*exp(-bm2bardelta) ...
-                        + 2*exp(-bm2barDelta) ...
-                        - exp(-bm2barDelta-bm2bardelta)...
-                        - exp(-bm2barDelta+bm2bardelta));
-            s = sum(s,3).*D0.*g.^2.*td.^3;
+            if strcmpi(solver,'mcmc') 
+
+                bm2_tmp     = shiftdim(bm2_tmp,-(ndims(r)-1));
+
+                s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part1,r,bm2_tmp,ldelta,BDELTA,D0);
+                s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part2,sum(s,ndims(bm2_tmp)),r,D0,g);
+
+            else
+
+            
+                if isgpuarray(r); bm2_tmp = gpuArray(single(bm2_tmp)); end
+                bm2_tmp     = permute(bm2_tmp(:),[2 3 1]);
+    
+                td          = r.^2./D0;
+                bardelta    = ldelta./td ;
+                barDelta    = BDELTA./td ;
+                bm2bardelta = bm2_tmp.*bardelta;
+                bm2barDelta = bm2_tmp.*barDelta;
+                s = (2/(bm2_tmp.^3.*(bm2_tmp-1))).*(-2 ...
+                            + 2*bm2bardelta ...
+                            + 2*exp(-bm2bardelta) ...
+                            + 2*exp(-bm2barDelta) ...
+                            - exp(-bm2barDelta-bm2bardelta)...
+                            - exp(-bm2barDelta+bm2bardelta));
+                s = sum(s,3).*D0.*g.^2.*td.^3;
+            end
             
         end
 
         %%%%%%%%%%%%%%
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting)
+
+            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
+
             % get basic fitting setting check
-            fitting2 = askadam.check_set_default_basic(fitting);
+            if strcmpi(fitting.solver,'mcmc')
+
+                % mcmc
+                fitting2                = mcmc.check_set_default_basic(fitting);
+                fitting2.lossFunction   = 'l2'; % for computing weights
+
+            else
+
+                % askadam
+                fitting2 = askadam.check_set_default_basic(fitting);
+
+                if ~isfield(fitting,'regmap');              fitting2.regmap             = 'r';             end
+
+                if ~iscell(fitting2.regmap)
+                    fitting2.regmap = cellstr(fitting2.regmap);
+                end
+
+            end
 
             % get customised fitting setting check
-            if ~isfield(fitting,'regmap');      fitting2.regmap     = {'f'};            end
             if ~isfield(fitting,'start');       fitting2.start      = 'likelihood';     end
             if ~isfield(fitting,'isFitCSF');    fitting2.isFitCSF   = true;             end
             if ~isfield(fitting,'isFitR2a');    fitting2.isFitR2a   = false;            end
             if ~isfield(fitting,'isFitk2a');    fitting2.isFitk2a   = false;            end
-
-            if ~iscell(fitting2.regmap)
-                fitting2.regmap = cellstr(fitting2.regmap);
-            end
 
         end
     

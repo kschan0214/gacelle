@@ -14,30 +14,43 @@ DeL_fixed   = 1.7;
 Dcsf        = 3;
 
 % get current DWI protocol for simulation
-bval_sorted     = [0.05, 0.35, 0.80, 1.5, 2.401, 3.45, 4.75, 6, 0.2, 0.95, 2.3, 4.25, 6.75, 9.85, 13.5, 17.8];
+bval_sorted     = [0, 0.05, 0.35, 0.80, 1.5, 2.401, 3.45, 4.75, 6, 0.2, 0.95, 2.3, 4.25, 6.75, 9.85, 13.5, 17.8,...
+                   0, 0.05, 0.35, 0.80, 1.5, 2.401, 3.45, 4.75, 6, 0.2, 0.95, 2.3, 4.25, 6.75, 9.85, 13.5, 17.8];
 ldelta_sorted   = ones(size(bval_sorted))* 6; % ms
-BDELTA_sorted   = [13,13,13,13,13,13,13,13,30,30,30,30,30,30,30,30]; %ms
+BDELTA_sorted   = [13, 13,13,13,13,13,13,13,13,30,30,30,30,30,30,30,30,...
+                   13, 13,13,13,13,13,13,13,13,30,30,30,30,30,30,30,30]; %ms
+
+te_sorted       = [51*ones(1,numel(bval_sorted)/2) 92*ones(1,numel(bval_sorted)/2)] * 1e-3;
 
 % Parameter raneg for forward simulation
-axonDia_range   = [0.5 6];
+r_range         = [0.1 5];
 f_range         = [0.3, 1];
 fscf_range      = [0 0.3];
 DeR_range       = [0.5 1.5];
+R2a_range       = [6, 12];
+k2a_range       = [2,2.5];
+R2e_range       = [17, 50];
 
 % generate ground truth
-axonDia_GT   = single(rand(1,Nsample) * diff(axonDia_range)  + min(axonDia_range) );
+r_GT         = single(rand(1,Nsample) * diff(r_range)        + min(r_range) );
 fcsf_GT      = single(rand(1,Nsample) * diff(fscf_range)     + min(fscf_range));
 f_GT         = single(rand(1,Nsample) * diff(f_range)        + min(f_range));
 DeR_GT       = single(rand(1,Nsample) * diff(DeR_range)      + min(DeR_range));
+R2a_GT       = single(rand(1,1)       * diff(R2a_range)      + min(R2a_range));
+k2a_GT       = single(rand(1,1)       * diff(k2a_range)      + min(k2a_range));
+R2e_GT       = single(rand(1,Nsample) * diff(R2e_range)      + min(R2e_range));
 
 % Forward signal simulation
 model       = 'VanGelderen';
 pars        = [];
-pars.a      = single(axonDia_GT);
+pars.r      = single(r_GT);
 pars.f      = single(f_GT);
 pars.fcsf   = single(fcsf_GT);
 pars.DeR    = single(DeR_GT);
-objGPU      = gpuAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
+pars.R2e    = single(R2e_GT);
+pars.k2a    = single(k2a_GT);
+pars.R2a    = single(R2a_GT);
+objGPU      = gpuMEAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, te_sorted, [],[]);
 s           = objGPU.FWD(pars, model);
 
 % Let assume Gaussian noise for simplicity
@@ -48,18 +61,15 @@ mask    = ones(size(s,1:3))>0;  % create mask
 
 %% askAdam estimation
 fitting                     = [];
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-4;
-fitting.isDisplay           = false;
-fitting.lambda              = 0;
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood';
-fitting.patience            = 5;   
+fitting.isFitR2a            = true;
+fitting.isFitk2a            = true;
+fitting.isFitCSF            = true;
 extraData                   = [];
 
-out   = objGPU.estimate(s, mask, extraData, fitting);
+out   = objGPU.estimate(s, mask, fitting);
 
 %% plot result
 figure;

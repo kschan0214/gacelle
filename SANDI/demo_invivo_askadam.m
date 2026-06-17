@@ -6,10 +6,6 @@ sepia_addpath
 input_dir = '/homes/1/kc020/Desktop/Bay8_C2/bids/derivatives/processed_dwi/sub-001/';
 subj_label = 'sub-001';
 
-% if ~exist(output_dir,'dir')
-%     mkdir(output_dir)
-% end
-
 %%
 D_txt       = strcat(subj_label,'.diffusionTime');
 bvals_txt   = strcat(subj_label,'.bval');
@@ -19,11 +15,8 @@ dwi_nii     = strcat(subj_label,'_dwi.nii.gz');
 D       = readtable(fullfile(input_dir,D_txt),"FileType","text");     D = D{1,:};
 bval    = readtable(fullfile(input_dir,bvals_txt),"FileType","text"); bval = bval{:,:};
 bvec    = readtable(fullfile(input_dir,bvecs_txt),"FileType","text"); bvec = bvec{:,:};
-nii     = load_untouch_nii(fullfile(input_dir,dwi_nii));
-dwi     = nii.img;
-mask_nii = fullfile(input_dir, strcat(subj_label,'_brain_mask.nii.gz'));
-nii     = load_untouch_nii(mask_nii);
-mask    = nii.img;
+dwi     = niftiread(fullfile(input_dir,dwi_nii));
+mask = niftiread(fullfile(input_dir, strcat(subj_label,'_brain_mask.nii.gz')));
 D_unique = unique(D(D~=0));
 
 for kd = 1%:numel(D_unique)
@@ -46,14 +39,8 @@ Ds = 3;
 objGPU                      = gpuSANDI(bval_sorted/1e3,ldelta_sorted,BDELTA_sorted,Ds);
 fitting                     = [];
 fitting.solver              = 'askadam';
-fitting.iteration           = 10000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false; 
-fitting.patience            = 10;    
-fitting.start               = 'default'; 
+fitting                     = objGPU.check_set_default(fitting);
+fitting.start               = 'likelihood'; 
 
 extraData                   = [];
 extraData.bval              = bval_tmp/1e3;

@@ -3,9 +3,9 @@ clear;
 %% Simulate data
 
 % for reproducibility
-seed        = 'default'; rng(seed); gpurng(seed);
+seed        = 8715; rng(seed); gpurng(seed);
 Nsample     = 1e3;  % #voxel
-SNR         = 50;   
+SNR         = 100;   
 
 % fixed parameters
 D0          = 1.7;
@@ -19,7 +19,7 @@ ldelta_sorted   = ones(size(bval_sorted))* 6; % ms
 BDELTA_sorted   = [13,13,13,13,13,13,13,13,30,30,30,30,30,30,30,30]; %ms
 
 % Parameter raneg for forward simulation
-axonDia_range   = [0.1 6];
+axonDia_range   = [0.5 6];
 f_range         = [0.3, 1];
 fscf_range      = [0 0.3];
 DeR_range       = [0.5 1.5];
@@ -33,29 +33,25 @@ DeR_GT       = single(rand(1,Nsample) * diff(DeR_range)      + min(DeR_range));
 % Forward signal simulation
 model       = 'VanGelderen';
 pars        = [];
-pars.a      = axonDia_GT;
-pars.f      = f_GT;
-pars.fcsf   = fcsf_GT;
-pars.DeR    = DeR_GT;
-objGPU      = gpuAxCaliberSMTmcmc(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
+pars.a      = single(axonDia_GT);
+pars.f      = single(f_GT);
+pars.fcsf   = single(fcsf_GT);
+pars.DeR    = single(DeR_GT);
+objGPU      = gpuAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
 s           = objGPU.FWD(pars, model);
 
 % Let assume Gaussian noise for simplicity
 noiseLv = 1/SNR;
 s       = s + randn(size(s)) .* noiseLv;
-s       = gather(permute(s,[2 3 4 1]));
-mask    = ones(size(s,1:3))>0;    % create mask
+s       = permute(s,[2 3 4 1]);
+mask    = ones(size(s,1:3))>0;  % create mask
 
-%% MCMC estimation
-fitting             = [];
-fitting.algorithm   = 'GW';
-fitting.Nwalker     = 50;
-fitting.StepSize    = 2;
-fitting.iteration   = 1e4;
-fitting.thinning    = 10;        % Sample every 10 iteration
-fitting.metric      = {'median','iqr'};
-fitting.burnin      = 0.1;       % 10% burn-in
-extraData           = [];
+%% askAdam estimation
+fitting                     = [];
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting);
+fitting.start               = 'likelihood';
+extraData                   = [];
 
 out   = objGPU.estimate(s, mask, extraData, fitting);
 
@@ -65,9 +61,9 @@ field = fieldnames(pars);
 tiledlayout(1,numel(field));
 for k = 1:numel(field)
     nexttile;
-    scatter(pars.(field{k}),out.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
-    xlabel('GT');ylabel('Estimate');
+    xlabel('GT');ylabel('Fitted');
 end

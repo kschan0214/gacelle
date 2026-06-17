@@ -46,14 +46,15 @@ Ds = 3;
 objGPU                      = gpuSANDI(bval_sorted/1e3,ldelta_sorted,BDELTA_sorted,Ds);
 fitting                     = [];
 fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting);
 fitting.algorithm           = 'ensemble';
-fitting.Nwalker             = 50;
+fitting.Nwalker             = 30;
 fitting.StepSize            = 2;
 fitting.iteration           = 1e4;
 fitting.thinning            = 10;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};
 fitting.burnin              = 0.1;       % 10% burn-in
-fitting.start               = 'default';
+fitting.start               = 'likelihood';
 
 extraData                   = [];
 extraData.bval              = bval_tmp/1e3;

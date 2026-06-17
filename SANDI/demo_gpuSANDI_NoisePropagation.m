@@ -45,14 +45,8 @@ mask    = ones(size(y,1:3)) > 0;
 %% askadam estimation
 rng(seed); gpurng(seed);
 
-fitting                     = objGPU.check_set_default([]);
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
-fitting.convergenceValue    = 1e-8;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false; 
-fitting.patience            = 5;    
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood'; 
 extraData                   = [];
 
