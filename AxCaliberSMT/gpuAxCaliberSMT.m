@@ -3,47 +3,65 @@ classdef gpuAxCaliberSMT < handle
 % kchan2@mgh.harvard.edu
 % Date created: 1 Apr 2024 
 % Date modified: 15 August 2024
+% Date modified: 17 June 2026 (v1.1)
 
-    properties
-        % default model parameters and estimation boundary
-        % a     : Axon diameter[um], 
-        % f     : neurite fraction (f=fa/(fa+fe)), 
-        % fcsf  : CSF fraction
-        % DeR   : hindered diffusion diffusivity [um2/ms]
-        % noise : noise level
-
+    properties (GetAccess = public, SetAccess = protected)
+    % ===== MODEL PARAMETER CONTRACT =====
+    % a         : Axon diameter[um], 
+    % f         : neurite fraction (f=fa/(fa+fe)), 
+    % fcsf      : CSF fraction
+    % DeR       : hindered diffusion diffusivity [um2/ms]
+    % noise     : noise
+    %
+    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
+    % These five arrays MUST stay the same length and index-aligned.
+    % Mutate only as a set, via updateProperty() - never assign into a
+    % single element from outside the class, or these will desync.
+    %
+    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
+    % updateProperty() can strip it by name without hardcoding an index,
+    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
+    % future solver-conditional parameter should likewise go last.
         modelParams     = {'a';                   'f';'fcsf';                'DeR';'noise'};
         ub              = [ 20;                     1;     1;                    3;    0.1];
         lb              = [0.1;                     0;     0;                 0.01;   0.01];
         step            = [0.24875;              0.05;  0.05;   0.0393421052631579;  0.005];
         startPoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895;	  0.05];
+    end
 
-        % default threshold for data exclusion
+    properties
+    % ===== USER-TUNABLE OPTIONS =====
+    % Freely settable by users before fitting; no coupling between these.
         thres_similarity    = 0.1; 
         thres_impossible    = 0.1;
         thres_bkg           = 0.01;
 
-    end
+        seed = 48463;   % for reproducible random number generation
 
-    properties (GetAccess = public, SetAccess = protected)
-        b;
-        Delta;
-        delta;
-        g;
-%         beta;
-%         erf_a;
-        Scsf;
-        Nav;
-        
+        epsilon = utils.epsilon;
+
         Dcsf    = 3;            % diffusivity in CSF [um2/ms]
         D0      = 1.7;          % intrinsic diffusivity in tissue [um2/ms]
         Da      = 1.7;          % axonal longitudinal diffusivity [um2/ms]
         DeL     = 1.7;          % extracellular longitudinal diffusivity [um2/ms]
         model   = 'wide';
-%         bm2;
+    end
+
+    properties (GetAccess = public, SetAccess = protected)
+    % ===== ACQUISITION PARAMETERS =====
+    % Set once in the constructor from user-provided acquisition info.
+    % Read-only after construction.
+        b;
+        Delta;
+        delta;
+        g;
+        Nav;
+        Ds;
+        Scsf;
     end
     
-    properties (GetAccess = private, SetAccess = private)
+    properties (Constant)
+
         bm  = [1.8412    5.3314    8.5363   11.7060   14.8636   18.0155   21.1644   24.3113   27.4571   30.6019 ...
               33.7462   36.8900   40.0334   43.1766   46.3196   49.4624   52.6050   55.7476   58.8900   62.0323];
         bm2 = [1.8412    5.3314    8.5363   11.7060   14.8636   18.0155   21.1644   24.3113   27.4571   30.6019 ...
@@ -193,7 +211,7 @@ classdef gpuAxCaliberSMT < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
-            [sliceBoundaries,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+            [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
 
             % parameter estimation
             out = [];
@@ -204,15 +222,22 @@ classdef gpuAxCaliberSMT < handle
                     disp   ('------------------------')
                 end
     
-                % divide the data if requried
-                slice                           = sliceBoundaries{kseg};
-                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, slice, pars0);
+                % divide the data; fitRange includes halo slices (if any), ownedRange
+                % is what this segment is responsible for writing back
+                fitRange                        = seg(kseg).fit;
+                ownedRange                      = seg(kseg).owned;
+                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, fitRange, pars0);
 
                 % run fitting
                 [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
 
+                % discard halo slices from this segment's output before restoring,
+                % so segment boundaries never keep voxels from a neighbour's
+                % independently-converged fit (no-op when seg(kseg).fit == .owned)
+                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
+
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
+                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
 
             end
             out.mask = mask;
@@ -487,22 +512,13 @@ classdef gpuAxCaliberSMT < handle
         function pars0 = estimate_prior(this,dwi,mask, Nsample)
         % Estimation starting points for NEXI using likehood method
 
+            rng(this.seed); % for reproducible dictionary
+
             bval = gather(this.b);
 
             start = tic;
             
             disp('Estimate starting points based on likelihood ...')
-
-            % manage pool
-            pool            = gcp('nocreate');
-            isDeletepool    = false;
-            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
-                if isempty(pool)
-                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                    pool    = parpool('Processes',Nworker);
-                    isDeletepool = true;
-                end
-            end
 
             if nargin < 4 || isempty(Nsample)
                 Nsample         = 1e4;
@@ -518,7 +534,18 @@ classdef gpuAxCaliberSMT < handle
             % find masked voxels
             ind         = find(mask(:));
 
-            Nparam = 4;
+            Nparam = numel(this.modelParams) - any(strcmpi(this.modelParams,'noise')); % Nparam = 4;
+
+            % manage pool
+            pool            = gcp('nocreate');
+            isDeletepool    = false;
+            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
+                if isempty(pool)
+                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                    pool    = parpool('Processes',Nworker);
+                    isDeletepool = true;
+                end
+            end
 
             pars0_mask  = zeros(Nparam,length(ind),'single');
             if ~isempty(pool)

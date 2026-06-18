@@ -781,6 +781,9 @@ classdef askadam < handle
             % =====================================================================
             if ~isfield(fitting,'isOptimiseMemory'); fitting2.isOptimiseMemory = true; end
             if ~isfield(fitting,'autoMemManage');    fitting2.autoMemManage    = true; end
+            if ~isfield(fitting,'segmentOverlap');   fitting2.segmentOverlap   = 0;     end
+            if ~isfield(fitting,'NSegmentUser');     fitting2.NSegmentUser     = [];     end
+
 
             % =====================================================================
             % Miscellaneous

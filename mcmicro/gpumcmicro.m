@@ -7,31 +7,52 @@ classdef gpumcmicro < handle
 
 % TODO: sort b and te and input full DWI
 
-    properties
-        % default model parameters and estimation boundary
-        % f     : neurite fraction (f=fa/(fa+fe)), 
-        % D     : intrinsic diffusivity [um2/ms]
-        % R2a   : Intra-neurite R2 [1/s] (for multi-echo)
-        % R2e   : Extra-neurite R2 [1/s] (for multi-echo)
+    properties (GetAccess = public, SetAccess = protected)
+    % ===== MODEL PARAMETER CONTRACT =====
+    % f         : neurite fraction (f=fa/(fa+fe)), 
+    % D         : intrinsic diffusivity [um2/ms]
+    % R2a       : Intra-neurite R2 [1/s] (for multi-echo)
+    % R2e       : Extra-neurite R2 [1/s] (for multi-echo)
+    % noise     : noise
+    %
+    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
+    % These five arrays MUST stay the same length and index-aligned.
+    % Mutate only as a set, via updateProperty() - never assign into a
+    % single element from outside the class, or these will desync.
+    %
+    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
+    % updateProperty() can strip it by name without hardcoding an index,
+    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
+    % future solver-conditional parameter should likewise go last.
         modelParams     = { 'f';  'D';'R2a';'R2e';'noise'};
         ub              = [   1;    3;   50;   75; 0.1];
         lb              = [1e-6; 1e-6;    1;    1; 0.001];
         startPoint      = [ 0.6;    2;   12;   30; 0.005];
         step            = [0.05; 0.04; 2.58; 2.58; 0.005];
 
-        % default threshold for data exclusion
+    end
+
+    properties
+    % ===== USER-TUNABLE OPTIONS =====
+    % Freely settable by users before fitting; no coupling between these.
+        thres_similarity    = 0.1; 
         thres_impossible    = 0.1;
         thres_bkg           = 0.01;
+
+        seed = 48463;   % for reproducible random number generation
+
+        epsilon = utils.epsilon;
+
     end
 
     properties (GetAccess = public, SetAccess = protected)
+    % ===== ACQUISITION PARAMETERS =====
+    % Set once in the constructor from user-provided acquisition info.
+    % Read-only after construction.
         b;
         te;
     end
-    
-    properties (GetAccess = private, SetAccess = private)
-    end
-    
+
     methods
 
         % constructuor
@@ -168,7 +189,7 @@ classdef gpumcmicro < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
-            [sliceBoundaries,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+            [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
 
             % parameter estimation
             out = [];
@@ -179,15 +200,22 @@ classdef gpumcmicro < handle
                     disp   ('------------------------')
                 end
     
-                % divide the data if requried
-                slice                                       = sliceBoundaries{kseg};
-                [dataSeg, maskSeg, extraDataSeg, pars0Seg]  = this.slice_segment(data, mask, slice, extraData, pars0);
+                % divide the data; fitRange includes halo slices (if any), ownedRange
+                % is what this segment is responsible for writing back
+                fitRange                        = seg(kseg).fit;
+                ownedRange                      = seg(kseg).owned;
+                [dataSeg, maskSeg,extraDataSeg,pars0Seg]    = this.slice_segment(data, mask, fitRange, extraData, pars0);
 
                 % run fitting
                 [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg,pars0Seg);
 
+                % discard halo slices from this segment's output before restoring,
+                % so segment boundaries never keep voxels from a neighbour's
+                % independently-converged fit (no-op when seg(kseg).fit == .owned)
+                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
+
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
+                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
 
             end
             out.mask = mask;
@@ -419,20 +447,11 @@ classdef gpumcmicro < handle
         function pars0 = estimate_prior(this,dwi,mask, Nsample)
         % Estimation starting points for NEXI using likehood method
 
+            rng(this.seed); % for reproducible dictionary
+
             start = tic;
             
             disp('Estimate starting points based on likelihood ...')
-
-            % manage pool
-            pool            = gcp('nocreate');
-            isDeletepool    = false;
-            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
-                if isempty(pool)
-                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                    pool    = parpool('Processes',Nworker);
-                    isDeletepool = true;
-                end
-            end
 
             if nargin < 4 || isempty(Nsample)
                 Nsample         = 1e4;
@@ -448,7 +467,18 @@ classdef gpumcmicro < handle
             % find masked voxels
             ind         = find(mask(:));
 
-            Nparam = size(x_train,1);
+            Nparam = numel(this.modelParams) - any(strcmpi(this.modelParams,'noise'));
+
+            % manage pool
+            pool            = gcp('nocreate');
+            isDeletepool    = false;
+            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
+                if isempty(pool)
+                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                    pool    = parpool('Processes',Nworker);
+                    isDeletepool = true;
+                end
+            end
 
             pars0_mask  = zeros(Nparam,length(ind),'single');
             if ~isempty(pool)

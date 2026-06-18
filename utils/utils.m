@@ -412,12 +412,56 @@ classdef utils < handle
             end
         end
 
-        function [sliceBoundaries,NSegment] = find_optimal_segment_3D(modelObj, data, mask, fitting, varargin)
+        function [seg,NSegment] = find_optimal_segment_3D(modelObj, data, mask, fitting, varargin)
         % modelObj : the model object (e.g. gpuMCRMWI, gpuJointR1R2starMapping)
         %            must implement: fit_probe, slice_segment, fit_segment, postprocess_segments
+        %
+        % fitting.segmentOverlap (default 0)  : number of halo slices added on each
+        %                                        *internal* segment boundary, to give
+        %                                        3D-coupled regularisers (e.g. 3D TV)
+        %                                        correct neighbour information across
+        %                                        segment cuts. Has no effect when
+        %                                        NSegment == 1. Default 0 reproduces
+        %                                        legacy (no-halo) behaviour exactly.
+        % fitting.NSegmentUser (default [])   : user-requested minimum segment count.
+        %                                        Treated as a FLOOR, not an override:
+        %                                        NSegment = max(NSegmentUser, memoryRequired).
+        %                                        This guarantees the memory logic can
+        %                                        only ever add segments, never remove
+        %                                        the safety margin it computed, so this
+        %                                        option cannot by itself cause an OOM.
+        %
+        % Output
+        % seg : struct array, one entry per segment, with fields:
+        %         .owned  - global slice indices this segment is responsible for
+        %                   (used to write results back; disjoint across segments,
+        %                   and exactly partitions 1:size(mask,3))
+        %         .fit    - global slice indices actually extracted/fitted, i.e.
+        %                   .owned padded with up to fitting.segmentOverlap halo
+        %                   slices on internal faces only (never past the true
+        %                   volume boundary)
+        %         .local  - position of .owned within .fit (i.e. .owned - .fit(1) + 1),
+        %                   precomputed here so callers never re-derive this arithmetic
+        %       When NSegment == 1, seg(1).owned == seg(1).fit == 1:size(mask,3) and
+        %       seg(1).local == seg(1).owned, identical to today's single-segment case.
 
         % if nargin < 4; safetyFactor = 1; end
             safetyFactor = 1;
+
+            % --- new opt-in options, both default to legacy behaviour ---
+            if ~isfield(fitting,'segmentOverlap') || isempty(fitting.segmentOverlap)
+                fitting.segmentOverlap = 0;
+            end
+            if ~isfield(fitting,'NSegmentUser')
+                fitting.NSegmentUser = [];
+            end
+            h            = fitting.segmentOverlap;
+            NSegmentUser = fitting.NSegmentUser;
+            if isempty(NSegmentUser) || NSegmentUser < 1
+                NSegmentUser = 1;
+            else
+                NSegmentUser = round(NSegmentUser);
+            end
 
             gpu = gpuDevice; reset(gpu);
 
@@ -428,6 +472,12 @@ classdef utils < handle
             if probeMax <= probeMin
                 fitting.autoMemManage = 0;  % size too small
             end
+
+            % NOTE: the NSegmentUser floor is honoured even when autoMemManage is
+            % off or skipped (small data) below - a user asking for N segments for
+            % a non-memory reason (e.g. seam validation) should not be silently
+            % ignored just because the memory probe didn't run. If this is not what
+            % you want, gate the NSegmentUser>1 branches below on fitting.autoMemManage.
 
             if fitting.autoMemManage && Nvoxel > max(probeSize)
         
@@ -442,6 +492,10 @@ classdef utils < handle
                     fitting_probe               = fitting;
                     fitting_probe.iteration     = 0;
                     fitting_probe.start         = 'default';
+                    % fitting_probe still carries segmentOverlap/NSegmentUser, but
+                    % this is harmless: modelObj.fit() never reads those fields,
+                    % only find_optimal_segment_3D (this function) does, and fit()
+                    % is not re-entered through this function during probing.
                 
                     logFile   = strcat(tempname, '_gacelle_probe.csv');
                     cmd       = sprintf('nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 5 > %s &', logFile);
@@ -507,38 +561,79 @@ classdef utils < handle
                 fprintf('  Available VRAM (smi)  : %.0f MB\n', memAvail_MB);
                 fprintf('  Budget (%.0f%%)         : %.0f MB\n', safetyFactor*100, memBudget_MB);
         
-                if memAvail_MB < memPred_MB
-                    warning('GACELLE:memoryWarning', ...
-                            'Predicted memory (%.2f MB) exceeds 100%% of available GPU memory (%.2f MB). Segmenting data.', ...
-                            memPred_MB, memAvail_MB);
-    
-                    % Solve for max voxels per segment:
-                    % slope * NvoxPerSeg + intercept <= memAvail
-                    NvoxPerSeg = floor((memAvail_MB - intercept) / slope);
-    
-                    if NvoxPerSeg <= 0
+                if memAvail_MB < memPred_MB || NSegmentUser > 1
+                    if memAvail_MB < memPred_MB
+                        warning('GACELLE:memoryWarning', ...
+                                'Predicted memory (%.2f MB) exceeds 100%% of available GPU memory (%.2f MB). Segmenting data.', ...
+                                memPred_MB, memAvail_MB);
+                    end
+
+                    % Solve for max voxels per FIT segment (owned + halo):
+                    % slope * NvoxPerSegFit + intercept <= memAvail
+                    NvoxPerSegFit = floor((memAvail_MB - intercept) / slope);
+
+                    if NvoxPerSegFit <= 0
                         error('GACELLE:memoryError', ...
                               'Insufficient GPU memory even for a single segment. Predicted fixed overhead (%.2f GB) already exceeds available memory (%.2f GB).', ...
                               intercept, memAvail_MB);
                     end
-    
-                    % Build density-balanced slice boundaries
-                    % so each segment has <= NvoxPerSeg masked voxels
-                    sliceBoundaries = utils.build_balanced_boundaries(mask, NvoxPerSeg);
-                    NSegment        = numel(sliceBoundaries);
-                    fprintf('Data divided into %d segments (max %d voxels/segment)\n', NSegment, NvoxPerSeg);
-                    fprintf('The estimation may not be exactly the same as 1 segment.');
-    
+
+                    % Charge the halo against the budget BEFORE sizing owned ranges,
+                    % so a fit segment (owned+halo) never exceeds NvoxPerSegFit.
+                    % Use mean slice density as the per-slice voxel cost estimate,
+                    % and the worst case of 2 halo faces (interior segment) so the
+                    % owned-target is conservative for every segment, not just edges.
+                    sliceDensity_  = squeeze(sum(mask, [1 2]));
+                    meanSliceVox   = mean(sliceDensity_(sliceDensity_>0));
+                    if isempty(meanSliceVox) || isnan(meanSliceVox); meanSliceVox = 0; end
+                    haloVoxCost    = 2 * h * meanSliceVox;
+                    NvoxPerSegOwned = max(1, NvoxPerSegFit - haloVoxCost);
+
+                    if NvoxPerSegFit <= haloVoxCost
+                        warning('GACELLE:haloBudget', ...
+                            ['Overlap (h=%d slices) consumes the entire per-segment memory budget. ' ...
+                             'Falling back to NvoxPerSegOwned=1 voxel/segment target; consider reducing ' ...
+                             'fitting.segmentOverlap or using a GPU with more VRAM.'], h);
+                    end
+
+                    % Respect the user-requested minimum segment count as a FLOOR:
+                    % NSegment can only be pushed UP from the memory-derived value,
+                    % never down, so this option cannot cause an OOM by itself.
+                    NSegmentMemory  = max(1, ceil(sum(sliceDensity_) / NvoxPerSegOwned));
+                    NSegmentTarget  = max(NSegmentMemory, NSegmentUser);
+
+                    % Build density-balanced OWNED slice boundaries so each segment
+                    % has approximately equal owned voxel counts, honouring NSegmentTarget
+                    ownedBoundaries = utils.build_balanced_boundaries(mask, NvoxPerSegOwned, NSegmentTarget);
+                    NSegment        = numel(ownedBoundaries);
+                    fprintf('Data divided into %d segments (target %d owned voxels/segment, halo=%d slices)\n', ...
+                        NSegment, round(NvoxPerSegOwned), h);
+                    if NSegment > 1
+                        fprintf('The estimation may not be exactly the same as 1 segment.\n');
+                    end
+
+                    seg = utils.expand_segments_with_halo(ownedBoundaries, h, size(mask,3));
+
                 else
-                    sliceBoundaries = {1:size(mask,3)};
-                    NSegment        = 1;
                     fprintf('Full data fits in GPU memory (predicted %.2f GB / available %.2f GB)\n', ...
                         memPred_MB, memAvail_MB/safetyFactor);
+                    seg      = struct('owned', {1:size(mask,3)}, 'fit', {1:size(mask,3)}, 'local', {1:size(mask,3)});
+                    NSegment = 1;
                 end
             
             else
-                sliceBoundaries = {1:size(mask, 3)};
-                NSegment        = 1;
+                % Probe skipped (autoMemManage off, or too little data to probe
+                % reliably). NSegmentUser is still honoured as a floor here - see
+                % NOTE above - but with no memory information, "owned" boundaries
+                % are simply equal-thickness slabs rather than density-balanced.
+                if NSegmentUser > 1
+                    ownedBoundaries = utils.build_balanced_boundaries(mask, ceil(nnz(mask)/NSegmentUser), NSegmentUser);
+                    NSegment        = numel(ownedBoundaries);
+                    seg             = utils.expand_segments_with_halo(ownedBoundaries, h, size(mask,3));
+                else
+                    seg      = struct('owned', {1:size(mask,3)}, 'fit', {1:size(mask,3)}, 'local', {1:size(mask,3)});
+                    NSegment = 1;
+                end
             end
 
         end
@@ -584,20 +679,27 @@ classdef utils < handle
             end
         end
 
-        function boundaries = build_balanced_boundaries(mask, NvoxPerSeg)
+        function boundaries = build_balanced_boundaries(mask, NvoxPerSeg, NSegmentMin)
         % Divide slices into segments with approximately equal voxel counts,
         % where each segment stays <= NvoxPerSeg masked voxels.
+        %
+        % NSegmentMin (optional, default 1): floor on the number of segments,
+        % e.g. from a user-requested minimum (fitting.NSegmentUser). Does not
+        % reduce memory safety - it can only ever increase segment count, which
+        % can only ever decrease per-segment voxel load.
         %
         % Strategy: compute cumulative voxel count across slices, then find
         % slice indices where cumulative count crosses multiples of the target
         % per-segment count.
+
+            if nargin < 3 || isempty(NSegmentMin); NSegmentMin = 1; end
         
             sliceDensity = squeeze(sum(mask, [1 2]));   % [dims3 x 1]
             dims3        = size(mask, 3);
             totalVox     = sum(sliceDensity);
         
             % How many segments do we actually need?
-            NSegment     = ceil(totalVox / NvoxPerSeg);
+            NSegment     = max(ceil(totalVox / NvoxPerSeg), NSegmentMin);
             targetPerSeg = totalVox / NSegment;          % equal voxel target per segment
         
             % Walk cumulative sum and cut when we cross each target boundary
@@ -651,6 +753,66 @@ classdef utils < handle
                 segVox   = sum(sliceDensity(slices));
                 fprintf('  Segment %d: slices %d-%d, %d voxels (%.1f%% of target)\n', ...
                     ks, slices(1), slices(end), segVox, 100*segVox/targetPerSeg);
+            end
+        end
+
+        function seg = expand_segments_with_halo(ownedBoundaries, h, dims3)
+        % Expand a cell array of disjoint, contiguous OWNED slice ranges (as
+        % returned by build_balanced_boundaries) into a struct array carrying
+        % owned/fit/local geometry for halo-aware segmented fitting.
+        %
+        % Input
+        %   ownedBoundaries : cell array of slice-index vectors, one per segment,
+        %                     contiguous and exactly partitioning 1:dims3
+        %   h               : halo width in slices, applied on INTERNAL faces only
+        %                     (the true volume boundary, slice 1 / dims3, never
+        %                     gets a halo - there's nothing there to borrow, and
+        %                     single-pass fitting has the same one-sided edge)
+        %   dims3           : total number of slices in the full volume, used to
+        %                     clamp halo expansion at the true boundary
+        %
+        % Output
+        %   seg : struct array with .owned, .fit, .local per segment (see
+        %         find_optimal_segment_3D for field definitions). With h==0 this
+        %         reduces to seg(k).fit == seg(k).owned == seg(k).local-shifted-
+        %         to-1-based, i.e. legacy behaviour.
+
+            NSegment = numel(ownedBoundaries);
+            seg(NSegment) = struct('owned', [], 'fit', [], 'local', []);
+
+            for ks = 1:NSegment
+                owned = ownedBoundaries{ks};
+
+                % Halo only on internal cut faces: segment 1 has no halo on its
+                % low side (it IS the volume boundary), last segment has none on
+                % its high side, for the same reason.
+                loHalo = h * (ks > 1);
+                hiHalo = h * (ks < NSegment);
+
+                fitStart = max(1,     owned(1)   - loHalo);
+                fitEnd   = min(dims3, owned(end) + hiHalo);
+                fitRange = fitStart:fitEnd;
+
+                seg(ks).owned = owned;
+                seg(ks).fit   = fitRange;
+                seg(ks).local = owned - fitRange(1) + 1;
+            end
+
+            % Warn when the halo eats a large fraction of the thinnest owned
+            % segment - this is the combination that user-forced NSegment (high
+            % NSegmentUser) plus nonzero overlap can produce: segments that
+            % mostly refit their neighbours rather than their own data.
+            if h > 0
+                ownedThickness = cellfun(@numel, ownedBoundaries);
+                thinnest       = min(ownedThickness);
+                if h >= thinnest / 2
+                    warning('GACELLE:haloVsOwnedThickness', ...
+                        ['Halo width (h=%d) is large relative to the thinnest owned segment ' ...
+                         '(%d slices). Segments will spend most of their compute refitting ' ...
+                         'neighbouring (halo) slices rather than their own owned slices. ' ...
+                         'Consider reducing fitting.segmentOverlap or fitting.NSegmentUser.'], ...
+                        h, thinnest);
+                end
             end
         end
         
@@ -1124,6 +1286,105 @@ classdef utils < handle
                     num2str(sz));
                 merged = existing;
             end
+        end
+
+        function out = crop_segment_output(out_tmp, seg)
+        % Crop a segment's FIT (haloed) output down to its OWNED sub-range along
+        % the slice axis, before restore_segment_structure writes it back at
+        % seg.owned. Mirrors restore_segment_structure's struct-walk shape, but
+        % reads (crops) instead of writes (inserts).
+        %
+        % Input
+        %   out_tmp : output structure from this.fit() on the haloed segment,
+        %             i.e. spatially indexed 1:numel(seg.fit) along the slice axis
+        %   seg     : single segment's geometry struct, with .owned, .fit, .local
+        %             as returned by find_optimal_segment_3D / expand_segments_with_halo
+        %
+        % When seg.fit and seg.owned are identical (h==0, or this is a 1-segment
+        % run), crop_field below is a no-op (localRange == 1:numel(fitRange)), so
+        % this function has zero effect on legacy (no-halo) runs.
+
+            fn1 = fieldnames(out_tmp);
+            for kfn1 = 1:numel(fn1)
+                field1 = fn1{kfn1};
+                val    = out_tmp.(field1);
+
+                if isstruct(val)
+                    fn2 = fieldnames(val);
+                    for kfn2 = 1:numel(fn2)
+                        field2 = fn2{kfn2};
+                        out.(field1).(field2) = utils.crop_field(val.(field2), seg);
+                    end
+                else
+                    out.(field1) = utils.crop_field(val, seg);
+                end
+            end
+        end
+
+        function cropped = crop_field(val, seg)
+        % Crop val along its slice axis from seg.fit-indexing down to seg.local
+        % (the owned sub-range within the fitted segment), using the same shape
+        % dispatch order as restore_field so the two functions interpret any
+        % given field's shape identically and cannot silently diverge.
+        %
+        % Fields with no slice axis under this dispatch (scalars accumulated
+        % per-segment, and the 2D [Nmeasurement, Nvoxel] voxel-flattened askadam
+        % residual format) are passed through unchanged, with no crop and no
+        % warning - same treatment restore_field already gives this shape
+        % (concatenation along the voxel dimension, not slice-axis insertion),
+        % since it is voxel-flattened by design and never carries a contiguous
+        % slice axis to begin with.
+
+            localRange  = seg.local;
+            fitRangeLen = numel(seg.fit);
+
+            % Non-numeric / scalar-logical: nothing to crop, identical to restore_field's
+            % handling - these are kept-from-first-segment values, not per-slice data.
+            if ischar(val) || isstring(val) || (islogical(val) && isscalar(val))
+                cropped = val;
+                return
+            end
+
+            if isempty(val)
+                cropped = val;
+                return
+            end
+
+            sz = size(val);
+            nd = ndims(val);
+
+            % --- Scalar numeric: no slice axis to crop, pass through ---
+            if isscalar(val)
+                cropped = val;
+                return
+            end
+
+            % --- Spatially-indexed array: 3rd dim matches the FIT (haloed) extent ---
+            if nd >= 3 && sz(3) == fitRangeLen
+                idx        = repmat({':'}, 1, nd);
+                idx{3}     = localRange;
+                cropped    = val(idx{:});
+                return
+            end
+
+            % --- 2D voxel-flattened (askadam residual format), e.g. [Nmeasurement,
+            % Nvoxel]: no slice axis by design (kept unmasked/flattened specifically
+            % to avoid the memory cost of a 4D/5D spatial representation). Pass
+            % through unchanged - restore_segment_structure already concatenates
+            % this shape correctly along the voxel dimension regardless of crop.
+            if nd == 2 && sz(2) > 1
+                cropped = val;
+                return
+            end
+
+            % --- 1D vector: same - no slice axis, pass through ---
+            if nd == 2 && sz(2) == 1
+                cropped = val;
+                return
+            end
+
+            % --- Fallback: unrecognised shape, pass through ---
+            cropped = val;
         end
         
          % initialise parameters

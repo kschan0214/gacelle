@@ -48,6 +48,39 @@ Convergence Model
      - ``5``
      - Number of consecutive checks below ``convergenceValue`` required before stopping.
 
+**Formalism**
+
+*Linear model.* The loss values from the last ``convergenceWindow`` iterations are held in a buffer :math:`\{L_1, L_2, \dots, L_N\}` (:math:`N = ` ``convergenceWindow``). A first-order polynomial is fitted to this buffer by ordinary least squares:
+
+.. math::
+
+   L_i \approx m \cdot i + c, \qquad i = 1, \dots, N
+
+Concretely, with design matrix :math:`A = [\,(1{:}N)^\top,\ \mathbf{1}\,]`, the slope and intercept are obtained from :math:`[m, c]^\top = A^{\dagger} \mathbf{L}` (least-squares solve). The convergence signal is the **negative slope**:
+
+.. math::
+
+   \text{convergence} = -m
+
+so that a positive value corresponds to a decreasing loss (improvement), matching the sign convention described for ``fitting.convergenceValue`` (positive = decreasing loss). Optimisation is considered converged once this value drops below ``convergenceValue`` for ``patienceConvergence`` consecutive checks. Because :math:`m` has the same units as the loss itself, this signal is **not scale-invariant**: ``convergenceValue`` must be re-tuned if the loss magnitude changes substantially (e.g. switching loss functions, changing regularisation weight, or changing data scaling).
+
+*EMA model.* Rather than fitting a window of past losses, an exponential moving average of the loss is updated incrementally at every iteration:
+
+.. math::
+
+   \text{EMA}_t = \delta \cdot \text{EMA}_{t-1} + (1 - \delta) \cdot L_t
+
+where :math:`\delta` is ``fitting.emaDecay`` and :math:`L_t` is the current iteration's loss. The convergence signal is the **relative change** in the EMA between consecutive iterations:
+
+.. math::
+
+   \text{convergence} = \frac{\left| \text{EMA}_t - \text{EMA}_{t-1} \right|}{\left| \text{EMA}_{t-1} \right| + \varepsilon}
+
+with :math:`\varepsilon = 10^{-8}` added to the denominator purely to avoid division by zero. Because this signal is a *relative* change, it is scale-invariant across loss functions, regularisation weights, and data magnitudes — a key practical advantage over the linear model. Note also that the EMA convergence signal is unsigned (it uses absolute value), so it cannot distinguish a decreasing loss from an increasing one; it only reports whether the loss has stabilised. ``fitting.convergenceValue`` should therefore be a small positive number regardless of sign convention used elsewhere.
+
+.. note::
+   The two models are not numerically comparable. A ``convergenceValue`` tuned for ``'linear'`` mode (an absolute slope, in loss units per iteration) will not have the same meaning under ``'ema'`` mode (a unitless relative change). If you switch ``convergenceModel``, re-tune ``convergenceValue`` rather than reusing the same number.
+
 **When to use** ``'ema'``: The linear slope can oscillate around zero during the later stages of optimisation, causing premature or delayed stopping depending on the window position. The EMA signal smooths out these short-term fluctuations and responds to genuine sustained improvement rather than transient dips. ``'ema'`` is the default and is recommended for most use cases, especially with spatial regularisation where the loss surface is less smooth.
 
 **When to use** ``'linear'``: If you need exact reproducibility with results obtained with earlier versions of GACELLE, set ``fitting.convergenceModel = 'linear'`` and ``fitting.convergenceWindow = 20``.

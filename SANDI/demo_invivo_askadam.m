@@ -41,6 +41,7 @@ fitting                     = [];
 fitting.solver              = 'askadam';
 fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood'; 
+fitting.initialLearnRate    = 1e-2;
 
 extraData                   = [];
 extraData.bval              = bval_tmp/1e3;

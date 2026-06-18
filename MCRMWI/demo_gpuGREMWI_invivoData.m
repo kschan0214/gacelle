@@ -46,10 +46,10 @@ fixed_params.B0dir      = B0_dir;
 objGPU                     = gpuGREMWI(TE,fixed_params);
 
 fitting = [];
-fitting.iteration           = 4000;
+fitting.iteration           = 10000;
 fitting.initialLearnRate    = 0.01;
 fitting.decayRate           = 0;
-fitting.convergenceValue    = 1e-8;
+fitting.convergenceValue    = 1e-5;
 fitting.tol                 = 1e-3;
 fitting.isdisplay           = 0;
 fitting.weightPower         = 0.5;
@@ -70,12 +70,12 @@ extraData.pini      = pini;
 objGPU                     = gpuGREMWI(TE,fixed_params);
 
 fitting = [];
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
+fitting.iteration           = 10000;
+fitting.initialLearnRate    = 0.01;
 fitting.decayRate           = 0;
-fitting.convergenceValue    = 1e-8;
+fitting.convergenceValue    = 1e-5;
 fitting.tol                 = 1e-3;
-fitting.isdisplay           = 1;
+fitting.isdisplay           = 0;
 
 fitting.DIMWI.isFitIWF      = 0;
 fitting.DIMWI.isFitFreqMW   = 0;
@@ -90,3 +90,30 @@ extraData.theta     = theta(:,:,:,:);
 extraData.ff        = ff(:,:,:,:)./sum(ff,4);
 
 [out_dimwi]    = objGPU.estimate(img, mask, extraData, fitting);
+
+%% GREMWI
+objGPU                     = gpuGREMWI(TE,fixed_params);
+
+fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting,img);
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 20;
+fitting.StepSize            = 2;
+fitting.iteration           = 1e4;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+fitting.burnin              = 0.1;       % 10% burn-in
+fitting.start               = 'prior';
+
+fitting.weightPower         = 0.5;
+
+fitting.DIMWI.isFitIWF      = 1;
+fitting.DIMWI.isFitFreqMW   = 1;
+fitting.DIMWI.isFitFreqIW   = 1;
+fitting.DIMWI.isFitR2sEW    = 1;
+
+extraData = [];
+extraData.freqBKG   = totalField / (gpuGREMWI.gyro*fixed_params.B0); % in ppm
+extraData.pini      = pini;
+
+[out_mcmc]    = objGPU.estimate(img, mask, extraData, fitting);

@@ -20,7 +20,7 @@ M0_range        = [0.5, 2];
 MWF_range       = [1e-8, 0.25];
 IWF_range       = [0.2, 0.8];
 R2sMW_range     = [75, 150];
-R2sIW_range     = [8, 65];
+R2sIW_range     = [8, 50];
 R2sp_range      = [0, 10];
 freqMW_range    = [0, 20]/ B0/ gpuGREMWI.gyro;
 freqIW_range    = [-10, 0]/ B0/ gpuGREMWI.gyro;
@@ -64,7 +64,7 @@ extraData.ff        = ones([size(M0_GT,1:3)]); %extraData.ff = extraData.ff ./ s
 extraData.theta     = zeros([size(M0_GT,1:3)]);
 
 objGPU  = gpuGREMWI(t);
-s       = ((objGPU.FWD(pars, fitting, extraData))).';
+s       = objGPU.FWD(pars, fitting, extraData).';
 s       = permute(reshape(s,[Nsample,Nt,2]),[1 4 5 2 3]);
 mask    = ones(size(s,1:3),'logical');
 
@@ -75,17 +75,16 @@ y       = y(:,:,:,:,1) + 1i*y(:,:,:,:,2);
 
 %% askadam estimation
 fitting                     = [];
-fitting.solver              = 'askadam';
-fitting.optimiser           = 'adam';
-fitting.iteration           = 10000;
-fitting.initialLearnRate    = 0.002;
-fitting.decayRate           = 0.000;
-fitting.convergenceValue    = 1e-7;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false;
-fitting.start               = 'prior';   
-fitting.patience            = 5;   
+fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting,y);
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 30;
+fitting.StepSize            = 2;
+fitting.iteration           = 1e4;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+fitting.burnin              = 0.1;       % 10% burn-in
+fitting.start               = 'prior';
 % extraData                   = [];
 
 objGPU  = gpuGREMWI(t);
@@ -102,7 +101,7 @@ tiledlayout(1,numel(field));
 for k = 1:numel(field)
     nexttile;
     scatter(pars.(field{k}),pars0.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});

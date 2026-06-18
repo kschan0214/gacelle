@@ -6,11 +6,22 @@ classdef gpuJointR1R2starMapping < handle
 % Date modified: 25 September 2024
 % Date modified: 10 June 2026 (update memory manager, support MCMC under same script)
 
-    properties
-        % default model parameters and estimation boundary
-        % M0    : Proton density weighted signal
-        % R1    : (=1/T1) in s^-1
-        % R2star: R2* in s^-1   
+    properties (GetAccess = public, SetAccess = protected)
+    % ===== MODEL PARAMETER CONTRACT =====
+    % M0        : Proton density weighted signal
+    % R1        : (=1/T1) in s^-1
+    % R2star    : R2* in s^-1   
+    % noise     : noise
+    %
+    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
+    % These five arrays MUST stay the same length and index-aligned.
+    % Mutate only as a set, via updateProperty() - never assign into a
+    % single element from outside the class, or these will desync.
+    %
+    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
+    % updateProperty() can strip it by name without hardcoding an index,
+    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
+    % future solver-conditional parameter should likewise go last.
         modelParams    = {'M0';'R1';'R2star';'noise'};
         ub              = [   2;  10;     200;    0.1];
         lb              = [   0; 0.1;     0.1;  0.001];
@@ -18,12 +29,33 @@ classdef gpuJointR1R2starMapping < handle
         step            = [0.01;0.01;       1;  0.005];
     end
 
+    properties
+    % ===== USER-TUNABLE OPTIONS =====
+    % Freely settable by users before fitting; no coupling between these.
+        thres_similarity    = 0.1; 
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
+
+        seed = 48463;   % for reproducible random number generation
+
+        epsilon = utils.epsilon;
+    end
+
     properties (GetAccess = public, SetAccess = protected)
+    % ===== ACQUISITION PARAMETERS =====
+    % Set once in the constructor from user-provided acquisition info.
+    % Read-only after construction.
         te;
         tr;
         fa;
+        B0      = 3;
+        B0dir   = [0;0;1];
     end
-    
+
+    properties
+        % default model parameters and estimation boundary
+    end
+
     methods
 
         % constructuor
@@ -107,7 +139,7 @@ classdef gpuJointR1R2starMapping < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
-            [sliceBoundaries,NSegment]  = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
+            [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
 
             % parameter estimation
             out = [];
@@ -118,15 +150,22 @@ classdef gpuJointR1R2starMapping < handle
                     disp   ('------------------------')
                 end
     
-                % divide the data if requried
-                slice                               = sliceBoundaries{kseg};
-                [dataSeg, maskSeg, extraDataSeg]    = this.slice_segment(data, mask, slice, extraData);
+                % divide the data; fitRange includes halo slices (if any), ownedRange
+                % is what this segment is responsible for writing back
+                fitRange                        = seg(kseg).fit;
+                ownedRange                      = seg(kseg).owned;
+                [dataSeg, maskSeg,extraDataSeg] = this.slice_segment(data, mask, fitRange, extraData);
 
                 % run fitting
                 [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg);
 
+                % discard halo slices from this segment's output before restoring,
+                % so segment boundaries never keep voxels from a neighbour's
+                % independently-converged fit (no-op when seg(kseg).fit == .owned)
+                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
+
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
+                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
 
             end
             out.mask = mask;

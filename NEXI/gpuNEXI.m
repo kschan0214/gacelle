@@ -7,33 +7,53 @@ classdef gpuNEXI < handle
 % Date modified: 20 August 2024 (v0.4.0)
 % Date modified: 8 June 2026 (v0.5.0) (update memory management, support mcmc in the same function)
 
-    properties
-        % default model parameters and estimation boundary
-        % fa        : Neurite volume fraction
-        % Da        : longitudinal diffusivity of neurite [ms/us^2]
-        % De        : diffusivity of extracellular water [ms/us^2]
-        % ra        : exchange rate from neurite to extracellular space [1/s]
-        % p2        : non-linear neurite dispersion index
+    properties (GetAccess = public, SetAccess = protected)
+    % ===== MODEL PARAMETER CONTRACT =====
+    % fa        : Neurite volume fraction
+    % Da        : longitudinal diffusivity of neurite [ms/us^2]
+    % De        : diffusivity of extracellular water [ms/us^2]
+    % ra        : exchange rate from neurite to extracellular space [1/s]
+    % p2        : non-linear neurite dispersion index
+    % noise     : noise
+    %
+    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
+    % These five arrays MUST stay the same length and index-aligned.
+    % Mutate only as a set, via updateProperty() - never assign into a
+    % single element from outside the class, or these will desync.
+    %
+    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
+    % updateProperty() can strip it by name without hardcoding an index,
+    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
+    % future solver-conditional parameter should likewise go last.
         modelParams     = {'fa'  ;'Da'  ;'De'   ;'ra'   ;'p2'; 'noise'};
         ub              = [   1  ;   3  ;   3   ;   1   ;  1 ;     0.1];
         lb              = [ eps  ; eps  ; eps   ;1/250  ; eps;    0.01];
         startPoint      = [ 0.4  ;   2  ;   1   ; 0.05  ; 0.2;   0.005];
         step            = [  0.05;  0.15;   0.15;  0.005;0.05;   0.005];
+    end
 
-        epsilon             = utils.epsilon;
-
-        % default threshold for data exclusion
+    properties
+    % ===== USER-TUNABLE OPTIONS =====
+    % Freely settable by users before fitting; no coupling between these.
         thres_similarity    = 0.1; 
         thres_impossible    = 0.1;
         thres_bkg           = 0.01;
+
+        seed = 48463;   % for reproducible random number generation
+
+        epsilon = utils.epsilon;
+
     end
 
     properties (GetAccess = public, SetAccess = protected)
+    % ===== ACQUISITION PARAMETERS =====
+    % Set once in the constructor from user-provided acquisition info.
+    % Read-only after construction.
         b;
         Delta;  
         Nav;
     end
-    
+
     methods
 
         % constructuor
@@ -165,7 +185,7 @@ classdef gpuNEXI < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
-            [sliceBoundaries,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+            [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
 
             % parameter estimation
             out = [];
@@ -176,15 +196,22 @@ classdef gpuNEXI < handle
                     disp   ('------------------------')
                 end
     
-                % divide the data if requried
-                slice                           = sliceBoundaries{kseg};
-                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, slice, pars0);
+                % divide the data; fitRange includes halo slices (if any), ownedRange
+                % is what this segment is responsible for writing back
+                fitRange                        = seg(kseg).fit;
+                ownedRange                      = seg(kseg).owned;
+                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, fitRange, pars0);
 
                 % run fitting
                 [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
 
+                % discard halo slices from this segment's output before restoring,
+                % so segment boundaries never keep voxels from a neighbour's
+                % independently-converged fit (no-op when seg(kseg).fit == .owned)
+                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
+
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,outSeg,slice,kseg);
+                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
 
             end
             out.mask = mask;
@@ -198,6 +225,7 @@ classdef gpuNEXI < handle
                 case 'mcmc'
                     mcmc.save_mcmc_output(fitting.outputFilename,out)
             end
+
 
         end
 
@@ -466,20 +494,11 @@ classdef gpuNEXI < handle
         function pars0 = estimate_prior(this,dwi,mask, Nsample,lmax)
         % Estimation starting points for NEXI using likehood method
 
+            rng(this.seed); % for reproducible dictionary
+
             start = tic;
             
             disp('Estimate starting points based on likelihood ...')
-
-            % manage pool
-            pool            = gcp('nocreate');
-            isDeletepool    = false;
-            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
-                if isempty(pool)
-                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
-                    pool    = parpool('Processes',Nworker);
-                    isDeletepool = true;
-                end
-            end
 
             if nargin < 4 || isempty(Nsample)
                 Nsample         = 1e4;
@@ -494,10 +513,18 @@ classdef gpuNEXI < handle
 
             % find masked voxels
             ind         = find(mask(:));
-            if lmax == 0
-                Nparam = 4;
-            elseif lmax == 2
-                Nparam = 5;
+            
+            Nparam = numel(this.modelParams) - any(strcmpi(this.modelParams,'noise'));
+
+            % manage pool
+            pool            = gcp('nocreate');
+            isDeletepool    = false;
+            if numel(mask(mask>0)) > 1e4    % only start a pool if many voxel
+                if isempty(pool)
+                    Nworker = min(max(8,floor(maxNumCompThreads/4)),maxNumCompThreads);
+                    pool    = parpool('Processes',Nworker);
+                    isDeletepool = true;
+                end
             end
 
             pars0_mask  = zeros(Nparam,length(ind));
