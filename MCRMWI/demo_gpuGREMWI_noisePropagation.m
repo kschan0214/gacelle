@@ -73,40 +73,63 @@ noiseLv = (M0_GT.')./SNR;
 y       = s + randn(size(s)) .* noiseLv;
 y       = y(:,:,:,:,1) + 1i*y(:,:,:,:,2);
 
-%% askadam estimation
+%% DEMO#1: askadam estimation
 fitting                     = [];
 fitting.solver              = 'askadam';
-fitting.optimiser           = 'adam';
-fitting.iteration           = 10000;
-fitting.initialLearnRate    = 0.002;
-fitting.decayRate           = 0.000;
-fitting.convergenceValue    = 1e-7;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false;
+fitting                     = objGPU.check_set_default(fitting,y);
+fitting.initialLearnRate    = 0.01;
+fitting.convergenceValue    = 1e-5;
 fitting.start               = 'prior';   
-fitting.patience            = 5;   
-% extraData                   = [];
 
-objGPU  = gpuGREMWI(t);
-out     = objGPU.estimate(y, mask, extraData, fitting);
+objGPU      = gpuGREMWI(t);
+out_adam    = objGPU.estimate(y, mask, extraData, fitting);
 
-%% starting position
-objGPU  = gpuGREMWI(t);
+% starting position
 pars0   = objGPU.estimate_prior(y);
 
-%% plot result
-figure(99);
+% plot result
+figure(98);
 field = fieldnames(pars);
 tiledlayout(1,numel(field));
 for k = 1:numel(field)
     nexttile;
     scatter(pars.(field{k}),pars0.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_adam.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
 end
 
-legend('Start','Fitted','Location','northwest');
+legend('Start','askadam.m estimation','Location','northwest');
+
+%% DEMO#2: mcmc estimation
+fitting                     = [];
+fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting,y);
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 30;
+fitting.StepSize            = 2;
+fitting.iteration           = 1e4;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+fitting.burnin              = 0.1;       % 10% burn-in
+fitting.start               = 'prior';
+
+objGPU          = gpuGREMWI(t);
+out_ensemble    = objGPU.estimate(y, mask, extraData, fitting);
+
+% plot result
+figure(99);
+field = fieldnames(pars);
+tiledlayout(1,numel(field));
+for k = 1:numel(field)
+    nexttile;
+    scatter(pars.(field{k}),out_ensemble.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    h = refline(1);
+    h.Color = 'k';
+    title(field{k});
+    xlabel('GT');ylabel('Fitted');
+end
+
+legend('mcmc.m estimation','Location','northwest');

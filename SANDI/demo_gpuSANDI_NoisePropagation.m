@@ -1,4 +1,4 @@
-addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/gacelle/'));
+addpath(genpath('../../gacelle/'));
 clear;
 %% Simulate data
 
@@ -50,38 +50,60 @@ fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood'; 
 extraData                   = [];
 
-out   = objGPU.estimate(y, mask, fitting, extraData);
+out_adam                    = objGPU.estimate(y, mask, fitting, extraData);
 
-%% make some plots
-rng(seed); gpurng(seed);
-
+% make some plots
 % get initial starting point based on likelihood method for scatter plots
+rng(seed); gpurng(seed);
 fitting.iteration   = 0;
 objGPU              = gpuSANDI(bval_sorted, ldelta_sorted, BDELTA_sorted, Ds);
 pars0               = objGPU.estimate(y, mask, fitting, []); 
 
-% get FWD signal based on fitted result
-objGPU  = gpuSANDI(bval_sorted, ldelta_sorted, BDELTA_sorted, Ds);
-shat    = objGPU.FWD(out.final,pulseType);
-
-%% plot result
+% plot result
 field = fieldnames(pars);
 figure;tiledlayout(2,numel(field)+1,"TileSpacing","compact");
 for k = 1:numel(field)
     nexttile;
     scatter(pars.(field{k}),pars0.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_adam.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
+    drawnow
 end
 
-nexttile([1 numel(field)+1]);plot(pars0.final.resloss,'x');hold on;plot(out.final.resloss,'o');title('Loss on each sample')
-legend('Start','Fitted');xlabel('Sample');ylabel('loss');
+nexttile([1 numel(field)+1]);plot(pars0.final.resloss,'x');hold on;plot(out_adam.final.resloss,'o');title('Loss on each sample')
+legend('Start','askadam.m estimation');xlabel('Sample');ylabel('loss');
 
-% %% plot residual
-% figure;
-% nexttile;h1 = plot(squeeze(y).','bo');hold on;h2 = plot(squeeze(shat),':r');h3 = plot(squeeze(s),'k');
-% legend([h1(1),h2(1),h3(1)],'Noisy data','Fitted','Noiseless');
-% nexttile;plot(out.final.residual.','--o');title('Fitting residuals')
+%% MCMC estimation
+% reset class object for MCMC
+objGPU      = gpuSANDI(bval_sorted, ldelta_sorted, BDELTA_sorted, Ds);
+
+fitting                     = [];
+fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting);
+fitting.start               = 'likelihood';
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 30;
+fitting.StepSize            = 2;
+fitting.iteration           = 1e4;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+extraData                   = [];
+
+out_mcmc   = objGPU.estimate(y, mask, fitting, extraData);
+
+% plot result
+figure;
+field = fieldnames(pars);
+tiledlayout(1,numel(field));
+for k = 1:numel(field)
+    nexttile;
+    scatter(pars.(field{k}),out_mcmc.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    h = refline(1);
+    h.Color = 'k';
+    title(field{k});
+    xlabel('GT');ylabel('mcmc.m estimation');
+    drawnow
+end

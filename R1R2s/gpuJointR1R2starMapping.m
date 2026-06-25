@@ -474,6 +474,8 @@ classdef gpuJointR1R2starMapping < handle
 
         % normalise input data based on masked signal intensity at 98%
         function [img, mask, scaleFactor] = prepare_data(this, img, mask, extradata)
+            
+            mask = mask>0;
 
             % make sure input data are valid
             [mask,extradata] = this.validate_input(img,mask,extradata);

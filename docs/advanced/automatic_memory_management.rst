@@ -6,7 +6,7 @@ Automatic GPU Memory Management
 When processing large datasets, GPU memory can become a bottleneck. GACELLE includes an automatic memory manager that detects whether the full dataset fits in available GPU memory and, if not, transparently segments the data into smaller chunks that are processed sequentially. This page explains how the mechanism works, what its limitations are, and what users should expect.
 
 .. note::
-   Automatic memory management is currently supported for the built-in model classes (e.g. ``gpuMCRMWI``, ``gpuJointR1R2starMapping``) and applies to both the ``askadam.m`` and ``mcmc.m`` solvers. It is activated by setting ``fitting.autoMemManage = 1`` before calling the model's ``fit`` method.
+   Automatic memory management is currently supported for the built-in model classes (e.g. ``gpuMCRMWI``, ``gpuJointR1R2starMapping``) and applies to both the ``askadam.m`` and ``mcmc.m`` solvers. It is activated by setting ``fitting.autoMemManage = 1`` before calling the model's ``fit`` method. Two further options, ``fitting.segmentOverlap`` and ``fitting.NSegmentUser``, give manual control over segment overlap and segment count; see :ref:`memmanage-manual-control` below.
 
 Why Segmentation Is Needed
 ----------------------------
@@ -18,7 +18,7 @@ For typical in vivo datasets at 1–2 mm isotropic resolution, this is usually n
 How It Works
 -------------
 
-The memory manager is implemented in ``utils.find_optimal_segment_3D`` and runs automatically before the main optimisation when ``fitting.autoMemManage = 1``. It proceeds in three stages.
+The memory manager is implemented in ``utils.find_optimal_segment_3D``, which runs before the main optimisation whenever segmentation might be needed: either because ``fitting.autoMemManage = 1`` (the probe-based path described below), or because ``fitting.NSegmentUser`` is set to force a minimum segment count regardless of ``autoMemManage`` (see :ref:`memmanage-manual-control`). This section describes the three-stage probe path; the manual override is covered separately.
 
 **Stage 1: Probe fitting**
 
@@ -46,11 +46,21 @@ The available VRAM is queried via ``utils.get_available_vram()``, which reads th
 - If the predicted peak is within the available VRAM budget, no segmentation is applied and the full volume is processed in a single pass.
 - If the predicted peak exceeds the budget, the maximum number of voxels that can safely fit in one segment is computed by inverting the linear model::
 
-     NvoxPerSeg = floor((memAvail_MB - intercept) / slope)
+     NvoxPerSegFit = floor((memAvail_MB - intercept) / slope)
 
-  The brain mask is then divided into **density-balanced slice groups** using ``utils.build_balanced_boundaries``. This partitions the 3D volume along the slice (z) dimension such that each segment contains at most ``NvoxPerSeg`` masked voxels, with boundaries chosen to keep segment sizes as equal as possible rather than splitting at fixed slice intervals.
+  This budget is for the segment as actually *fitted*, which includes any halo slices (see :ref:`memmanage-manual-control`). The halo cost is subtracted first, using the mean masked-voxel density per slice and the worst case of two halo faces, to give a smaller, conservative target for the voxels each segment *owns*::
 
-The resulting slice boundaries are returned to the model's ``fit`` method, which loops over segments, fits each independently, and reassembles the output parameter maps.
+     NvoxPerSegOwned = max(1, NvoxPerSegFit - 2 * segmentOverlap * meanSliceVox)
+
+  The brain mask is then divided into **density-balanced owned slice groups** using ``utils.build_balanced_boundaries``, which partitions the volume along the slice (z) dimension so each segment owns at most ``NvoxPerSegOwned`` masked voxels, with boundaries chosen to keep segment sizes as equal as possible. ``utils.expand_segments_with_halo`` then pads each segment's owned range with up to ``segmentOverlap`` halo slices on its internal faces (never past the true volume boundary) to get the range actually fitted.
+
+The function returns a struct array ``seg``, one entry per segment, with three fields:
+
+- ``seg(k).owned`` — global slice indices this segment is responsible for. Disjoint across segments and exactly partitions the full volume; used when writing results back.
+- ``seg(k).fit`` — global slice indices actually extracted and fitted, i.e. ``.owned`` padded with halo slices.
+- ``seg(k).local`` — position of ``.owned`` within ``.fit``, precomputed so calling code never has to re-derive the offset.
+
+With no overlap (``segmentOverlap = 0``, the default), ``.fit`` and ``.owned`` are identical and this reduces exactly to the previous behaviour. The model's ``fit`` method loops over ``seg``, fits each segment's ``.fit`` range, crops the output down to ``.owned`` via ``.local``, and reassembles the full parameter maps.
 
 Enabling Automatic Memory Management
 --------------------------------------
@@ -69,7 +79,7 @@ When the flag is active, GACELLE will print a brief report to the console::
      Predicted MATLAB peak : 18432 MB
      Available VRAM (smi)  : 12288 MB
      Budget (100%)         : 12288 MB
-   Data divided into 4 segments (max 62500 voxels/segment)
+   Data divided into 4 segments (target 62500 owned voxels/segment, halo=0 slices)
    The estimation may not be exactly the same as 1 segment.
 
 If the full volume fits, you will instead see::
@@ -78,28 +88,64 @@ If the full volume fits, you will instead see::
 
 and a single-pass fit proceeds as normal.
 
+.. _memmanage-manual-control:
+
+Manual Control: Overlap and Forced Segment Count
+---------------------------------------------------
+
+Automatic detection is a prediction, not a guarantee, and the linear memory model can be wrong for some forward functions (see :ref:`memmanage-limitations` below). Two ``fitting`` fields let you override or assist it directly, and — importantly — **both work whether or not the automatic probe runs at all**, including with ``fitting.autoMemManage = 0``:
+
+``fitting.segmentOverlap`` (default ``0``)
+   Number of halo slices added on each *internal* segment boundary. When a spatial regulariser couples neighbouring slices (e.g. 3D TV), each segment normally loses correct neighbour information at its cut faces, producing mild discontinuities in the reconstructed map at segment boundaries (see :ref:`memmanage-limitations`). Setting ``segmentOverlap`` to a small positive integer (e.g. ``3``) gives every internal segment face that many slices of context borrowed from its neighbour; those halo slices are fitted but discarded on reassembly, so only the ``owned`` core of each segment is written to the output. The true volume boundary (the very first and last slice of the whole dataset) never gets a halo, since there is nothing to borrow there. The default of ``0`` reproduces the original no-halo behaviour exactly. If the halo width approaches half the thickness of the thinnest segment, GACELLE issues a ``GACELLE:haloVsOwnedThickness`` warning, since at that point a segment is spending most of its compute refitting its neighbours' slices rather than its own.
+
+``fitting.NSegmentUser`` (default ``[]``)
+   A user-requested **minimum** number of segments. This is a floor, not a fixed override: the final segment count is ``max(NSegmentUser, memoryRequiredSegments)``, so it can only ever push the segment count up, never down past what the memory model determined was necessary. Setting this cannot, by construction, cause an out-of-memory error that the automatic logic would otherwise have prevented.
+
+   This is the option to reach for if automatic detection is unavailable or untrustworthy for your situation:
+
+   - If the probe itself raises ``GACELLE:memoryError`` (predicted fixed overhead alone exceeds available VRAM) or you hit an out-of-memory error mid-run despite a "fits in memory" prediction, set ``fitting.autoMemManage = 0`` and ``fitting.NSegmentUser`` to a value you know is safe (e.g. from a previous successful run, or by estimating from your GPU's VRAM and the dataset's voxel count) and re-run.
+   - ``NSegmentUser`` is honoured even when ``autoMemManage`` is off, or when the probe is skipped because the mask is too small to probe reliably (see below). In both of those cases the resulting segments are equal-thickness slabs rather than density-balanced, since there is no memory or voxel-density information available to balance against.
+   - It is also useful on its own for validating that segmentation itself is not the source of an unexpected result: force a known segment count on a dataset that normally fits in one pass, and compare against the single-pass output.
+
+Example — forcing two segments with a 3-slice halo, bypassing automatic detection entirely::
+
+   fitting.autoMemManage  = 0;
+   fitting.NSegmentUser   = 2;
+   fitting.segmentOverlap = 3;
+   out = modelObj.fit(data, mask, fitting);
+
+Example — letting automatic detection decide segment count, but adding a halo in case 3D TV is active::
+
+   fitting.autoMemManage  = 1;
+   fitting.segmentOverlap = 3;
+   out = modelObj.fit(data, mask, fitting);
+
 When autoMemManage Is Skipped
 -------------------------------
 
-The manager disables itself (i.e., falls back to single-pass) in two situations:
+The probe stage disables itself (i.e., falls back to single-pass sizing) in two situations:
 
 - The total number of masked voxels is smaller than the minimum probe size (100 voxels). There is nothing meaningful to segment.
 - The larger probe size does not exceed the smaller one (e.g. 10% of the mask is fewer than 100 voxels). The linear fit would be degenerate.
 
-In both cases, ``fitting.autoMemManage`` is silently set to 0 internally and the full data is processed in one pass.
+In both cases, ``fitting.autoMemManage`` is silently set to 0 internally. This does **not** mean segmentation is impossible in this situation: ``fitting.NSegmentUser`` is still honoured as a floor even when the probe is skipped or ``autoMemManage`` is off, so if you need a forced segment count on a small mask (e.g. for testing), set ``NSegmentUser`` directly rather than relying on the probe. With no memory information available, the resulting segments are equal-thickness slabs rather than density-balanced.
+
+.. _memmanage-limitations:
 
 Limitations and Caveats
 -------------------------
 
-**Segmentation changes results slightly.** When the data is split into segments, each segment is optimised independently. For ``askadam.m``, because gradients are accumulated across all voxels in a single loss, splitting the volume changes the loss landscape: voxels at segment boundaries lose their neighbours during that segment's optimisation, and any spatial regularisation (e.g. TV) is applied within, not across, segment boundaries. For ``mcmc.m``, chains are independent per voxel so the effect is more limited, but initialisation and any shared hyperparameters may differ slightly across segments. In practice, differences are small for typical segmentation counts, but results will not be numerically identical to a single-pass fit. This is noted explicitly in the console output.
+**Segmentation changes results slightly.** When the data is split into segments, each segment is optimised independently. For ``askadam.m``, because gradients are accumulated across all voxels in a single loss, splitting the volume changes the loss landscape: voxels at segment boundaries lose their neighbours during that segment's optimisation, and any spatial regularisation (e.g. TV) is applied within, not across, segment boundaries unless a halo is used. For ``mcmc.m``, chains are independent per voxel so the effect is more limited, but initialisation and any shared hyperparameters may differ slightly across segments. In practice, differences are small for typical segmentation counts, but results will not be numerically identical to a single-pass fit. This is noted explicitly in the console output.
 
-**3D TV regularisation does not cross segment boundaries.** If you are using 3D total variation regularisation, the regulariser is computed independently within each segment's slice group. This can introduce mild discontinuities at boundaries, particularly when segment counts are high. 2D TV (applied within each axial slice) is unaffected.
+**3D TV regularisation does not cross segment boundaries unless a halo is set.** If you are using 3D total variation regularisation with ``fitting.segmentOverlap = 0`` (the default), the regulariser is computed independently within each segment's owned slice group, which can introduce mild discontinuities at boundaries, particularly when segment counts are high. Setting ``fitting.segmentOverlap`` to a few slices (see :ref:`memmanage-manual-control`) gives each segment correct neighbour information across its cut faces and removes this discontinuity in practice, at the cost of refitting a few extra slices per internal boundary. 2D TV (applied within each axial slice) is unaffected by segmentation either way.
+
+**Whole-image operations (e.g. Fourier transforms) need further testing.** Segmentation assumes the forward model's dependence on neighbouring voxels is local and slice-limited, which is what a halo of a few slices can correct for. Operations that act on the *entire* image volume at once, such as a 3D FFT or other transforms with global support, do not fit this assumption: a halo of any finite width cannot reproduce what a whole-volume transform would see, since every voxel in principle depends on every other voxel. Models or regularisers that include such whole-image operations have not yet been thoroughly validated under segmentation, with or without halo, and should be treated with caution until this is tested explicitly.
 
 **The linear memory model is an approximation.** The probe-based extrapolation assumes that peak memory scales linearly with voxel count. This is a reasonable first-order model for most GACELLE applications, but it can underestimate memory for models with strongly nonlinear forward functions or when MATLAB's internal allocator fragments GPU memory. A conservative ``safetyFactor < 1`` can be applied to reduce the effective budget if you observe out-of-memory errors despite the manager predicting a fit.
 
 **Memory prediction depends on the GPU state at probe time.** If GPU memory is heavily fragmented or occupied by other processes at the time of probing, the estimate of other-process overhead may be inaccurate, leading to a more conservative (more segments) or, less commonly, an overoptimistic (fewer segments) segmentation decision. Closing other GPU-intensive applications before running is recommended for reproducibility.
 
-**Forward model internal allocations are not captured.** The probe measures peak memory during a zero-iteration fit (``fitting.iteration = 0``). Allocations made inside the forward model during a real optimisation run (e.g. temporary arrays in EPG-X or ANN inference) may add memory beyond what the probe captures. If you find that the predicted-safe segment count still causes OOM errors, reduce the number of segments manually or contact the developers.
+**Forward model internal allocations are not captured.** The probe measures peak memory during a zero-iteration fit (``fitting.iteration = 0``). Allocations made inside the forward model during a real optimisation run (e.g. temporary arrays in EPG-X or ANN inference) may add memory beyond what the probe captures. If you find that the predicted-safe segment count still causes OOM errors, set ``fitting.NSegmentUser`` to a higher value yourself (see :ref:`memmanage-manual-control`) rather than relying on the probe, or contact the developers.
 
 **nvidia-smi must be available.** The memory manager relies on ``nvidia-smi`` being on the system path. On most Linux HPC systems this is the case; on Windows it may require adding the CUDA bin directory to the PATH.
 
@@ -111,4 +157,5 @@ The memory manager calls the following internal utilities, which are documented 
 - ``utils.get_other_process_memory(pid)`` — returns the current GPU memory (MB) used by all processes except the MATLAB process with the given PID.
 - ``utils.get_available_vram()`` — returns current free GPU VRAM (MB) as reported by nvidia-smi.
 - ``utils.read_absolute_peak_from_log(logFile)`` — reads a nvidia-smi CSV log and returns the peak total GPU memory usage (MB), discarding the first 5% of samples as a warm-up period.
-- ``utils.build_balanced_boundaries(mask, NvoxPerSeg)`` — partitions a 3D binary mask into slice groups such that each group contains at most ``NvoxPerSeg`` masked voxels, with group sizes as equal as possible.
+- ``utils.build_balanced_boundaries(mask, NvoxPerSeg, NSegmentMin)`` — partitions a 3D binary mask into owned slice groups such that each group contains at most ``NvoxPerSeg`` masked voxels, with group sizes as equal as possible. ``NSegmentMin`` (optional, default 1) is a floor on the number of segments, used to implement ``fitting.NSegmentUser``.
+- ``utils.expand_segments_with_halo(ownedBoundaries, h, dims3)`` — takes the owned slice ranges from ``build_balanced_boundaries`` and pads each internal boundary with ``h`` halo slices to produce the ``seg`` struct array (``.owned``/``.fit``/``.local``) used by ``find_optimal_segment_3D``.

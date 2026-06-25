@@ -30,7 +30,6 @@ Nav   = Ngdir*ones(numel(bval),1);
 N = Nsample;
 
 NEXIobj = NEXIrotinv(bval, Delta);
-SMEXobj = SMEXSH(bval, Delta, delta);
 intervals = [0.1 0.9  ;   % fa: intra-neurite volume fraction
                 1.5 3   ;   % Da: intra-neurite axial diffusivity
                 0.5 1.5   ;   % De/Da: ratio of Da to De

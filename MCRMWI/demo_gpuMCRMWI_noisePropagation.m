@@ -101,40 +101,29 @@ Smax = mean(M0_GT);
 noise_sigma = Smax/SNR;
 y = Sgpu_GT + noise_sigma*randn(size(Sgpu_GT)) + 1i*noise_sigma*randn(size(Sgpu_GT));
 
-%% askadam estimation
+%% DEMO#1: askadam estimation
 fitting                     = [];
-fitting.optimiser           = 'adam';
-fitting.iteration           = 10000;
+fitting.solver              = 'askadam';
+fitting                     = objGPU.check_set_default(fitting,y);
 fitting.initialLearnRate    = 0.01;
-fitting.decayRate           = 0.001;
-fitting.convergenceValue    = 1e-6;
-fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-8;
-fitting.isDisplay           = false;
+fitting.convergenceValue    = 1e-5;
 fitting.start               = 'prior';   
-fitting.patience            = 5;   
-fitting.convergenceModel        = 'ema';
-fitting.emaDecay                = 0.95;
-fitting.robustConvergence       = true;
-fitting.outlierWeight           = 0.1;
-fitting.parameterTransform      = 'sigmoid';
-% extraData                   = [];
 
 objGPU     = gpuMCRMWI(te,tr,fa,fixed_params);
-out     = objGPU.estimate(y, mask, extraData, fitting);
+out_adam   = objGPU.estimate(y, mask, extraData, fitting);
 
-%% starting position
+% starting position
 objGPU     = gpuMCRMWI(te,tr,fa,fixed_params);
 pars0   = objGPU.estimate_prior(y,mask,extraData);
 
-%% plot result
+% plot result
 figure;
 field = fieldnames(pars);
 tiledlayout(1,numel(field)-1);
 for k = 1:numel(field)-1
     nexttile;
     scatter(pars.(field{k}),pars0.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_adam.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});

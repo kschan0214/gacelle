@@ -41,30 +41,31 @@ mask    = ones(size(s,1:3),'logical');
 noiseLv = (M0_GT.')./SNR;
 s       = s + randn(size(s)) .* noiseLv;
 
-%% askadam estimation
-fitting.solver              = 'askadam';
-fitting                     = objGPU.check_set_default(fitting);
 extraData                   = [];
 extraData.b1                = b1.';
 
-objGPU  = gpuJointR1R2starMapping(t,tr,fa);
-out     = objGPU.estimate(s, mask, extraData, fitting);
+%% DEMO#1: askadam estimation default
+fitting             = [];
+fitting.solver      = 'askadam';
+fitting             = objGPU.check_set_default(fitting);
+fitting.start       = 'default';
 
-%% askadam estimation
-fitting.solver              = 'askadam';
-fitting                     = objGPU.check_set_default(fitting);
-fitting.isWeighted          = true;
-fitting.weightMethod        = '1stecho';
-fitting.weightPower         = 2;
-extraData                   = [];
-extraData.b1                = b1.';
+objGPU              = gpuJointR1R2starMapping(t,tr,fa);
+out_adam            = objGPU.estimate(s, mask, extraData, fitting);
 
-objGPU          = gpuJointR1R2starMapping(t,tr,fa);
-out_weighted    = objGPU.estimate(s, mask, extraData, fitting);
+% get starting position
+fitting.iteration   = 0;
+pars0               = objGPU.estimate(s, mask, extraData,fitting);
 
-%% starting position
-objGPU  = gpuJointR1R2starMapping(t,tr,fa);
-pars0   = objGPU.estimate_prior(s, mask, extraData);
+%% DEMO#2: mcmc estimation, uniform weights
+% reset class object
+objGPU              = gpuJointR1R2starMapping(t,tr,fa);
+
+fitting             = [];
+fitting.solver      = 'mcmc';
+fitting             = objGPU.check_set_default(fitting);
+
+out_mh              = objGPU.estimate(s, mask, extraData, fitting);
 
 %% plot result
 figure(99);
@@ -72,21 +73,21 @@ field = fieldnames(pars);
 tiledlayout(2,numel(field));
 for k = 1:numel(field)
     nexttile;
-    scatter(pars.(field{k}),pars0.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),pars0.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
+    scatter(pars.(field{k}),out_adam.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
 end
+legend('Start','askadam.m estimation','Location','northwest');
+
 for k = 1:numel(field)
     nexttile;
-    scatter(pars.(field{k}),pars0.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out_weighted.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_mh.mean.(field{k}),5,'filled','MarkerFaceAlpha',.4,'MarkerFaceColor','g');
     h = refline(1);
     h.Color = 'k';
-    title([field{k} ' w-P2']);
+    title(field{k});
     xlabel('GT');ylabel('Fitted');
 end
-
-legend('Start','Fitted','Location','northwest');
+legend('mcmc.m estimation','Location','northwest');

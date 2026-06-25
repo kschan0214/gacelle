@@ -56,7 +56,7 @@ classdef mcmc < handle
                 if k == 1
                     N = numel(pars0.(fitting.modelParams{k}));
                 else
-                    if N ~= numel(pars0.(fitting.modelParams{k}))
+                    if N ~= numel(pars0.(fitting.modelParams{k})) && numel(pars0.(fitting.modelParams{k})) == 1
                         isGlobal = true;
                         break;
                     end

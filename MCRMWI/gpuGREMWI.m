@@ -504,7 +504,7 @@ classdef gpuGREMWI < handle
                 else
                     g = hcfm_gratio(abs(S0IW),abs(S0MW)/this.rho_mw);
                 end
-
+                g = max(g, this.epsilon);
             end
             
             % extra decay on extracellular water estimated by HCFM 
@@ -549,12 +549,13 @@ classdef gpuGREMWI < handle
 
             end
 
-            freqEW = this.freq_EW;
+            freqEW      = this.freq_EW;
+            S0IEW_phase = 0;
 
             if isfield(fitting,'solver') && strcmpi(fitting.solver, 'mcmc')
-                [Sreal,Simag] = arrayfun(@compute_gremwi_signal,S0MW,S0IW,S0EW,r2sMW,r2sIW,r2sEW,freqMW,freqIW,freqEW,freqBKG,pini,decayEW,extraData.ff,TE,this.B0,this.gyro);
+                [Sreal,Simag] = arrayfun(@compute_gremwi_signal,S0MW,S0IW,S0EW,r2sMW,r2sIW,r2sEW,freqMW,freqIW,freqEW,freqBKG,pini,decayEW,extraData.ff,TE,this.B0,this.gyro,S0IEW_phase);
             else
-                [Sreal,Simag] = compute_gremwi_signal(S0MW,S0IW,S0EW,r2sMW,r2sIW,r2sEW,freqMW,freqIW,freqEW,freqBKG,pini,decayEW,extraData.ff,TE,this.B0,this.gyro);
+                [Sreal,Simag] = compute_gremwi_signal(S0MW,S0IW,S0EW,r2sMW,r2sIW,r2sEW,freqMW,freqIW,freqEW,freqBKG,pini,decayEW,extraData.ff,TE,this.B0,this.gyro,S0IEW_phase);
             end
             % weighted sum all fibre for DIMWI
             Sreal = sum(Sreal,5);
@@ -644,7 +645,7 @@ classdef gpuGREMWI < handle
         end
 
         % normalise input data based on masked signal intensity at 98%
-        function [data, mask, extraData, scaleFactor] = prepare_data(this,data,mask,extraData,fitting);
+        function [data, mask, extraData, scaleFactor] = prepare_data(this,data,mask,extraData,fitting)
 
             % make sure input data are valid
             [extraData,mask] = this.validate_data(data,extraData,mask,fitting);
@@ -797,7 +798,7 @@ classdef gpuGREMWI < handle
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting,data)
             
-             if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
+            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
 
             % get basic fitting setting check
             if strcmpi(fitting.solver,'mcmc')
@@ -810,7 +811,7 @@ classdef gpuGREMWI < handle
                 % askadam
                 fitting2 = askadam.check_set_default_basic(fitting);
                 % get customised fitting setting check
-            if ~isfield(fitting,'regmap');      fitting2.regmap = 'MWF'; end
+                if ~isfield(fitting,'regmap');      fitting2.regmap = 'MWF'; end
             end
 
             % get customised fitting setting check

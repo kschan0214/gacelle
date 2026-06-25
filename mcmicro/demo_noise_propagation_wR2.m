@@ -71,9 +71,3 @@ xlabel('GT');ylabel('Fitted');
 
 nexttile([1 numel(field)]);plot(pars0.final.resloss,'x');hold on;plot(out.final.resloss,'o');title('Loss on each sample')
 legend('Start','Fitted');xlabel('Sample');ylabel('loss');
-
-% %% plot residual
-% figure;
-% nexttile;h1 = plot(squeeze(y).','bo');hold on;h2 = plot(squeeze(shat),':r');h3 = plot(squeeze(s),'k');
-% legend([h1(1),h2(1),h3(1)],'Noisy data','Fitted','Noiseless');
-% nexttile;plot(out.final.residual.','--o');title('Fitting residuals')

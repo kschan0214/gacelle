@@ -22,6 +22,66 @@ classdef utils < handle
 
     methods(Static)
 
+        function s = struct2gpusingle(s)
+        % Recursively convert all numeric arrays in a struct to gpuArray single.
+            fn = fieldnames(s);
+            for k = 1:numel(s)
+                for i = 1:numel(fn)
+                    v = s(k).(fn{i});
+                    if isnumeric(v) && ~issparse(v) && ~isa(v, 'gpuArray')
+                        s(k).(fn{i}) = gpuArray(single(v));
+                    elseif isstruct(v)
+                        s(k).(fn{i}) = utils.struct2gpusingle(v);
+                    elseif iscell(v)
+                        s(k).(fn{i}) = utils.cell2gpusingle(v);
+                    end
+                end
+            end
+        end
+        
+        function c = cell2gpusingle(c)
+            for i = 1:numel(c)
+                v = c{i};
+                if isnumeric(v) && ~issparse(v) && ~isa(v, 'gpuArray')
+                    c{i} = gpuArray(single(v));
+                elseif isstruct(v)
+                    c{i} = utils.struct2gpusingle(v);
+                elseif iscell(v)
+                    c{i} = utils.cell2gpusingle(v);
+                end
+            end
+        end
+
+        function s = struct2single(s)
+        % Recursively convert all numeric arrays in a struct to single precision.
+            fn = fieldnames(s);
+            for k = 1:numel(s)            % handle struct arrays
+                for i = 1:numel(fn)
+                    v = s(k).(fn{i});
+                    if isnumeric(v)
+                        s(k).(fn{i}) = single(v);
+                    elseif isstruct(v)
+                        s(k).(fn{i}) = utils.struct2single(v);
+                    elseif iscell(v)
+                        s(k).(fn{i}) = utils.cell2single(v);
+                    end
+                end
+            end
+        end
+        
+        function c = cell2single(c)
+            for i = 1:numel(c)
+                v = c{i};
+                if isnumeric(v)
+                    c{i} = single(v);
+                elseif isstruct(v)
+                    c{i} = utils.struct2single(v);
+                elseif iscell(v)
+                    c{i} = utils.cell2single(v);
+                end
+            end
+        end
+
         function data = vectorise(data)
             data = data(:);
         end
@@ -326,10 +386,16 @@ classdef utils < handle
             % Log total GPU memory AND per-process breakdown
             % Two columns: total_used, matlab_process_used
             % We poll total (high time resolution) and correct for non-MATLAB usage
-            cmd = sprintf(['nvidia-smi --query-gpu=memory.used ' ...
+            % "timeout 60" bounds the process lifetime independently of whether
+            % the caller ever reaches a cleanup call (e.g. on a hard crash).
+            cmd = sprintf(['timeout 60 nvidia-smi --query-gpu=memory.used ' ...
                            '--format=csv,noheader,nounits -lms 5 > %s &'], logFile);
             system(cmd);
-            [~, pidStr] = system('pgrep -n nvidia-smi');
+            % Match by logFile (unique via tempname), not by process name -
+            % "pgrep -n nvidia-smi" grabs the most recently started
+            % nvidia-smi system-wide, which can be a stale/orphaned process
+            % from a previous interrupted session rather than this one.
+            [~, pidStr] = system(sprintf('pgrep -f "%s"', logFile));
             nvidiaPID   = strtrim(pidStr);
         end
         
@@ -412,6 +478,117 @@ classdef utils < handle
             end
         end
 
+        function kill_and_cleanup(pid, logFile)
+        % utils.kill_and_cleanup  Best-effort termination of a probe/profile's
+        % background nvidia-smi process and removal of its log file.
+        %
+        % Designed to be safe to call unconditionally - on every code path
+        % (success, OOM-catch, any-other-error-catch) - even if pid is empty,
+        % already dead, or invalid, or logFile does not exist. This is the
+        % single point of cleanup used by both find_optimal_segment_3D and
+        % run_and_profile, so any future fix to orphan-handling only needs to
+        % be made once.
+        %
+        % Input
+        %   pid     : string, PID of the nvidia-smi process to terminate, as
+        %             captured via "pgrep -f <logFile>" (NOT "pgrep -n
+        %             nvidia-smi", which matches by process name and can
+        %             grab an unrelated/stale process system-wide). May be
+        %             empty if pgrep failed to find a match.
+        %   logFile : string, full path to the probe/profile's nvidia-smi
+        %             log CSV file. Deleted if present.
+        %
+        % See also: utils.find_optimal_segment_3D, utils.run_and_profile,
+        %           utils.cleanup_orphaned_probes
+        
+            if nargin < 2; logFile = ''; end
+        
+            if ~isempty(pid)
+                % Graceful termination first, then a brief wait for any
+                % in-flight write to flush before the file is deleted.
+                system(sprintf('kill %s 2>/dev/null', pid));
+                pause(0.1);
+                % Escalate to SIGKILL in case the process was mid-write,
+                % ignored SIGTERM, or is otherwise still alive. Safe to call
+                % even if the process already died from the first kill -
+                % system() on a missing PID is a silent no-op, not an error.
+                system(sprintf('kill -9 %s 2>/dev/null', pid));
+                pause(0.05);
+            end
+        
+            if ~isempty(logFile) && isfile(logFile)
+                try
+                    delete(logFile);
+                catch ME
+                    warning('GACELLE:cleanupFailed', ...
+                        'Could not delete log file %s: %s', logFile, ME.message);
+                end
+            end
+        end
+
+        function cleanup_orphaned_probes()
+        % utils.cleanup_orphaned_probes  Kill any leftover nvidia-smi
+        % processes writing to GACELLE probe/profile logfiles, and delete
+        % any stale logfiles sitting in tempdir.
+        %
+        % This handles debris left behind by a PREVIOUS session that was
+        % interrupted (crash, Ctrl-C, killed kernel) before its own
+        % kill_and_cleanup call could run - e.g. a probe's nvidia-smi
+        % process that was orphaned and has been polling/appending to its
+        % CSV log ever since, sometimes growing to a very large file.
+        %
+        % Safe to call at any time, including when no GACELLE probe is
+        % currently running: it only targets processes/files matching the
+        % "_gacelle_probe.csv" / "_gacelle_profile.csv" naming pattern used
+        % exclusively by find_optimal_segment_3D and run_and_profile, so it
+        % will not affect unrelated nvidia-smi usage on a shared machine.
+        %
+        % Recommended: call this once at the start of a session, e.g. in a
+        % startup script, or any time you suspect a previous run was
+        % interrupted mid-probe.
+        %
+        % See also: utils.kill_and_cleanup, utils.find_optimal_segment_3D,
+        %           utils.run_and_profile
+        
+            patterns = {'_gacelle_probe.csv', '_gacelle_profile.csv'};
+        
+            nKilled = 0;
+            nDeleted = 0;
+        
+            for kpat = 1:numel(patterns)
+                pat = patterns{kpat};
+        
+                % Kill any nvidia-smi process whose command line references a
+                % logfile matching this pattern, wherever it lives in tempdir.
+                [~, pidList] = system(sprintf('pgrep -f "%s"', pat));
+                pids = strsplit(strtrim(pidList));
+                for kpid = 1:numel(pids)
+                    if ~isempty(pids{kpid})
+                        system(sprintf('kill -9 %s 2>/dev/null', pids{kpid}));
+                        nKilled = nKilled + 1;
+                    end
+                end
+        
+                % Delete any stale logfiles matching this pattern in tempdir.
+                staleFiles = dir(fullfile(tempdir, ['*' pat]));
+                for kf = 1:numel(staleFiles)
+                    f = fullfile(staleFiles(kf).folder, staleFiles(kf).name);
+                    try
+                        delete(f);
+                        nDeleted = nDeleted + 1;
+                    catch ME
+                        warning('GACELLE:cleanupFailed', ...
+                            'Could not delete stale log file %s: %s', f, ME.message);
+                    end
+                end
+            end
+        
+            if nKilled > 0 || nDeleted > 0
+                fprintf('utils.cleanup_orphaned_probes: terminated %d orphaned process(es), deleted %d stale log file(s).\n', ...
+                    nKilled, nDeleted);
+            end
+        end
+
         function [seg,NSegment] = find_optimal_segment_3D(modelObj, data, mask, fitting, varargin)
         % modelObj : the model object (e.g. gpuMCRMWI, gpuJointR1R2starMapping)
         %            must implement: fit_probe, slice_segment, fit_segment, postprocess_segments
@@ -468,7 +645,7 @@ classdef utils < handle
             Nvoxel      = nnz(mask);
             probeMin    = 100;
             probeMax    = min(round(Nvoxel*0.1),1e5);
-            probeSize = [probeMin probeMax];
+            probeSize   = [probeMin probeMax];
             if probeMax <= probeMin
                 fitting.autoMemManage = 0;  % size too small
             end
@@ -490,7 +667,8 @@ classdef utils < handle
                     mask_probe                  = zeros(size(mask));
                     mask_probe(1:probeSize(kp)) = 1;
                     fitting_probe               = fitting;
-                    fitting_probe.iteration     = 0;
+                    fitting_probe.iteration     = 100;      % run 100 iterations to make sure the CUDA memory pool warm-up
+                    fitting_probe.repetition    = 1;
                     fitting_probe.start         = 'default';
                     % fitting_probe still carries segmentOverlap/NSegmentUser, but
                     % this is harmless: modelObj.fit() never reads those fields,
@@ -498,9 +676,19 @@ classdef utils < handle
                     % is not re-entered through this function during probing.
                 
                     logFile   = strcat(tempname, '_gacelle_probe.csv');
-                    cmd       = sprintf('nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 5 > %s &', logFile);
+                    cmd       = sprintf('timeout 60 nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 5 > %s &', logFile);
                     system(cmd);
-                    [~, pidStr] = system('pgrep -n nvidia-smi');
+                    % Match by logFile (unique per call via tempname), not by
+                    % process name. "pgrep -n nvidia-smi" grabs the most
+                    % recently started nvidia-smi process system-wide, which is
+                    % wrong if a prior crashed/interrupted session left one
+                    % running, or if probes ever overlap. The "timeout 60"
+                    % wrapper above is a second, independent safety net: even
+                    % if this process is never explicitly killed below (hard
+                    % crash between here and cleanup), it self-terminates
+                    % after 60s regardless, so it can never become a
+                    % long-running orphan writing an unbounded logfile.
+                    [~, pidStr] = system(sprintf('pgrep -f "%s"', logFile));
                     nvidiaPID   = strtrim(pidStr);
                 
                     % Other-process memory snapshot before fit
@@ -509,8 +697,7 @@ classdef utils < handle
                     try
                         [~, ~] = evalc('modelObj.fit(data, mask_probe, fitting_probe, varargin{:})');
                     catch ME
-                        system(sprintf('kill %s 2>/dev/null', nvidiaPID));
-                        if isfile(logFile); delete(logFile); end
+                        utils.kill_and_cleanup(nvidiaPID, logFile);
                         if contains(ME.message, 'out of memory', 'IgnoreCase', true)
                             warning('GACELLE:probeOOM', 'OOM at probe size %d', probeSize(kp));
                             continue
@@ -519,7 +706,6 @@ classdef utils < handle
                         end
                     end
                 
-                    system(sprintf('kill %s 2>/dev/null', nvidiaPID));
                     pause(0.1);
                 
                     % Other-process memory snapshot after fit
@@ -539,7 +725,7 @@ classdef utils < handle
                         kp, numel(probeSize), probeSize(kp), ...
                         matlabPeak_MB(kp), totalPeak_MB, otherMem_peak_MB);
                 
-                    if isfile(logFile); delete(logFile); end
+                    utils.kill_and_cleanup(nvidiaPID, logFile);
                 end
                 
                 % Fit absolute MATLAB peak vs probe size
@@ -574,7 +760,7 @@ classdef utils < handle
 
                     if NvoxPerSegFit <= 0
                         error('GACELLE:memoryError', ...
-                              'Insufficient GPU memory even for a single segment. Predicted fixed overhead (%.2f GB) already exceeds available memory (%.2f GB).', ...
+                              'Insufficient GPU memory even for a single segment. Predicted fixed overhead (%.2f MB) already exceeds available memory (%.2f MB).', ...
                               intercept, memAvail_MB);
                     end
 
@@ -615,7 +801,7 @@ classdef utils < handle
                     seg = utils.expand_segments_with_halo(ownedBoundaries, h, size(mask,3));
 
                 else
-                    fprintf('Full data fits in GPU memory (predicted %.2f GB / available %.2f GB)\n', ...
+                    fprintf('Full data fits in GPU memory (predicted %.2f MB / available %.2f MB)\n', ...
                         memPred_MB, memAvail_MB/safetyFactor);
                     seg      = struct('owned', {1:size(mask,3)}, 'fit', {1:size(mask,3)}, 'local', {1:size(mask,3)});
                     NSegment = 1;
@@ -946,7 +1132,7 @@ classdef utils < handle
         % =========================================================================
             % --- defaults ---------------------------------------------------------
             if nargin < 2 || isempty(interval_ms)
-                interval_ms = 500;
+                interval_ms = 5;
             end
         
             % --- parse LHS variable name from cmd --------------------------------
@@ -966,7 +1152,7 @@ classdef utils < handle
             logFile = strcat(tempname, '_gacelle_profile.csv');
         
             cmd_smi = sprintf( ...
-                'nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms %d > %s &', ...
+                'timeout 600 nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms %d > %s &', ...
                 round(interval_ms), logFile);
         
             system(cmd_smi);
@@ -974,8 +1160,16 @@ classdef utils < handle
             % Give nvidia-smi a moment to start and write its first line
             pause(0.05);
         
-            % Retrieve nvidia-smi PID for clean shutdown
-            [~, pidStr] = system('pgrep -n nvidia-smi');
+            % Retrieve nvidia-smi PID for clean shutdown. Match by logFile
+            % (unique per call via tempname), not by process name - "pgrep -n
+            % nvidia-smi" grabs the most recently started nvidia-smi process
+            % system-wide, which is wrong if a prior crashed/interrupted
+            % session left one running. The "timeout 600" wrapper above is a
+            % second, independent safety net: profiled commands are expected
+            % to run longer than probes, but even a profiled run that hangs
+            % or a session that crashes before cleanup cannot leave this
+            % process running indefinitely.
+            [~, pidStr] = system(sprintf('pgrep -f "%s"', logFile));
             nvidiaPID   = strtrim(pidStr);
         
             % --- snapshot other-process memory before cmd ------------------------
@@ -987,8 +1181,7 @@ classdef utils < handle
             try
                 evalin('caller', cmd);
             catch ME
-                utils.run_and_profile_cleanup_(nvidiaPID);
-                if isfile(logFile); delete(logFile); end
+                utils.kill_and_cleanup(nvidiaPID, logFile);
                 rethrow(ME);
             end
         
@@ -1000,10 +1193,11 @@ classdef utils < handle
             % Conservative estimate: assume worst-case other-process usage during run
             otherMem_peak_MB = max(otherMem_before_MB, otherMem_after_MB);
         
-            % --- shut down nvidia-smi --------------------------------------------
-            utils.run_and_profile_cleanup_(nvidiaPID);
+            % --- shut down nvidia-smi (allow final writes to flush first) -------
+            pause(0.15);
         
             % --- parse log and compute MATLAB-only series ------------------------
+            % (read the log BEFORE deleting it, which kill_and_cleanup does below)
             memory = utils.run_and_profile_parse_log_(logFile, elapsed_s, otherMem_peak_MB);
         
             % --- package time ----------------------------------------------------
@@ -1019,18 +1213,10 @@ classdef utils < handle
                 end
             end
         
-            % --- clean up log ----------------------------------------------------
-            if isfile(logFile); delete(logFile); end
+            % --- clean up nvidia-smi process and log file ------------------------
+            utils.kill_and_cleanup(nvidiaPID, logFile);
         
         end % run_and_profile
-
-        function run_and_profile_cleanup_(nvidiaPID)
-        % Kill the background nvidia-smi process and wait briefly for it to flush.
-            if ~isempty(nvidiaPID)
-                system(sprintf('kill %s 2>/dev/null', nvidiaPID));
-            end
-            pause(0.15);   % allow final writes to flush to disk
-        end
 
         function memory = run_and_profile_parse_log_(logFile, elapsed_s, otherMem_peak_MB)
         % Read nvidia-smi CSV log and return the memory struct.

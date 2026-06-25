@@ -1,4 +1,4 @@
-addpath(genpath('../gacelle/'));
+addpath(genpath('../../gacelle/'));
 clear;
 %% Simulate data
 
@@ -42,7 +42,7 @@ y       = s + randn(size(s)) .* noiseLv;
 y       = permute(y,[3 2 4 1]);
 mask    = ones(size(y,1:3)) > 0;
 
-%% askadam estimation
+%% Demo#1: askadam estimation
 rng(seed); gpurng(seed);
 
 fitting.solver              = 'askadam';
@@ -51,44 +51,72 @@ fitting.lmax                = 2;
 fitting.start               = 'likelihood'; 
 extraData                   = [];
 
-out   = objGPU.estimate(y, mask, extraData, fitting);
+out_adam   = objGPU.estimate(y, mask, extraData, fitting);
 
-%% make some plots
-% reset seed
-rng(seed); gpurng(seed);
-
+% make some plots
 % get initial starting point based on likelihood method for scatter plots
+rng(seed); gpurng(seed); % reset seed
 fitting.iteration   = 0;
 pars0               = objGPU.estimate(y, mask, [], fitting); 
 
-% get FWD signal based on fitted result
-shat = objGPU.FWD(out.final,fitting.lmax);
-
-%% plot result
+% plot result
 field = fieldnames(pars);
 figure;tiledlayout(2,numel(field)+1,"TileSpacing","compact");
 for k = 1:numel(field)
     nexttile;
     scatter(pars.(field{k}),pars0.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_adam.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
+    drawnow
 end
 nexttile;
 scatter((1-pars.fa)./pars.ra,(1-pars0.final.fa)./pars0.final.ra,5,'filled','MarkerFaceAlpha',.4);hold on;
-scatter((1-pars.fa)./pars.ra,(1-out.final.fa)./out.final.ra,5,'filled','MarkerFaceAlpha',.4);
+scatter((1-pars.fa)./pars.ra,(1-out_adam.final.fa)./out_adam.final.ra,5,'filled','MarkerFaceAlpha',.4);
 h = refline(1);
 h.Color = 'k';
 title('tex');
 xlabel('GT');ylabel('Fitted');
 
-nexttile([1 numel(field)+1]);plot(pars0.final.resloss,'x');hold on;plot(out.final.resloss,'o');title('Loss on each sample')
-legend('Start','Fitted');xlabel('Sample');ylabel('loss');
+nexttile([1 numel(field)+1]);plot(pars0.final.resloss,'x');hold on;plot(out_adam.final.resloss,'o');title('Loss on each sample')
+legend('Start','askadam.m estimation');xlabel('Sample');ylabel('loss');
 
-% %% plot residual
-% figure;
-% nexttile;h1 = plot(squeeze(y).','bo');hold on;h2 = plot(squeeze(shat),':r');h3 = plot(squeeze(s),'k');
-% legend([h1(1),h2(1),h3(1)],'Noisy data','Fitted','Noiseless');
-% nexttile;plot(out.final.residual.','--o');title('Fitting residuals')
+%% MCMC estimation
+% reset class object for MCMC
+objGPU                      = gpuNEXI(bval_sorted, BDELTA_sorted);
+
+fitting                     = [];
+fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting);
+fitting.lmax                = 2;  
+fitting.start               = 'likelihood'; 
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 30;
+fitting.StepSize            = 2;
+fitting.iteration           = 1e4;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+extraData                   = [];
+
+out_mcmc   = objGPU.estimate(y, mask, extraData, fitting);
+
+% plot result
+figure;
+field = fieldnames(pars);
+tiledlayout(1,numel(field));
+for k = 1:numel(field)
+    nexttile;
+    scatter(pars.(field{k}),out_mcmc.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    h = refline(1);
+    h.Color = 'k';
+    title(field{k});
+    xlabel('GT');ylabel('Fitted');
+    drawnow
+end
+scatter((1-pars.fa)./pars.ra,(1-out_mcmc.median.fa)./out_adam.final.ra,5,'filled','MarkerFaceAlpha',.4);
+h = refline(1);
+h.Color = 'k';
+title('tex');
+xlabel('GT');ylabel('Fitted');

@@ -36,37 +36,50 @@ rng(seed); gpurng(seed);
 fitting             = [];
 fitting.solver      = 'askadam';
 fitting             = objGPU.check_set_default(fitting);
-out                 = objGPU.estimate(y, mask, fitting);
-
-%% make some plots
-rng(seed); gpurng(seed);
+out_adam            = objGPU.estimate(y, mask, fitting);
 
 % get initial starting point based on likelihood method for scatter plots
+rng(seed); gpurng(seed);
 fitting.iteration   = 0;
-pars0               = objGPU.estimate(y, mask, fitting); 
+[~,pars0] = evalc('objGPU.estimate( y, mask, fitting)');
 
-% get FWD signal based on fitted result
-shat = objGPU.FWD(out.final);
+%% askadam estimation
+% reset class object
+objGPU      = gpumcmicro(bval_sorted);
 
-%% plot result
+rng(seed); gpurng(seed);
+
+fitting         = [];
+fitting.solver  = 'mcmc';
+fitting         = objGPU.check_set_default(fitting);
+out_mcmc        = objGPU.estimate(y, mask, fitting);
+
+%% make some plots
+
+% get comparable residuals on mcmc's mean posterior
+fitting             = [];
+fitting.solver      = 'askadam';
+fitting.iteration   = 0;
+fitting             = objGPU.check_set_default(fitting);
+[~,loss_mcmc] = evalc('objGPU.estimate( y, mask, fitting, [], out_mcmc.mean)');
+
+% plot result
 field = fieldnames(pars);
 figure;tiledlayout(2,numel(field),"TileSpacing","compact");
 for k = 1:numel(field)
     nexttile;
     scatter(pars.(field{k}),pars0.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);hold on
-    scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_adam.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    scatter(pars.(field{k}),out_mcmc.mean.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
     xlabel('GT');ylabel('Fitted');
 end
 xlabel('GT');ylabel('Fitted');
+legend('Start','askadam.m estimation','mcmc estimation')
 
-nexttile([1 numel(field)]);plot(pars0.final.resloss,'x');hold on;plot(out.final.resloss,'o');title('Loss on each sample')
-legend('Start','Fitted');xlabel('Sample');ylabel('loss');
+nexttile([1 numel(field)]);plot(pars0.final.resloss,'x');hold on;plot(out_adam.final.resloss,'o');plot(loss_mcmc.final.resloss,'o');
+title('Residuals on each sample'); 
+legend('Start','askadam.m estimation','mcmc.m estimation');xlabel('Sample');ylabel('residual');
 
-% %% plot residual
-% figure;
-% nexttile;h1 = plot(squeeze(y).','bo');hold on;h2 = plot(squeeze(shat),':r');h3 = plot(squeeze(s),'k');
-% legend([h1(1),h2(1),h3(1)],'Noisy data','Fitted','Noiseless');
-% nexttile;plot(out.final.residual.','--o');title('Fitting residuals')

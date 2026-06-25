@@ -1,52 +1,80 @@
 classdef gpuMCRMWI < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
+%
+% Support askadam.m only!
+%
 % Date created: 22 September 2024
-% Date modified: 
+% Date modified: 23 June 2026
 
-    properties (Constant)
-            gyro = 42.57747892;
+    properties (GetAccess = public, SetAccess = protected)
+    % ===== MODEL PARAMETER CONTRACT =====
+    % S0        : T1w signal [a.u.] 
+    % MWF       : myelin water fraction [0,1]
+    % IWF       : intracellular volume ratio (=Vic or ICVF in DWI) [0,1]
+    % R1IEW     : R1* IEW [1/s]
+    % kIEWM     : exchange rate from IEW to myelin [1/s] 
+    % R2sMW     : R2* MW [1/s]
+    % R2sIW     : R2* IW [1/s] 
+    % R2sEW     : R2* EW [1/s] 
+    % freqMW    : frequency MW [ppm]
+    % freqIW    : frequency IW [ppm]
+    % dfreqBKG  : background frequency in addition to the one provided [ppm]
+    % dpini     : B1 phase offset in addition to the one provided [rad]
+    % noise     : noise
+    %
+    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
+    % These five arrays MUST stay the same length and index-aligned.
+    % Mutate only as a set, via updateProperty() - never assign into a
+    % single element from outside the class, or these will desync.
+    %
+    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
+    % updateProperty() can strip it by name without hardcoding an index,
+    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
+    % future solver-conditional parameter should likewise go last.
+        modelParams     = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW'; 'R2sIW'; 'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini';'noise'};
+        ub              = [    2;     0.3;      1;       2;      10;     200;      50;      50;     0.25;    0.05;       0.4;   pi/2;    0.1];
+        lb              = [ 1e-8;    1e-8;   1e-8;     1/3;    1e-8;      50;1/150e-3;1/150e-3;    -0.05;    -0.1;      -0.4;  -pi/2;  0.001];
+        startPoint      = [    1;     0.1;    0.6;       1;       1;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8;  0.005];
+        step            = [  0.1;   0.015;   0.05;     0.1;       1;      10;     3.5;     3.5;     0.02;    0.01;      0.05;  0.075;  0.005];
     end
 
-    % here define the fitting parameters and their conditions
     properties
-        % default model parameters and estimation boundary
-        % S0        : T1w signal [a.u.] 
-        % MWF       : myelin water fraction [0,1]
-        % IWF       : intracellular volume ratio (=Vic or ICVF in DWI) [0,1]
-        % R2sMW     : R2* MW [1/s]
-        % R2sIW     : R2* IW [1/s] 
-        % R2sEW     : R2* EW [1/s] 
-        % freqMW    : frequency MW [ppm]
-        % freqIW    : frequency IW [ppm]
-        % dfreqBKG  : background frequency in addition to the one provided [ppm]
-        % dpini     : B1 phase offset in addition to the one provided [rad]
-        modelParams     = { 'S0';   'MWF';  'IWF'; 'R1IEW'; 'kIEWM'; 'R2sMW'; 'R2sIW'; 'R2sEW'; 'freqMW';'freqIW';'dfreqBKG';'dpini'};
-        ub              = [    2;     0.3;      1;       2;      10;     200;      50;      50;     0.25;    0.05;       0.4;   pi/2];
-        lb              = [ 1e-8;    1e-8;   1e-8;     1/3;    1e-8;      50;1/150e-3;1/150e-3;    -0.05;    -0.1;      -0.4;  -pi/2];
-        startPoint      = [    1;     0.1;    0.6;       1;    1;     100;      15;      21;     0.04;    1e-8;      1e-8;   1e-8];
+    % ===== USER-TUNABLE OPTIONS =====
+    % Freely settable by users before fitting; no coupling between these.
+        thres_similarity    = 0.1; 
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
 
+        thres_R2star    = 2;
+        thres_T1        = 3.1;    % s, upper bound
+
+        seed = 48463;   % for reproducible random number generation
+
+        epsilon = utils.epsilon;
+
+        freq_EW = 0;
     end
 
     properties (GetAccess = public, SetAccess = protected)
+    % ===== ACQUISITION PARAMETERS =====
+    % Set once in the constructor from user-provided acquisition info.
+    % Read-only after construction.
+        te;
+        tr;
+        fa;
 
+        B0      = 3;            % T
         x_i     = -0.1;         % ppm
         x_a     = -0.1;         % ppm
         E       = 0.02;         % ppm
         rho_mw  = 0.36/0.86;    % ratio
+        B0dir   = [0;0;1];      % unit vector [x,y,z]
         t1_mw   = 234e-3;       % s
-
-        % hardware setting
-        B0      = 3; % T
-        B0dir   = [0;0;1]; % main magnetic field direction with respect to FOV
-
-        thres_R2star    = 150;  % 1/s, upper bound
-        thres_T1        = 3.1;    % s, upper bound
-
-        te;
-        tr;
-        fa;
-        
+    end
+    
+    properties (Constant)
+            gyro = 42.57747892;
     end
     
     methods
@@ -98,6 +126,16 @@ classdef gpuMCRMWI < handle
         
         % update properties according to lmax
         function this = updateProperty(this, fitting)
+
+            % property change in related to solver
+            if ~strcmpi(fitting.solver,'mcmc')
+                idx = find(ismember(this.modelParams,'noise'));
+                this.modelParams(idx)       = [];
+                this.lb(idx)                = [];
+                this.ub(idx)                = [];
+                this.startPoint(idx)        = [];
+                this.step(idx)              = [];
+            end
 
             if fitting.isComplex == 0
                 for kpar = {'dfreqBKG','dpini'}
@@ -209,58 +247,69 @@ classdef gpuMCRMWI < handle
             % get all fitting algorithm parameters 
             fitting = this.check_set_default(fitting,data);
 
-            % get matrix size
-            dims = size(data,1:3);
-
-            % make sure input data are valid
-            [extraData,mask] = this.validate_data(data,extraData,mask,fitting);
-
             % normalised data if needed
-            [data, scaleFactor] = this.prepare_data(data,mask, extraData.b1);
-
-            % mask sure no nan or inf
-            [data,mask] = utils.remove_img_naninf(data,mask);
+            [data, mask, extraData, scaleFactor] = this.prepare_data(data, mask, extraData, fitting);
 
             % convert datatype to single
-            data    = single(data);
-            mask    = mask > 0;
+            data        = single(data);
+            mask        = mask > 0;
+            extraData   = utils.struct2single(extraData);
 
-            % determine if we need to divide the data to fit in GPU: TODO
-            g = gpuDevice; reset(g);
-            memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.0001;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
+            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
+            
+            % --- [Experimental] estimate memory usage using a small batch of data size ---
+            % this method tends to be more conservative than the actual memory ussage
+            [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
 
             % parameter estimation
             out = [];
-            for ks = 1:NSegment
-
-                fprintf('Running #Segment = %d/%d \n',ks,NSegment);
-                disp   ('------------------------')
-    
-                % determine slice# given a segment
-                if ks ~= NSegment
-                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
-                else
-                    slice = 1+(ks-1)*maxSlice : dims(3);
-                end
+            for kseg = 1:NSegment
                 
-                % divide the data
-                dwi_tmp     = data(:,:,slice,:,:);
-                mask_tmp    = mask(:,:,slice);
-                fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); end
+                if NSegment > 1
+                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
+                    disp   ('------------------------')
+                end
+    
+                % divide the data; fitRange includes halo slices (if any), ownedRange
+                % is what this segment is responsible for writing back
+                fitRange                        = seg(kseg).fit;
+                ownedRange                      = seg(kseg).owned;
+                [dataSeg, maskSeg,extraDataSeg] = this.slice_segment(data, mask, fitRange, extraData);
 
                 % run fitting
-                [out_tmp]    = this.fit(dwi_tmp,mask_tmp,fitting,extraData_tmp);
+                [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg);
+
+                % discard halo slices from this segment's output before restoring,
+                % so segment boundaries never keep voxels from a neighbour's
+                % independently-converged fit (no-op when seg(kseg).fit == .owned)
+                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
 
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
 
             end
             out.mask = mask;
-            % rescale S0
-            out.final.S0    = out.final.S0 *scaleFactor;
-            out.min.S0      = out.min.S0 *scaleFactor;
+            %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
+            
+            % save the estimation results if the output filename is provided
+            % askadam.save_askadam_output(fitting.outputFilename,out)
+            switch fitting.solver
+                case 'askadam'
+
+                    out.min.S0      = out.min.S0 * scaleFactor; % undo scaling
+                    out.final.S0    = out.final.S0 * scaleFactor; % undo scaling
+
+                    askadam.save_askadam_output(fitting.outputFilename,out)
+                case 'mcmc'
+
+                    % rescale M0
+                    for k = 1:numel(fitting.metric)
+                        out.(fitting.metric{k}).S0 = out.(fitting.metric{k}).S0 *scaleFactor;
+                    end
+                    out.posterior.S0 = out.posterior.S0 *scaleFactor;
+                    mcmc.save_mcmc_output(fitting.outputFilename,out)
+            end
+
 
             % save the estimation results if the output filename is provided
             askadam.save_askadam_output(fitting.outputFilename,out)
@@ -313,9 +362,6 @@ classdef gpuMCRMWI < handle
         %
         %
             
-            % check GPU
-            gpool = gpuDevice;
-            
             % get image size
             dims = size(data,1:3);
 
@@ -333,11 +379,15 @@ classdef gpuMCRMWI < handle
             if isempty( fitting.lb); fitting.lb = this.lb(1:numel(this.modelParams)); end
             
             % set initial starting points
-            pars0 = this.estimate_prior(data,mask,extraData);
+            pars0                   = this.determine_x0(data,fitting,mask,extraData);
+            % pars0 = this.estimate_prior(data,mask,extraData);
 
             % load pre-trained ANN
-            ann_epgx_phase = load(fitting.epgx_phase_ann,'dlnet');  ann_epgx_phase.dlnet.alpha  = 0.01;
-            ann_epgx_magn  = load(fitting.epgx_mag_ann,'dlnet');    ann_epgx_magn.dlnet.alpha   = 0.01;
+            ann_epgx_phase          = load(fitting.epgx_phase_ann,'dlnet');  ann_epgx_phase.dlnet.alpha  = 0.01;
+            ann_epgx_magn           = load(fitting.epgx_mag_ann,'dlnet');    ann_epgx_magn.dlnet.alpha   = 0.01;
+
+            % gacelle does not check your extra data, so put them onto gpu now
+            extraData               = utils.struct2gpusingle(extraData);
             
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
@@ -351,32 +401,41 @@ classdef gpuMCRMWI < handle
             % 2.2 display optimisation algorithm parameters
             this.display_algorithm_info(fitting)
 
-            % 3. askAdam optimisation main
-            askadamObj  = askadam();
-
-            % 3.1. initial global optimisation
-            disp('##############################################')
-            disp('Runnning optimisation on all voxels...')
-
             % askadam.optimisation does not see extractData so we have to manually mask the data inside here, make sure the voxel is on the second dimension
             % extraData   = structfun(@transpose, utils.gpu_vectorise_NDto2D_struct(extraData,mask) ,'UniformOutput',false);
             extraData   = utils.masking_ND2GD_preserve_struct(extraData,mask) ;
-            
-            % run optimisation
-            out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData, ann_epgx_phase.dlnet, ann_epgx_magn.dlnet);
-            
-            if fitting.isComplex
-                out.final.dfreqBKG  = permute(out.final.dfreqBKG,[1 2 3 5 4]);
-                out.min.dfreqBKG    = permute(out.min.dfreqBKG,[1 2 3 5 4]);
+
+            % 2.3 askAdam optimisation main
+            switch fitting.solver
+                case 'askadam'
+
+                    askadamObj  = askadam();
+                    out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
+                    
+                    if fitting.isComplex
+                        out.final.dfreqBKG  = permute(out.final.dfreqBKG,[1 2 3 5 4]);
+                        out.min.dfreqBKG    = permute(out.min.dfreqBKG,[1 2 3 5 4]);
+                    end
+
+                case 'mcmc'
+                    fitting.xStepSize = this.step;
+
+                    mcmcObj     = mcmc();
+                    % 3.1. initial global optimisation
+                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
+
+                    % if fitting.isComplex
+                    %     out.final.dfreqBKG  = permute(out.final.dfreqBKG,[1 2 3 5 4]);
+                    %     out.min.dfreqBKG    = permute(out.min.dfreqBKG,[1 2 3 5 4]);
+                    % end
+                    
             end
-
-            %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
-
+            
             disp('The process is completed.')
             disp('##############################################')
             
             % clear GPU
-            reset(gpool)
+            reset(gpuDevice)
             
         end
 
@@ -411,19 +470,60 @@ classdef gpuMCRMWI < handle
 
         %% Prior estimation related functions
 
+        % determine how the starting points will be set up
+        function x0 = determine_x0(this,y,fitting,mask,extraData) 
+
+            disp('---------------');
+            disp('Starting points');
+            disp('---------------');
+
+            dims = size(y,1:3);
+
+            if ischar(fitting.start)
+                switch lower(fitting.start)
+                    case 'prior'
+                        % using maximum likelihood method to estimate starting points
+                        x0 = this.estimate_prior(y,mask,extraData);
+    
+                    case 'default'
+                        % use fixed points
+                        fprintf('Using default starting points for all voxels at [%s]: [%s]\n', cell2str(this.modelParams),replace(num2str(this.startPoint(:).',' %.2f'),' ',','));
+                        x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
+                        % size of dfreqBKG depends on number of flip angles
+                        if isfield(x0,'dfreqBKG'); x0.dfreqBKG = repmat(x0.dfreqBKG,[1,1,1,1,size(extraData.freqBKG,5)]); end
+
+                end
+            else
+                % user defined starting point
+                x0 = fitting.start(:);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+
+                % size of dfreqBKG depends on number of flip angles
+                if isfield(x0,'dfreqBKG'); x0.dfreqBKG = repmat(x0.dfreqBKG,[1,1,1,1,size(extraData.freqBKG,5)]); end
+            end
+            
+            % make sure the input is bounded
+            x0 = askadam.set_boundary(x0,fitting.ub,fitting.lb);
+
+            fprintf('Estimation lower bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.lb(:).',' %.2f'),' ',','));
+            fprintf('Estimation upper bound [%s]: [%s]\n',      cell2str(this.modelParams),replace(num2str(fitting.ub(:).',' %.2f'),'  ',','));
+            ('---------------');
+        end
+
         % estimate starting points
         function pars0 = estimate_prior(this,data,mask,extraData)
         % Estimation starting points 
 
             dims = size(data,1:3);
 
-            for k = 1:numel(this.modelParams)
-                pars0.(this.modelParams{k}) = single(this.startPoint(k)*ones(dims));
-            end
+            % initiate starting point of all parameters
+            pars0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
             
             disp('Estimate starting points based on hybrid fixed points/prior information ...')
             
-            % S0
+            % update S0
             S0 = zeros([dims numel(this.fa)]);
             for kfa = 1:numel(this.fa)
                 [~,S0(:,:,:,kfa)]  = this.R2star_trapezoidal(abs(data(:,:,:,:,kfa)),this.te);
@@ -433,40 +533,188 @@ classdef gpuMCRMWI < handle
             [t1, M0, ~] = despot1_obj.estimate(S0, mask, extraData.b1);
             pars0.(this.modelParams{1}) = single(M0);
 
-            % R1
+            % update R1
             idx = find(ismember(this.modelParams,'R1IEW'));
             pars0.R1IEW = single(1./t1); pars0.R1IEW(isnan(pars0.R1IEW)) = 0; pars0.R1IEW(isinf(pars0.R1IEW)) = 0;
             pars0.R1IEW = max(pars0.R1IEW, this.lb(idx)); pars0.R1IEW = min(pars0.R1IEW, this.ub(idx));
 
-            % freqBKG
+            % update freqBKG
             if isfield(pars0,'dfreqBKG')
                 pars0.dfreqBKG = repmat(pars0.dfreqBKG,[1,1,1,1,size(extraData.freqBKG,5)]);
             end
 
             [R2s,~]  = this.R2star_trapezoidal(mean(abs(data),5),this.te);
-            % R2*IW
+            % update R2*IW
             idx = find(ismember(this.modelParams,'R2sIW'));
             R2sIW = R2s - 3;
             R2sIW(isnan(R2sIW)) = single(this.startPoint(idx)); R2sIW(isinf(R2sIW)) = single(this.startPoint(idx)); 
-            R2sIW(R2sIW < this.lb(idx)) = single(this.lb(idx)); R2sIW(R2sIW > this.ub(idx)) = single(this.ub(idx));
+            R2sIW = single(max(min(R2sIW,this.ub(idx)-2),this.lb(idx)+2));  % avoid boundaries
             pars0.R2sIW = R2sIW;
 
-            % R2*EW
+            % update R2*EW
             idx = find(ismember(this.modelParams,'R2sEW'));
             if ~isempty(idx)
                 R2sEW = R2s + 3;
                 R2sEW(isnan(R2sEW)) = single(this.startPoint(idx)); R2sEW(isinf(R2sEW)) = single(this.startPoint(idx)); 
-                R2sEW(R2sEW < this.lb(idx)) = single(this.lb(idx)); R2sEW(R2sEW > this.ub(idx)) = single(this.ub(idx));
+                R2sEW = single(max(min(R2sEW,this.ub(idx)-2),this.lb(idx)+2));  % avoid boundaries
                 pars0.R2sEW = R2sEW;
             end
 
-            % [~,mwf] = this.superfast_mwi_2m_mcr(abs(data),[],mask,extraData.b1,1);
-            % mwf = min(mwf,0.25);
-            % mwf = max(mwf,0.05);
-            % pars0.(this.modelParams{2})    = single(mwf);
-
         end
+        
+        %% Signal related functions
 
+        % compute the forward model
+        function [s] = FWD(this, pars, fitting, extraData, dlnet_phase,dlnet_magn)
+
+            TE =  permute(this.te, [2 3 4 1] );              % TE always on 4th dim
+            FA =  permute(deg2rad(this.fa), [2 3 4 5 1] );   % FA always on 5th dim
+
+            Nfa = numel(this.fa);
+
+            S0      = pars.S0;
+            mwf     = pars.MWF;
+            if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
+            r2sMW   = pars.R2sMW;
+            r2sIW   = pars.R2sIW;
+            r1iew   = pars.R1IEW;
+
+            if fitting.isFitExchange;       kiewm = pars.kIEWM; end
+
+            % external effects
+            if ~fitting.isComplex % magnitude fitting
+                freqBKG = 0;                          
+                pini    = 0;
+            else    % other fittings
+                freqBKG = pars.dfreqBKG + extraData.freqBKG;
+                pini    = pars.dpini    + extraData.pini;
+                
+            end
+        
+            % Forward model
+            %%%%%%%%%%%%%%%%%%%% DIMWI related operations %%%%%%%%%%%%%%%%%%%%
+            % Compartmental Signals
+            S0MW        = S0 .* mwf;
+            S0IW        = S0 .* (1-mwf) .* iwf;
+            S0EW        = S0 .* (1-mwf) .* (1-iwf);
+            totalVolume = S0IW + S0EW + S0MW/this.rho_mw; totalVolume = max(totalVolume,askadam.epsilon); % avoid division by zeros
+            MVF         = (S0MW/this.rho_mw) ./ totalVolume; MVF = max(MVF,askadam.epsilon); % avoid division by zeros in BM calculation
+
+            if ~fitting.DIMWI.isFitFreqMW || ~fitting.DIMWI.isFitFreqIW || ~fitting.DIMWI.isFitR2sEW
+                hcfm_obj = HCFM(this.te,this.B0);
+
+                % derive g-ratio
+                if isfield(fitting,'solver') && strcmpi(fitting.solver, 'mcmc')
+                    g = arrayfun(@hcfm_gratio,abs(S0IW)./totalVolume,MVF);
+                else
+                    g = hcfm_gratio(abs(S0IW)./totalVolume,MVF);
+                end
+                g = max(g, this.epsilon);
+
+            end
+            
+           % extra decay on extracellular water estimated by HCFM 
+           if ~fitting.DIMWI.isFitR2sEW
+                
+                % assume extracellular water has the same T2* as intra-axonal water
+                r2sEW   = r2sIW;
+                % fibre volume fraction
+                % fibre volume fraction
+                if isfield(fitting,'solver') && strcmpi(fitting.solver, 'mcmc')
+                    fvf = arrayfun(@hcfm_fibre_volume_fraction,abs(S0IW)./totalVolume,abs(S0EW)./totalVolume,MVF);
+                else
+                    fvf = hcfm_fibre_volume_fraction(abs(S0IW)./totalVolume,abs(S0EW)./totalVolume,MVF);
+                end
+                fvf = max(fvf,askadam.epsilon);
+
+                % signal dephase in extracellular water due to myelin sheath, Eq.[A7]
+                decayEW = hcfm_obj.DephasingExtraaxonal(fvf,g,this.x_i,this.x_a,extraData.theta);
+                decayEW = permute(decayEW,[4 2 3 1 5 6]);
+
+           else
+                r2sEW  = pars.R2sEW;
+                decayEW = 0;
+           end
+
+           % determine the source of compartmental frequency shifts
+           % compute frequency shifts given theta
+            if ~fitting.DIMWI.isFitFreqMW 
+
+                % in ppm
+                freqMW = hcfm_obj.FrequencyMyelin(this.x_i,this.x_a,g,extraData.theta,this.E) / (this.B0*this.gyro);
+            else
+
+                freqMW  = pars.freqMW;
+            end
+
+            if ~fitting.DIMWI.isFitFreqIW 
+
+                % in ppm
+                freqIW = hcfm_obj.FrequencyAxon(this.x_a,g,extraData.theta) / (this.B0*this.gyro);
+
+            else
+
+                freqIW  = pars.freqIW;
+
+            end
+
+            freqEW = this.freq_EW;
+
+            %%%%%%%%%%%%%%%%%%%% T1 model %%%%%%%%%%%%%%%%%%%%
+            
+            if fitting.isFitExchange
+                if fitting.isEPG
+                    % EPG-X
+                    features = feature_preprocess_MCRMWI_MLP_EPGX_leakyrelu( repmat(MVF(:),Nfa,1),      1./repmat(r1iew(:),Nfa,1), ...
+                                                                             repmat(kiewm(:),Nfa,1),    (squeeze(FA) .* extraData.b1(:).').', ...    % true_famp = (FA .* extraData.b1(:).').';
+                                                                             this.tr, 1./repmat(r2sIW(:),Nfa,1), this.t1_mw);
+                    features    = dlarray(features,'CB');
+                    
+                    % phase of long T2 components
+                    S0IEW_phase   = mlp_model_leakyRelu(dlnet_phase.parameters,features,dlnet_phase.alpha);
+                    S0IEW_phase   = reshape(S0IEW_phase,[size(MVF),1,1,Nfa]);
+    
+                    % get magnitude signal difference from BM
+                    Ss_diff    = mlp_model_leakyRelu(dlnet_magn.parameters,features,dlnet_magn.alpha);
+                    Ss_diff    = shiftdim( reshape(Ss_diff,[2, size(MVF),1,1,Nfa]), 1);
+    
+                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory, S0MW and S0IEW here are saturation fractors
+                    S0MW            = (S0MW  + Ss_diff(:,:,:,:,:,2)) .* totalVolume .* this.rho_mw;   S0MW  = max(S0MW, this.epsilon);    % 20250819: fix bug with wrong order
+                    S0IEW           = (S0IEW + Ss_diff(:,:,:,:,:,1)) .* totalVolume;                  S0IEW = max(S0IEW, this.epsilon);   % 20250819: fix bug with wrong order
+                
+                else
+                    % BM analytical solution
+                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
+                    S0MW            = S0MW  .* totalVolume .* this.rho_mw;
+                    S0IEW           = S0IEW .* totalVolume;
+                    S0IEW_phase     = 0;
+                end
+            else
+                [S0MW, S0IEW] = this.model_Bloch_2T1(this.tr,S0MW,S0IW+S0EW,this.t1_mw,1./r1iew,shiftdim(FA,-ndims(MVF)) .* extraData.b1);
+                S0IEW_phase   = 0;
+            end
+
+            %%%%%%%%%%%%%%%%%%%% Forward model %%%%%%%%%%%%%%%%%%%%
+                if isfield(fitting,'solver') && strcmpi(fitting.solver, 'mcmc')
+                    [Sreal,Simag] = arrayfun(@compute_gremwi_signal,S0MW,S0IEW.*iwf,S0IEW.*(1-iwf),r2sMW,r2sIW,r2sEW,freqMW,freqIW,freqEW,freqBKG,pini,decayEW,extraData.ff,TE,this.B0,this.gyro,S0IEW_phase);
+                else
+                    [Sreal,Simag] = compute_gremwi_signal(S0MW,S0IEW.*iwf,S0IEW.*(1-iwf),r2sMW,r2sIW,r2sEW,freqMW,freqIW,freqEW,freqBKG,pini,decayEW,extraData.ff,TE,this.B0,this.gyro,S0IEW_phase);
+                end
+                % weighted sum all fibre for DIMWI
+                Sreal = sum(Sreal,6);
+                Simag = sum(Simag,6);
+
+                if fitting.isComplex
+                    s = cat(6,Sreal,Simag);
+                else
+                    s = sqrt(Sreal.^2 + Simag.^2);
+                end
+
+                % vectorise to match maksed measurement data
+                s = utils.reshape_ND2GD(s,[]);
+            
+        end
+        
         function [m0,mwf] = superfast_mwi_2m_mcr(this,img,t2s,mask,b1map, isSuperfast)
         % [m0,mwf,t2s_iew,t1_iew] = superfast_mwi_2m_mcr_self(img,te,fa,tr,t2s,t1_mw,mask,b1map,mode)
         %
@@ -620,159 +868,11 @@ classdef gpuMCRMWI < handle
         m0(m0 < 0)      = 0; m0(isinf(m0))   = 0; m0(isnan(m0))   = 0;
         
         end
-        
-        %% Signal related functions
 
-        % compute the forward model
-        function [s] = FWD(this, pars, fitting, extraData, dlnet_phase,dlnet_magn)
-
-            TE = gpuArray(dlarray( permute(this.te, [2 3 4 1] )));              % TE always on 4th dim
-            FA = gpuArray(dlarray( permute(deg2rad(this.fa), [2 3 4 5 1] )));   % FA always on 5th dim
-
-            Nfa = numel(this.fa);
-
-            S0   = pars.S0;
-            mwf  = pars.MWF;
-            if fitting.DIMWI.isFitIWF; iwf  = pars.IWF; else; iwf = extraData.IWF; end
-            r2sMW   = pars.R2sMW;
-            r2sIW   = pars.R2sIW;
-            r1iew   = pars.R1IEW;
-
-            if fitting.isFitExchange;       kiewm = pars.kIEWM; end
-
-            if fitting.DIMWI.isFitR2sEW;    r2sEW  = pars.R2sEW;    end
-            if fitting.DIMWI.isFitFreqMW;   freqMW  = pars.freqMW;  end
-            if fitting.DIMWI.isFitFreqIW;   freqIW  = pars.freqIW;  end
-            % external effects
-            if ~fitting.isComplex % magnitude fitting
-                freqBKG = 0;                          
-                pini    = 0;
-            else    % other fittings
-                freqBKG = pars.dfreqBKG + extraData.freqBKG;
-                pini    = pars.dpini    + extraData.pini;
-                
-            end
-        
-            % Forward model
-            %%%%%%%%%%%%%%%%%%%% DIMWI related operations %%%%%%%%%%%%%%%%%%%%
-            % Compartmental Signals
-            S0MW        = S0 .* mwf;
-            S0IW        = S0 .* (1-mwf) .* iwf;
-            S0EW        = S0 .* (1-mwf) .* (1-iwf);
-            totalVolume = S0IW + S0EW + S0MW/this.rho_mw; totalVolume = max(totalVolume,askadam.epsilon); % avoid division by zeros
-            MVF         = (S0MW/this.rho_mw) ./ totalVolume; MVF = max(MVF,askadam.epsilon); % avoid division by zeros in BM calculation
-
-            if ~fitting.DIMWI.isFitFreqMW || ~fitting.DIMWI.isFitFreqIW || ~fitting.DIMWI.isFitR2sEW
-                hcfm_obj = HCFM(this.te,this.B0);
-
-                % derive g-ratio 
-                % g = hcfm_obj.gratio(abs(S0IW),abs(S0MW)/this.rho_mw);
-                g = max(hcfm_obj.gratio(abs(S0IW)./totalVolume,MVF),askadam.epsilon);
-
-            end
-            
-           % extra decay on extracellular water estimated by HCFM 
-           if ~fitting.DIMWI.isFitR2sEW
-                
-                % assume extracellular water has the same T2* as intra-axonal water
-                r2sEW   = r2sIW;
-                % fibre volume fraction
-                fvf     = max(hcfm_obj.FibreVolumeFraction(abs(S0IW)./totalVolume,abs(S0EW)./totalVolume,MVF),askadam.epsilon);
-
-                % signal dephase in extracellular water due to myelin sheath, Eq.[A7]
-                decayEW = hcfm_obj.DephasingExtraaxonal(fvf,g,this.x_i,this.x_a,extraData.theta);
-                decayEW = permute(decayEW,[4 2 3 1 5 6]);
-
-           else
-                decayEW = 0;
-           end
-
-           % determine the source of compartmental frequency shifts
-            if ~fitting.DIMWI.isFitFreqMW || ~fitting.DIMWI.isFitFreqIW
-               
-                % compute frequency shifts given theta
-                if ~fitting.DIMWI.isFitFreqMW 
-
-                    freqMW = hcfm_obj.FrequencyMyelin(this.x_i,this.x_a,g,extraData.theta,this.E) / (this.B0*this.gyro);
-
-                end
-                if ~fitting.DIMWI.isFitFreqIW 
-
-                    freqIW = hcfm_obj.FrequencyAxon(this.x_a,g,extraData.theta) / (this.B0*this.gyro);
-
-                end
-            end
-
-            freqEW = 0;
-
-            %%%%%%%%%%%%%%%%%%%% T1 model %%%%%%%%%%%%%%%%%%%%
-            
-            if fitting.isFitExchange
-                if fitting.isEPG
-                    % EPG-X
-                    features = feature_preprocess_MCRMWI_MLP_EPGX_leakyrelu( repmat(MVF(:),Nfa,1),      1./repmat(r1iew(:),Nfa,1), ...
-                                                                             repmat(kiewm(:),Nfa,1),    (squeeze(FA) .* extraData.b1(:).').', ...    % true_famp = (FA .* extraData.b1(:).').';
-                                                                             this.tr, 1./repmat(r2sIW(:),Nfa,1), this.t1_mw);
-                    features    = gpuArray( dlarray(features,'CB'));
-                    
-                    % phase of long T2 components
-                    S0IEW_phase   = mlp_model_leakyRelu(dlnet_phase.parameters,features,dlnet_phase.alpha);
-                    S0IEW_phase   = reshape(S0IEW_phase,[size(MVF),1,1,Nfa]);
-    
-                    % signal_steadystate_phase   = reshape(signal_steadystate_phase,size(mvf,1),size(mvf,2),size(mvf,3),1,nFA);
-                    Ss_diff    = mlp_model_leakyRelu(dlnet_magn.parameters,features,dlnet_magn.alpha);
-                    Ss_diff    = shiftdim( reshape(Ss_diff,[2, size(MVF),1,1,Nfa]), 1);
-    
-                    % true_famp = permute(FA,[2:ndims(MVF)+1 1]) .* extraData.b1;
-                    % [S0MW, S0IEW]   = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    % [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    S0MW  = (S0MW  + Ss_diff(:,:,:,:,:,2)) .* totalVolume .* this.rho_mw;   S0MW  = max(S0MW, utils.epsilon);    % 20250819: fix bug with wrong order
-                    S0IEW = (S0IEW + Ss_diff(:,:,:,:,:,1)) .* totalVolume;                  S0IEW = max(S0IEW, utils.epsilon);   % 20250819: fix bug with wrong order
-                    % S0_mag          = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm) + Ss_diff ) .* totalVolume;
-                
-                else
-                    % BM analytical solution
-                    % S0_mag          = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm)) .* totalVolume;
-                    % [S0MW, S0IEW]   = (this.model_BM_2T1(this.tr, shiftdim(FA,-ndims(MVF)) .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    [S0MW, S0IEW]   = (this.model_BM_2T1_analytical(this.tr, FA .* extraData.b1, MVF,r1iew,1./this.t1_mw,kiewm));   % S0MW here is indeed S0Myelin, recycle variable to reduce memory
-                    S0MW            = S0MW  .* totalVolume .* this.rho_mw;
-                    S0IEW           = S0IEW .* totalVolume;
-                    S0IEW_phase     = 0;
-                end
-            else
-                [S0MW, S0IEW] = this.model_Bloch_2T1(this.tr,S0MW,S0IW+S0EW,this.t1_mw,1./r1iew,shiftdim(FA,-ndims(MVF)) .* extraData.b1);
-                S0IEW_phase   = 0;
-            end
-
-            %%%%%%%%%%%%%%%%%%%% Forward model %%%%%%%%%%%%%%%%%%%%
-                Sreal = sum((   S0MW            .* exp(-TE .* r2sMW) .* cos(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...               % MW
-                                S0IEW.*iwf      .* exp(-TE .* r2sIW) .* cos(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) + ...    % IW
-                                S0IEW.*(1-iwf)  .* exp(-TE .* r2sEW) .* cos(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) .* exp(-decayEW) ).*extraData.ff,6);
-    
-                Simag = sum((   S0MW            .* exp(-TE .* r2sMW) .* sin(TE .* 2.*pi.*(freqMW+freqBKG).*this.B0.*this.gyro + pini) + ...
-                                S0IEW.*iwf      .* exp(-TE .* r2sIW) .* sin(TE .* 2.*pi.*(freqIW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) + ...
-                                S0IEW.*(1-iwf)  .* exp(-TE .* r2sEW) .* sin(TE .* 2.*pi.*(freqEW+freqBKG).*this.B0.*this.gyro + pini + S0IEW_phase) .* exp(-decayEW) ).*extraData.ff,6);
-
-                if fitting.isComplex
-                    s = cat(6,Sreal,Simag);
-                else
-                    s = sqrt(Sreal.^2 + Simag.^2);
-                end
-
-                % vectorise to match maksed measurement data
-                s = utils.reshape_ND2GD(s,[]);
-            
-        end
-        
         %% Utilities
 
         % validate extra data
         function [extraData,mask] = validate_data(this,data,extraData,mask,fitting)
-
-           % % check if the signal is monotonic decay
-           %  [~,I] = max(abs(data),[],4);
-           %  mask = and(mask,min(I<4,[],5));
 
             dims = size(data,1:3);
 
@@ -842,24 +942,48 @@ classdef gpuMCRMWI < handle
 
             % final mask
             mask = and(mask,and(t1<=this.thres_T1,mask_fitted));
-            mask = and(mask,R2star<=this.thres_R2star);
+            mask = and(mask,R2star>=this.thres_R2star);
             mask = and(mask,min(abs(data(:,:,:,1,:))>0,[],5));
 
 
         end
 
         % normalise input data based on masked signal intensity at 98%
-        function [img, scaleFactor] = prepare_data(this,img, mask, b1)
+        function [data, mask, extraData, scaleFactor] = prepare_data(this,data, mask, extraData, fitting)
+
+            mask = mask>0;
+            
+            % make sure input data are valid
+            [extraData,mask] = this.validate_data(data,extraData,mask,fitting);
 
             despot1_obj          = despot1(this.tr,this.fa);
-            [~, m0, mask_fitted] = despot1_obj.estimate(permute(abs(img(:,:,:,1,:)),[1 2 3 5 4]), mask, b1);
+            [~, m0, mask_fitted] = despot1_obj.estimate(permute(abs(data(:,:,:,1,:)),[1 2 3 5 4]), mask, extraData.b1);
 
             scaleFactor = prctile( m0(mask_fitted>0), 98);
 
-            img = img ./ scaleFactor;
+            data = data ./ scaleFactor;
+
+            % mask sure no nan or inf
+            [data,mask] = utils.remove_img_naninf(data,mask);
 
         end
         
+        % segment data based on slice
+        function [dataSeg, maskSeg, extraDataSeg] = slice_segment(this, data, mask, slice, extraData)
+
+            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
+            maskSeg     = mask(:,:,slice);
+            if ~isempty(extraData)
+                fields      = fieldnames(extraData); 
+                for kfield = 1:numel(fields)
+                    extraDataSeg.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:,:,:,:,:); 
+                end
+            else                                                    
+                extraDataSeg = [];                 
+            end
+
+        end
+
     end
 
     methods(Static)
@@ -938,13 +1062,29 @@ classdef gpuMCRMWI < handle
         %% Utilities
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting,data)
+
             % get basic fitting setting check
-            fitting2 = askadam.check_set_default_basic(fitting);
+            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
+
+            % get basic fitting setting check
+            if strcmpi(fitting.solver,'mcmc')
+
+                % mcmc
+                fitting2 = mcmc.check_set_default_basic(fitting);
+
+            else
+
+                % askadam
+                fitting2 = askadam.check_set_default_basic(fitting);
+                % get customised fitting setting check
+                if ~isfield(fitting,'regmap');      fitting2.regmap = 'MWF'; end
+            end
 
             % check weighted sum of cost function
             if ~isfield(fitting,'isWeighted');      fitting2.isWeighted     = true; end
             if ~isfield(fitting,'weightMethod');    fitting2.weightMethod   = '1stecho'; end
             if ~isfield(fitting,'weightPower');     fitting2.weightPower    = 2; end
+            if ~isfield(fitting,'start');           fitting2.start          = 'prior';          end
             
             % check hollow cylinder fibre model parameters
             if ~isfield(fitting,'DIMWI') || ~isfield(fitting.DIMWI,'isFitFreqMW');  fitting2.DIMWI.isFitFreqMW  = true; end
@@ -956,7 +1096,6 @@ classdef gpuMCRMWI < handle
             if ~isfield(fitting,'isEPG');           fitting2.isEPG          = true; end
 
             % get customised fitting setting check
-            if ~isfield(fitting,'regmap');      fitting2.regmap = 'MWF'; end
 
             if ~isfield(fitting,'isComplex');   fitting2.isComplex = true; end
 

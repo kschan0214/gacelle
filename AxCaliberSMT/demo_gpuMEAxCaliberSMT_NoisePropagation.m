@@ -64,20 +64,48 @@ fitting                     = [];
 fitting.solver              = 'askadam';
 fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood';
-fitting.isFitR2a            = true;
-fitting.isFitk2a            = true;
-fitting.isFitCSF            = true;
 extraData                   = [];
 
-out   = objGPU.estimate(s, mask, fitting);
+out   = objGPU.estimate(s, mask, extraData, fitting);
 
-%% plot result
+% plot result
 figure;
 field = fieldnames(pars);
 tiledlayout(1,numel(field));
 for k = 1:numel(field)
     nexttile;
     scatter(pars.(field{k}),out.final.(field{k}),5,'filled','MarkerFaceAlpha',.4);
+    h = refline(1);
+    h.Color = 'k';
+    title(field{k});
+    xlabel('GT');ylabel('Fitted');
+end
+
+%% MCMC estimation
+% reset class object for MCMC
+objGPU                      = gpuMEAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
+
+fitting                     = [];
+fitting.solver              = 'mcmc';
+fitting                     = objGPU.check_set_default(fitting);
+fitting.start               = 'likelihood';
+fitting.algorithm           = 'ensemble';
+fitting.Nwalker             = 30;
+fitting.StepSize            = 2;
+fitting.iteration           = 1e4;
+fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.metric              = {'median','iqr'};
+extraData                   = [];
+
+out   = objGPU.estimate(s, mask, extraData, fitting);
+
+% plot result
+figure;
+field = fieldnames(pars);
+tiledlayout(1,numel(field));
+for k = 1:numel(field)
+    nexttile;
+    scatter(pars.(field{k}),out.median.(field{k}),5,'filled','MarkerFaceAlpha',.4);
     h = refline(1);
     h.Color = 'k';
     title(field{k});
