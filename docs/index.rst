@@ -26,6 +26,7 @@ Table of Contents
    :name: sec-getstart
 
    getting_started/introduction
+   getting_started/output_handling
    getting_started/designing_model
    getting_started/askadam_basic_tutorial
    getting_started/askadam_basicND_tutorial

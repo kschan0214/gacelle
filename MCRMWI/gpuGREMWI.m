@@ -368,16 +368,14 @@ classdef gpuGREMWI < handle
             switch fitting.solver
                 case 'askadam'
 
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
+                    out         = askadam().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
                     % out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
 
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    mcmcObj     = mcmc();
                     % 3.1. initial global optimisation
-                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
+                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData);
                     
             end
 
@@ -447,7 +445,7 @@ classdef gpuGREMWI < handle
             idx = find(ismember(this.modelParams,'R2sIW'));
             R2sIW = R2s - 3;
             R2sIW(isnan(R2sIW)) = single(this.startPoint(idx)); R2sIW(isinf(R2sIW)) = single(this.startPoint(idx)); 
-            R2sIW(R2sIW < this.lb(idx)) = single(this.lb(idx)); R2sIW(R2sIW > this.ub(idx)) = single(this.ub(idx));
+            R2sIW = single(max(min(R2sIW,this.ub(idx)-2),this.lb(idx)+2));  % avoid boundaries
             pars0.R2sIW = single(R2sIW);
 
             % update R2*EW
@@ -456,7 +454,7 @@ classdef gpuGREMWI < handle
                 % if R2*EW is a free parameter then set it
                 R2sEW = R2s + 3;
                 R2sEW(isnan(R2sEW)) = single(this.startPoint(idx)); R2sEW(isinf(R2sEW)) = single(this.startPoint(idx)); 
-                R2sEW(R2sEW < this.lb(idx)) = single(this.lb(idx)); R2sEW(R2sEW > this.ub(idx)) = single(this.ub(idx));
+                R2sEW = single(max(min(R2sEW,this.ub(idx)-2),this.lb(idx)+2));  % avoid boundaries
                 pars0.R2sEW = single(R2sEW);
             end
 

@@ -636,9 +636,9 @@ classdef mcmc < handle
         % fitting       : structure contains fitting algorithm parameters
         %   .iteration  : no. of maximum MCMC iterations,   default = 200k
         %   .repetition : no. of MCMC repetitions,          default = 1
-        %   .thinning   : MCMC thinning interval,           default = every 100 iterations
-        %   .burning    : MCMC burn-in ratio,               default = 10%
-        %   .method     : method to compute expected valur from posterior distribution, 'mean' (default) | 'median'
+        %   .thinning   : MCMC thinning interval,           default = every 20 iterations
+        %   .burnin     : MCMC burn-in ratio,               default = 10%
+        %   .metric     : method to compute expected valur from posterior distribution, 'mean' (default) | 'median'
         %   .algorithm  : MCMC algorithm 'MH': Metropolis-Hastings; 'GW': Goodman-Weare, 'MH' (default) | 'GW' 
         %   .StepSize   : Step size for Goodman-Weare,      default = 2
         %   .Nwalker    : number of walkers for Goodman-Weare,      default = 50

@@ -269,16 +269,14 @@ classdef gpuJointR1R2starMapping < handle
             switch fitting.solver
                 case 'askadam'
 
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData, fitting.solver);
+                    out         = askadam().optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData, fitting.solver);
                     % out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
 
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    mcmcObj     = mcmc();
                     % 3.1. initial global optimisation
-                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData, fitting.solver, fitting);
+                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, extraData, fitting.solver, fitting);
                     
             end
 

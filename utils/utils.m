@@ -1462,6 +1462,15 @@ classdef utils < handle
                 end
                 return
             end
+
+            if nd == 3 && isequal(size(existing,2:3), size(new_val,2:3))
+                if ksegment == 1
+                     merged = new_val;
+                else
+                    merged = cat(1, existing, new_val);
+                end
+                return
+            end
         
             % --- Fallback: store from first segment, warn on subsequent ---
             if ksegment == 1
@@ -1602,7 +1611,215 @@ classdef utils < handle
             end
 
         end
+
+        function [neighbours, dr, edgeLength] = get_surface_neighbours(surf_dir, depth, hemisphere)
+        % [neighbours, dr, edgeLength] = utils.get_surface_neighbours(surf_dir, depth, hemisphere)
+        %
+        % Input
+        % --------------
+        % surf_dir      : directory containing FreeSurfer surface files (lh/rh.white/pial)
+        % depth         : cortical depth from white matter surface, [0,1] (default 0.5)
+        % hemisphere    : cell array subset of {'lh','rh'}, order determines dim3 order
+        %                 in the output (default {'lh','rh'}, reproducing the original
+        %                 get_surface_neightbour.m behaviour exactly)
+        %
+        % Output
+        % --------------
+        % neighbours    : [1, Nvertex, Nhemi, maxNeighbours] vertex neighbour indices,
+        %                  broadcast-ready against a [1,Nvertex,Nhemi] parameter map
+        % dr            : [1, Nvertex, Nhemi, maxNeighbours, 3] per-axis edge vector to
+        %                  each neighbour. Kept for any future directional/anisotropic
+        %                  use; isotropic surface TV (surface_total_variation.m) uses
+        %                  edgeLength below instead, not this.
+        % edgeLength    : [1, Nvertex, Nhemi, maxNeighbours] scalar Euclidean edge length
+        %                  to each neighbour (= sqrt(sum(dr.^2,5))), precomputed once
+        %                  here since it's fixed mesh geometry - callers doing per-
+        %                  iteration optimisation (e.g. surface TV inside askadam's loss)
+        %                  should use this rather than recomputing it every iteration.
+        %
+        % Description: computes per-vertex mesh adjacency and edge vectors on the
+        % mid-cortical surface, for use in surface-based spatial TV regularisation
+        % (see surface_total_variation.m). Model-agnostic; any surface-fitting model
+        % can call this directly.
+        %
+        % Note: when hemisphere has >1 entry, all requested hemispheres must have
+        % the same vertex count to be concatenated along dim3 (true for fsaverage
+        % by construction; NOT generally true for native subject surfaces). This
+        % is checked explicitly and errors clearly rather than failing inside cat().
+        % maxNeighbours, by contrast, commonly *does* differ between hemispheres
+        % even on fsaverage (local mesh topology, not global symmetry) and is
+        % padded to a common width below rather than assumed equal.
+        %
+        % Kwok-Shing Chan @ MGH
+        % kchan2@mgh.harvard.edu
+        %
+        % Date created: 15 April 2025
+        % Date modified: 3 July 2026 (added edgeLength as a third, precomputed
+        %                 output - surface_total_variation.m now takes edgeLength
+        %                 directly instead of dr, so this scalar-distance reduction
+        %                 happens once per geometry instead of once per optimiser
+        %                 iteration; generalised from hardcoded lh+rh to arbitrary
+        %                 hemisphere subset; pad maxNeighbours per hemisphere instead
+        %                 of assuming equal; explicit vertex-count guard across
+        %                 hemispheres; folded in the [1,Nvertex,Nhemi,...] permute
+        %                 previously done by hand at each call site; moved from a
+        %                 standalone script into utils.m for model-agnostic reuse)
+        %
+            if nargin < 2 || isempty(depth);      depth      = 0.5;             end
+            if nargin < 3 || isempty(hemisphere); hemisphere = {'lh','rh'};     end
+            if ~iscell(hemisphere); hemisphere = cellstr(hemisphere); end
+
+            validHemi = {'lh','rh'};
+            if isempty(hemisphere) || any(~ismember(hemisphere, validHemi))
+                error('GACELLE:invalidHemisphere', ...
+                    'hemisphere must be a non-empty cell array from {''lh'',''rh''}, got {%s}.', ...
+                    strjoin(cellfun(@(x) sprintf('''%s''',x), hemisphere, 'UniformOutput', false), ', '));
+            end
+
+            if exist('read_surf', 'file') ~= 2
+                error('GACELLE:freesurferNotFound', ...
+                    'read_surf.m not found on path. Surface neighbour computation requires the FreeSurfer MATLAB toolbox (matlab/ subdirectory of a FreeSurfer install) to be added to path.');
+            end
+
+            if ~isfolder(surf_dir)
+                error('GACELLE:surfDirNotFound', 'surf_dir does not exist: %s', surf_dir);
+            end
+
+            % --- pass 1: compute per-hemisphere adjacency, ragged maxNeighbours ---
+            Nhemi                 = numel(hemisphere);
+            neighbourPerHemi      = cell(Nhemi, 1);
+            drPerHemi             = cell(Nhemi, 1);
+            paddingPerHemi        = cell(Nhemi, 1);
+            numVerticesPerHemi    = zeros(Nhemi, 1);
+            maxNeighboursPerHemi  = zeros(Nhemi, 1);
+
+            for kh = 1:Nhemi
+
+                % Load white matter surface
+                [vertices_white, faces_white] = read_surf(fullfile(surf_dir, strcat(hemisphere{kh}, '.white')));
+                % Load pial surface
+                [vertices_pial, ~]            = read_surf(fullfile(surf_dir, strcat(hemisphere{kh}, '.pial')));
+
+                % Interpolate vertices to the requested cortical depth
+                vertices_mid = vertices_white + depth * (vertices_pial - vertices_white);
+
+                faces = faces_white + 1;  % face index starts from 0 in FreeSurfer files
+
+                % Build adjacency list from faces
+                numVertices   = size(vertices_white, 1);
+                neighbourList = cell(numVertices, 1);
+                for i = 1:size(faces, 1)
+                    for j = 1:3
+                        vertex = faces(i, j);
+                        neighbourList{vertex} = unique([neighbourList{vertex}, faces(i, mod(j, 3) + 1), faces(i, mod(j + 1, 3) + 1)]);
+                    end
+                end
+
+                maxNeighbours_kh = max(cellfun(@numel, neighbourList));
+
+                neighbourArray_tmp = nan(numVertices, maxNeighbours_kh);
+                for i = 1:numVertices
+                    neighbourArray_tmp(i, 1:numel(neighbourList{i})) = neighbourList{i};
+                end
+
+                % replace invalid (padding) neighbour entries with self index, so
+                % downstream dr = 0 for those and they contribute nothing to TV.
+                % isPadding_kh records exactly which entries these are, so later
+                % steps can distinguish "expected padding" from a genuine
+                % zero-length edge (distinct connected vertices at coincident
+                % positions - a real mesh defect) rather than inferring it from
+                % the value being zero, which cannot tell the two apart.
+                invalidIndices = isnan(neighbourArray_tmp);
+                isPadding_kh    = invalidIndices;
+                vertexNum       = repmat((1:numVertices).', 1, maxNeighbours_kh);
+                neighbourArray_tmp(invalidIndices) = vertexNum(invalidIndices);
+
+                xNeighbour = reshape(vertices_mid(neighbourArray_tmp(:), 1), size(neighbourArray_tmp));
+                yNeighbour = reshape(vertices_mid(neighbourArray_tmp(:), 2), size(neighbourArray_tmp));
+                zNeighbour = reshape(vertices_mid(neighbourArray_tmp(:), 3), size(neighbourArray_tmp));
+
+                dx = xNeighbour - vertices_mid(:,1);
+                dy = yNeighbour - vertices_mid(:,2);
+                dz = zNeighbour - vertices_mid(:,3);
+
+                neighbourPerHemi{kh}     = neighbourArray_tmp;      % [vertex, neighbour]
+                drPerHemi{kh}            = cat(3, dx, dy, dz);      % [vertex, neighbour, coord]
+                paddingPerHemi{kh}       = isPadding_kh;            % [vertex, neighbour]
+                numVerticesPerHemi(kh)   = numVertices;
+                maxNeighboursPerHemi(kh) = maxNeighbours_kh;
+            end
+
+            % --- guard: hemispheres must share vertex count to concatenate ---
+            if Nhemi > 1 && numel(unique(numVerticesPerHemi)) > 1
+                error('GACELLE:hemisphereVertexMismatch', ...
+                    ['Requested hemispheres have different vertex counts (%s) and cannot be ' ...
+                     'concatenated. This is expected for native subject surfaces - resample to ' ...
+                     'a common template (e.g. fsaverage) first, or process hemispheres separately.'], ...
+                    num2str(numVerticesPerHemi(:).'));
+            end
+            numVertices = numVerticesPerHemi(1);
+
+            % --- pass 2: pad each hemisphere's ragged maxNeighbours to the common max ---
+            maxNeighbours = max(maxNeighboursPerHemi);
+            neighbours    = [];
+            dr            = [];
+            isPadding     = [];
+            for kh = 1:Nhemi
+                padWidth = maxNeighbours - maxNeighboursPerHemi(kh);
+                if padWidth > 0
+                    % pad with self-index (-> zero dr, no contribution to TV), same
+                    % convention already used above for ragged per-vertex neighbour counts
+                    selfPad               = repmat((1:numVertices).', 1, padWidth);
+                    neighbourPerHemi{kh}  = [neighbourPerHemi{kh}, selfPad];
+                    drPerHemi{kh}         = cat(2, drPerHemi{kh}, zeros(numVertices, padWidth, 3));
+                    paddingPerHemi{kh}    = [paddingPerHemi{kh}, true(numVertices, padWidth)];
+                end
+                neighbours = cat(3, neighbours, neighbourPerHemi{kh});   % [vertex, neighbour, hemi]
+                dr         = cat(4, dr,         drPerHemi{kh});          % [vertex, neighbour, coord, hemi]
+                isPadding  = cat(3, isPadding,  paddingPerHemi{kh});     % [vertex, neighbour, hemi]
+            end
+
+            % --- assemble into [1, Nvertex, Nhemi, maxNeighbours(,3)] broadcast convention ---
+            neighbours = permute(neighbours, [1 3 2]);        % -> [vertex, hemi, neighbour]
+            dr         = permute(dr,         [1 4 2 3]);      % -> [vertex, hemi, neighbour, coord]
+            isPadding  = permute(isPadding,  [1 3 2]);        % -> [vertex, hemi, neighbour]
+            neighbours = permute(neighbours, [4 1 2 3]);      % -> [1, vertex, hemi, neighbour]
+            dr         = permute(dr,         [5 1 2 3 4]);    % -> [1, vertex, hemi, neighbour, coord]
+            isPadding  = permute(isPadding,  [4 1 2 3]);      % -> [1, vertex, hemi, neighbour]
+
+            % scalar edge length, computed once here rather than per-iteration by
+            % callers - see header note above
+            edgeLength = sqrt(sum(dr.^2, 5));
+
+            % --- guard against a genuine zero-length edge being mistaken for padding ---
+            % Padding entries are zero-length by construction (self-indexed -> dr=0)
+            % and are safe to replace with a large sentinel below. A zero-length
+            % entry that is NOT padding means two distinct, mesh-connected vertices
+            % sit at coincident positions - a real surface defect, not an expected
+            % condition - so it is reported rather than silently absorbed into the
+            % same fix.
+            degenerateEdge = (edgeLength == 0) & ~isPadding;
+            if any(degenerateEdge(:))
+                warning('GACELLE:degenerateSurfaceEdge', ...
+                    ['%d non-padding mesh edge(s) have zero length (two distinct connected ' ...
+                     'vertices at coincident positions). These will still safely avoid division ' ...
+                     'by zero (only padding entries are sentinel-substituted below), but a ' ...
+                     'zero-length real edge indicates a degenerate input surface and is worth ' ...
+                     'inspecting.'], nnz(degenerateEdge));
+            end
+
+            % Replace padding entries' zero edge length with a large sentinel so
+            % downstream division (theta-thetaNeighbours)./edgeLength never hits
+            % 0/0: the numerator for a padding entry is exactly zero by construction
+            % (self-indexed, theta(v)-theta(v)), so the sentinel's magnitude only
+            % needs to clear single-precision range, not match any real length scale -
+            % 0/sentinel = 0 exactly regardless of how large sentinel is.
+            edgeLengthSentinel        = 1e6;
+            % edgeLength(isPadding>0)   = edgeLengthSentinel;
+            edgeLength(edgeLength==0) = edgeLengthSentinel;
+
+        end
     
     end
-
+   
 end

@@ -54,6 +54,16 @@ classdef gpuNEXI < handle
         Nav;
     end
 
+    properties (Access = protected)
+    % ===== SURFACE GEOMETRY CACHE =====
+    % Populated by get_surface_geometry(); recomputed only when (surf_dir,
+    % depth, hemisphere) differ from the previous call on this object, since
+    % utils.get_surface_neighbours is not cheap to recompute (unvectorised
+    % per-face adjacency loop over the full mesh).
+        % surfaceGeometryCache = struct('surf_dir','','depth',[],'hemisphere',{{}},'neighbours',[],'dr',[],'edgeLength',[]);
+        surfaceGeometryCache = struct('surf_dir','','depth',[],'hemisphere',{{}},'neighbours',[],'edgeLength',[]);
+    end
+
     methods
 
         % constructuor
@@ -113,6 +123,7 @@ classdef gpuNEXI < handle
                 this.lb(idx)              = [];
                 this.ub(idx)              = [];
                 this.startPoint(idx)      = [];
+                this.step(idx)            = [];
             end
 
         end
@@ -148,7 +159,16 @@ classdef gpuNEXI < handle
         %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
         %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
         %   .sigma      : 3D noise map, [x,y,z]                     (Optional, only needed for NEXIrice model)
+        %   .surf_dir   : FreeSurfer surf directory                 (Required if fitting.dataType='surface')
+        %   .hemisphere : cell array subset of {'lh','rh'}          (Required if fitting.dataType='surface'; must match mask dim3/Nhemi)
+        %   .depth      : cortical depth, [0,1]                     (Optional, surface mode only, default 0.5)
         % fitting   : fitting algorithm parameters (see fit function)
+        %   .dataType   : 'volumetric' (default) | 'surface'. Surface mode expects
+        %                 data/mask in [1, Nvertex, Nhemi] convention and ignores
+        %                 fitting.TVmode entirely (regularisation dispatched via
+        %                 surface_total_variation instead of the built-in volumetric
+        %                 TV operator). Segmentation for surface mode is opt-in and
+        %                 exact-only (fitting.NSegmentUser must be 1 or Nhemi).
         % pars0     : (Optional) initial starting points for model parameters
         % 
         % Output
@@ -169,7 +189,8 @@ classdef gpuNEXI < handle
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [data,mask] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax);
+            % [data,mask] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax);
+            [data, mask, extradata] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax,fitting);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -182,7 +203,7 @@ classdef gpuNEXI < handle
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
             %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
-            
+
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
@@ -190,20 +211,20 @@ classdef gpuNEXI < handle
             % parameter estimation
             out = [];
             for kseg = 1:NSegment
-                
+
                 if NSegment > 1
                     fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
                     disp   ('------------------------')
                 end
-    
+
                 % divide the data; fitRange includes halo slices (if any), ownedRange
                 % is what this segment is responsible for writing back
-                fitRange                        = seg(kseg).fit;
-                ownedRange                      = seg(kseg).owned;
-                [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, fitRange, pars0);
+                fitRange                                    = seg(kseg).fit;
+                ownedRange                                  = seg(kseg).owned;
+                [dataSeg, maskSeg, pars0Seg, extradataSeg]  = this.slice_segment(data, mask, fitRange, pars0, extradata);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
+                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg,extradataSeg);
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's
@@ -215,6 +236,7 @@ classdef gpuNEXI < handle
 
             end
             out.mask = mask;
+
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
@@ -229,8 +251,43 @@ classdef gpuNEXI < handle
 
         end
 
+        % Cached wrapper around utils.get_surface_neighbours; recomputes only
+        % when (surf_dir, depth, hemisphere) differ from the last call on
+        % this object, so repeated estimate() calls on the same subject/
+        % surface don't repay the mesh-adjacency computation each time.
+        function [neighbours, edgeLength] = get_surface_geometry(this, surf_dir, depth, hemisphere)
+
+            if nargin < 3 || isempty(depth);      depth      = 0.5;         end
+            if nargin < 4 || isempty(hemisphere); hemisphere = {'lh','rh'}; end
+            if ~iscell(hemisphere); hemisphere = cellstr(hemisphere); end
+
+            cacheHit = strcmp(this.surfaceGeometryCache.surf_dir, surf_dir) && ...
+                       isequal(this.surfaceGeometryCache.depth, depth) && ...
+                       isequal(this.surfaceGeometryCache.hemisphere, hemisphere);
+
+            if cacheHit
+                neighbours = this.surfaceGeometryCache.neighbours;
+                % dr         = this.surfaceGeometryCache.dr;
+                edgeLength = this.surfaceGeometryCache.edgeLength;
+                return
+            end
+
+            [neighbours, ~, edgeLength] = utils.get_surface_neighbours(surf_dir, depth, hemisphere);
+            neighbours = (single(neighbours));
+            % dr         = (single(dr));
+            edgeLength = (single(edgeLength));
+
+            this.surfaceGeometryCache.surf_dir   = surf_dir;
+            this.surfaceGeometryCache.depth      = depth;
+            this.surfaceGeometryCache.hemisphere = hemisphere;
+            this.surfaceGeometryCache.neighbours = neighbours;
+            % this.surfaceGeometryCache.dr         = dr;
+            this.surfaceGeometryCache.edgeLength = edgeLength;
+
+        end
+
         % Data fitting function, can be 2D (voxel-based) or 4D (image-based)
-        function [out] = fit(this,dwi,mask,fitting,pars0)
+        function [out] = fit(this,dwi,mask,fitting,pars0,extradata)
         %
         % Input
         % -----------
@@ -278,9 +335,6 @@ classdef gpuNEXI < handle
         %
         %
             
-            % check GPU
-            gpool = gpuDevice;
-            
             % get image size
             dims = size(dwi,1:3);
 
@@ -292,6 +346,7 @@ classdef gpuNEXI < handle
             else
                 if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
             end
+            if nargin < 6; extradata = []; end % only used by the surface TV path below
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
@@ -301,6 +356,9 @@ classdef gpuNEXI < handle
             % set fitting boundary if no input from user
             if isempty( fitting.ub); fitting.ub = this.ub(1:numel(fitting.modelParams)); end
             if isempty( fitting.lb); fitting.lb = this.lb(1:numel(fitting.modelParams)); end
+
+            % gacelle does not check your extra data, so put them onto gpu now
+            if ~isempty(extradata); extradata = utils.struct2gpusingle(extradata); end
             
             %%%%%%%%%%%%%%%%%%%% End 1 %%%%%%%%%%%%%%%%%%%%
 
@@ -321,13 +379,65 @@ classdef gpuNEXI < handle
             % 2.3 askAdam optimisation main
             switch fitting.solver
                 case 'askadam'
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
+                    if strcmpi(fitting.regularisationType,'prior') && fitting.lambda{1} > 0
+                        % Prior-distribution regularisation: custom-regulariser path via
+                        % the userFcn/userInput two-slot form, applicable to EITHER
+                        % dataType ('volumetric' or 'surface') since prior_distribution_normal
+                        % is geometry-agnostic (it goes through utils.reshape_GD2ND/mask
+                        % exactly like the forward model does).
+                        if isempty(extradata) || ~isfield(extradata,'mu') || ~isfield(extradata,'sigma')
+                            error('GACELLE:missingPriorDistribution', ...
+                                ['fitting.regularisationType is ''prior'' and fitting.lambda > 0, but ' ...
+                                 'extradata.mu/extradata.sigma were not provided to fit().']);
+                        end
+                        missingMu    = fitting.regmap(~isfield(extradata.mu,    fitting.regmap));
+                        missingSigma = fitting.regmap(~isfield(extradata.sigma, fitting.regmap));
+                        if ~isempty(missingMu) || ~isempty(missingSigma)
+                            error('GACELLE:incompletePriorDistribution', ...
+                                ['extradata.mu/extradata.sigma must have a field for every name in ' ...
+                                 'fitting.regmap. Missing from mu: {%s}. Missing from sigma: {%s}.'], ...
+                                strjoin(missingMu, ', '), strjoin(missingSigma, ', '));
+                        end
+                        % gpu-convert only the regmap fields actually used by the loss -
+                        % NOT this.modelParams, which would silently pull in fields mu/
+                        % sigma may not even have (this was a bug in the original
+                        % gpuNEXI_priorDistribution.m: it looped over this.modelParams
+                        % rather than fitting.regmap)
+                        for kreg = 1:numel(fitting.regmap)
+                            extradata.mu.(fitting.regmap{kreg})    = gpuArray(single(extradata.mu.(fitting.regmap{kreg})));
+                            extradata.sigma.(fitting.regmap{kreg}) = gpuArray(single(extradata.sigma.(fitting.regmap{kreg})));
+                        end
+
+                        userFcn      = {@this.FWD};
+                        userInput    = {{fitting.lmax, fitting.solver}};
+                        userFcn{2}   = @this.prior_distribution_normal;
+                        userInput{2} = {mask, fitting.lambda, fitting.regmap, extradata.mu, extradata.sigma};
+                        out = askadam().optimisation( dwi, mask, w, pars0, fitting, userFcn, userInput);
+                    elseif strcmpi(fitting.dataType,'surface')
+                        % custom-regulariser path: userFcn/userInput two-slot form,
+                        % see askadam.model_gradient. Volumetric path below is left
+                        % on the legacy single-function call form, unchanged.
+                        userFcn   = {@this.FWD};
+                        userInput = {{fitting.lmax, fitting.solver}};
+                        if fitting.lambda{1} > 0
+                            if isempty(extradata) || ~isfield(extradata,'neighbours') || ~isfield(extradata,'dr')
+                                error('GACELLE:missingSurfaceGeometry', ...
+                                    ['fitting.dataType is ''surface'' and fitting.lambda > 0, but ' ...
+                                     'extradata.neighbours/extradata.dr were not provided to fit(). ' ...
+                                     'This is normally populated by estimate() - if calling fit() ' ...
+                                     'directly, supply extradata.neighbours and extradata.dr yourself.']);
+                            end
+                            userFcn{2}   = @this.surface_total_variation;
+                            userInput{2} = {mask, extradata.neighbours, fitting.lambda, fitting.regmap, extradata.dr};
+                        end
+                        out = askadam().optimisation( dwi, mask, w, pars0, fitting, userFcn, userInput);
+                    else
+                        out = askadam().optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
+                    end
                 case 'mcmc'
                     fitting.xStepSize = this.step;
                     
-                    mcmcObj     = mcmc(); 
-                    out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
+                    out         = mcmc().optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.lmax, fitting.solver);
             end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
@@ -335,7 +445,7 @@ classdef gpuNEXI < handle
             disp('The estimation is completed.');
             
             % clear GPU
-            reset(gpool)
+            reset(gpuDevice)
             
         end
 
@@ -367,10 +477,77 @@ classdef gpuNEXI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [dwi, mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        function [data, mask, extradata] = prepare_dwi_data(this,data,mask,extradata,lmax,fitting)
+
+            if strcmpi(fitting.dataType,'surface')
+                %%%%%%%%%%%% Surface path %%%%%%%%%%%%
+                % Expected layout: [1, Nvertex, Nhemi] for both data and mask (singleton
+                % 1st dim). No overlapping-slice/halo machinery here: unlike volumetric
+                % z-slicing, a hemisphere split has no vertices straddling the cut (each
+                % hemisphere's mesh graph is independent by construction), so a split
+                % along dim3 is exact rather than an approximation needing halo repair.
+                % Arbitrary splits are NOT supported - they would cut real mesh
+                % connectivity - so segmentation here is opt-in and exact-only.
+
+                if size(mask,1) ~= 1 || size(data,1) ~= 1
+                    error('GACELLE:surfaceShapeMismatch', ...
+                        ['Surface mode expects data/mask in [1, Nvertex, Nhemi] convention ' ...
+                         '(singleton 1st dimension), got mask size [%s]. See documentation ' ...
+                         'for the surface data layout.'], num2str(size(mask,1:3)));
+                end
+                Nhemi = size(mask,3);
+                
+                if strcmpi(fitting.regularisationType,'TV') && fitting.lambda{1} > 0
+                    % Only surface_total_variation needs mesh connectivity
+                    % (neighbours/dr). Prior-distribution regularisation needs
+                    % mu/sigma instead (validated later, in the dispatch section)
+                    % and has nothing to do with mesh geometry, so this block must
+                    % NOT trigger just because lambda{1}>0 - that was true when
+                    % 'TV' was the only regularisation option, but is no longer a
+                    % safe proxy for "this fit needs surf_dir/hemisphere" now that
+                    % 'prior' exists as an alternative gated on the same lambda.
+                    if isempty(extradata) || ~isfield(extradata,'surf_dir') || isempty(extradata.surf_dir)
+                        error('GACELLE:missingSurfDir', ...
+                            'fitting.dataType is ''surface'' but extradata.surf_dir was not provided.');
+                    end
+                    if ~isfield(extradata,'hemisphere') || isempty(extradata.hemisphere)
+                        error('GACELLE:missingHemisphere', ...
+                            'fitting.dataType is ''surface'' but extradata.hemisphere was not provided.');
+                    end
+                    hemisphere = extradata.hemisphere;
+                    if ~iscell(hemisphere); hemisphere = cellstr(hemisphere); end
+                    if numel(hemisphere) ~= Nhemi
+                        error('GACELLE:hemisphereMaskMismatch', ...
+                            ['extradata.hemisphere has %d entries but mask dim3 (Nhemi) = %d; ' ...
+                             'these must match.'], numel(hemisphere), Nhemi);
+                    end
+                    depth = 0.5;
+                    if isfield(extradata,'depth') && ~isempty(extradata.depth); depth = extradata.depth; end
+    
+                    [neighbours, dr] = this.get_surface_geometry(extradata.surf_dir, depth, hemisphere);
+                    if size(neighbours,3) ~= Nhemi
+                        error('GACELLE:surfaceGeometryMismatch', ...
+                            ['Computed surface neighbour geometry has %d hemisphere(s) but mask ' ...
+                             'has %d; check extradata.hemisphere matches the data.'], ...
+                            size(neighbours,3), Nhemi);
+                    end
+                    extradata.neighbours = neighbours;
+                    extradata.dr         = dr;
+                end
+
+                % --- segmentation: exact-only, opt-in, {1, Nhemi} legal ---
+                NSegmentUser = fitting.NSegmentUser;
+                if isempty(NSegmentUser); NSegmentUser = 1; end
+                if ~ismember(NSegmentUser, [1, Nhemi])
+                    error('GACELLE:invalidSurfaceSegmentation', ...
+                        ['Surface segmentation is exact-only and limited to fitting.NSegmentUser ' ...
+                         '= 1 (no split) or %d (exact per-hemisphere split); got %d. Arbitrary ' ...
+                         'splits would cut mesh connectivity and are not supported.'], Nhemi, NSegmentUser);
+                end
+            end
 
             % --- Step 1: compute rotationally invariant signal if needed ---
-            if size(dwi,4)/(lmax/2+1) > numel(this.b) 
+            if size(data,4)/(lmax/2+1) > numel(this.b) 
                 % compute spherical mean signal
                 fprintf('Computing rotationally invariant signal...')
 
@@ -379,74 +556,78 @@ classdef gpuNEXI < handle
                 %     extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
                 % end
                 DWIutilityObj   = DWIutility();
-                [dwi]           = DWIutilityObj.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,[],extradata.BDELTA,[],lmax);
+                [data]          = DWIutilityObj.compute_rotationally_invariant_signal(data,extradata.bval,extradata.bvec,[],extradata.BDELTA,[],lmax);
                 % [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
 
                 fprintf('done.\n');
 
-            elseif size(dwi,4) < numel(this.b) * (lmax/2+1)
+            elseif size(data,4) < numel(this.b) * (lmax/2+1)
                 error('GACELLE:inputMismatch', ...
                     'Input has %d volumes but model expects %d. Check lmax or input data.', ...
-                    size(dwi,4), numel(this.b)*(lmax/2+1));
+                    size(data,4), numel(this.b)*(lmax/2+1));
             end
 
-            % --- Step 2: exclude biophysically impossible signal ---
-            % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
-            % works for both magnitude and real-valued data
-            Nshells         = numel(this.b);
-            dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
-            mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
-            mask_valid      = ~mask_impossible;
+            if ~strcmpi(fitting.dataType,'surface')
+                % only for volumetric data
 
-            % --- Step 3: exclude near-zero signal (background voxels) ---
-            % Sl0 of lowest b-value shell should be well above zero for tissue
-            % very small value indicates background noise with no diffusion signal
-            mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
-            mask_valid      = mask_valid & ~mask_background;
-
-            % --- Step 4: exclude incoherent signal (random noise pattern) ---
-            % correlate each voxel's Sl0 signal with the median tissue template
-            % median is more robust to outliers than mean
-            % low correlation indicates random noise rather than coherent diffusion decay
-            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0, mask_valid);
-            if size(dwi_2D, 2) > 0
-                signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
-                signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
-                                  std(signalTemplate,'omitmissing');
-        
-                Rcorr = zeros(1, size(dwi_2D,2));
-                for k = 1:size(dwi_2D,2)
-                    signalVoxel = dwi_2D(:,k);
-                    denom       = std(signalVoxel);
-                    if denom < eps
-                        Rcorr(k) = 0;   % flat signal -> zero correlation
-                    else
-                        signalVoxel = (signalVoxel - mean(signalVoxel)) ./ denom;
-                        Rcorr(k)    = corr(signalTemplate, signalVoxel);
+                % --- Step 2: exclude biophysically impossible signal ---
+                % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
+                % works for both magnitude and real-valued data
+                Nshells         = numel(this.b);
+                dwi_Sl0         = data(:,:,:,1:Nshells);          % Sl0 block
+                mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
+                mask_valid      = ~mask_impossible;
+    
+                % --- Step 3: exclude near-zero signal (background voxels) ---
+                % Sl0 of lowest b-value shell should be well above zero for tissue
+                % very small value indicates background noise with no diffusion signal
+                mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+                mask_valid      = mask_valid & ~mask_background;
+    
+                % --- Step 4: exclude incoherent signal (random noise pattern) ---
+                % correlate each voxel's Sl0 signal with the median tissue template
+                % median is more robust to outliers than mean
+                % low correlation indicates random noise rather than coherent diffusion decay
+                dwi_2D         = utils.reshape_ND2GD(dwi_Sl0, mask_valid);
+                if size(dwi_2D, 2) > 0
+                    signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
+                    signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
+                                      std(signalTemplate,'omitmissing');
+            
+                    Rcorr = zeros(1, size(dwi_2D,2));
+                    for k = 1:size(dwi_2D,2)
+                        signalVoxel = dwi_2D(:,k);
+                        denom       = std(signalVoxel);
+                        if denom < eps
+                            Rcorr(k) = 0;   % flat signal -> zero correlation
+                        else
+                            signalVoxel = (signalVoxel - mean(signalVoxel)) ./ denom;
+                            Rcorr(k)    = corr(signalTemplate, signalVoxel);
+                        end
                     end
+            
+                    Rcorr           = utils.reshape_GD2ND(Rcorr, mask_valid);
+                    mask_incoherent = Rcorr < this.thres_similarity;
+                    mask_valid      = mask_valid & ~mask_incoherent;
                 end
-        
-                Rcorr           = utils.reshape_GD2ND(Rcorr, mask_valid);
-                mask_incoherent = Rcorr < this.thres_similarity;
-                mask_valid      = mask_valid & ~mask_incoherent;
-            end
-
-            % --- Step 5: remove NaN/Inf ---
-            [dwi,mask_naninf] = utils.remove_img_naninf(dwi,mask);
-            mask_naninf        = max(mask_naninf, [], 4);
-            mask_valid         = mask_valid & mask_naninf;
-
-            % --- Report and update mask ---
-            Nexcluded = sum(mask(:)) - sum(mask_valid(:));
-            if Nexcluded > 0
-                fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
-                    Nexcluded, 100*Nexcluded/sum(mask(:)));
-                fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
-                fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
-                fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
-                fprintf('  Incoherent     : %d\n', sum(mask_incoherent(:) & mask(:)));
-                disp('Please use the updated mask in subsequent analysis.');
-                mask = mask_valid;
+    
+                % --- Step 5: remove NaN/Inf ---
+                [data,mask_naninf] = utils.remove_img_naninf(data,mask);
+                mask_naninf        = max(mask_naninf, [], 4);
+                mask_valid         = mask_valid & mask_naninf;
+    
+                % --- Report and update mask ---
+                Nexcluded = sum(mask(:)) - sum(mask_valid(:));
+                if Nexcluded > 0
+                    fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
+                        Nexcluded, 100*Nexcluded/sum(mask(:)));
+                    fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
+                    fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
+                    fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
+                    fprintf('  Incoherent     : %d\n', sum(mask_incoherent(:) & mask(:)));
+                    disp('Please use the updated mask in subsequent analysis.');
+                    mask = mask_valid;
+                end
             end
 
         end
@@ -494,7 +675,7 @@ classdef gpuNEXI < handle
         function pars0 = estimate_prior(this,dwi,mask, Nsample,lmax)
         % Estimation starting points for NEXI using likehood method
 
-            rng(this.seed); % for reproducible dictionary
+            rng(this.seed,'twister'); % for reproducible dictionary
 
             start = tic;
             
@@ -668,7 +849,7 @@ classdef gpuNEXI < handle
         end
 
         % segment data based on slice
-        function [dataSeg, maskSeg, pars0Seg] = slice_segment(this, data, mask, slice, pars0)
+        function [dataSeg, maskSeg, pars0Seg, extraDataSeg] = slice_segment(this, data, mask, slice, pars0, extraData)
 
             dataSeg     = data(:,:,slice,:,:,:,:,:,:);
             maskSeg     = mask(:,:,slice);
@@ -680,6 +861,39 @@ classdef gpuNEXI < handle
                 pars0Seg = [];                 
             end
 
+            if ~isempty(extraData)
+                extraDataSeg = this.slice_extradata_recursive(extraData, slice);
+            else                                                    
+                extraDataSeg = [];                 
+            end
+
+        end
+
+        % Slices every field of an extradata struct along dim3 (the segment's
+        % slice/hemisphere range), recursing one level into any struct-valued
+        % field. This matters for fields like extradata.mu/extradata.sigma
+        % (prior-distribution regularisation), which are themselves structs of
+        % per-parameter maps (mu.fa, mu.Da, ...): ismatrix() on a scalar struct
+        % is always true regardless of what its fields contain, so treating a
+        % struct like any other field would silently take the "pass through
+        % unsliced" branch and hand every segment the full-volume prior map
+        % instead of the segment's slice - a shape mismatch (or worse, a
+        % silent misalignment) inside the loss rather than a clear error.
+        % Non-struct fields are sliced exactly as before - fully backward
+        % compatible for existing extradata (e.g. surface neighbours/dr).
+        function out = slice_extradata_recursive(this, in, slice)
+            fields = fieldnames(in);
+            out    = struct();
+            for kfield = 1:numel(fields)
+                val = in.(fields{kfield});
+                if isstruct(val)
+                    out.(fields{kfield}) = this.slice_extradata_recursive(val, slice);
+                elseif ~ismatrix(val)
+                    out.(fields{kfield}) = val(:,:,slice,:,:,:,:,:,:,:,:);
+                else
+                    out.(fields{kfield}) = val;
+                end
+            end
         end
 
         %% NEXI signal related functions
@@ -718,9 +932,14 @@ classdef gpuNEXI < handle
         function S = Slmax2(this, fa, Da, De, ra, p2, solver)
 
             if nargin < 7; solver = []; end
+            if ismatrix(fa)
+                GDinput = true;
+            else
+                GDinput = false;
+            end
 
-            bval    = this.b;
-            DELTA   = this.Delta;
+            bval    = permute(this.b,[2 3 4 1]);
+            DELTA   = permute(this.Delta, [2 3 4 1]);
 
             Da      = bval.*Da;
             De      = bval.*De;
@@ -729,29 +948,19 @@ classdef gpuNEXI < handle
 
             % Trapezoidal's rule replacement
             Nx  = 14;    % NRMSE<0.05% for Nx=14 for Sl0 and 0.5% for Sl2
-            x   = zeros([ones(1,ndims(fa)), Nx],'like',De); x(:) = linspace(0,1,Nx);
-            % x   = zeros([ones(1,ndims(fa)), Nx], 'single', 'gpuArray'); x(:) = linspace(0,1,Nx);
+            x   = zeros([ones(1,ndims(re)), Nx],'like',De); x(:) = linspace(0,1,Nx);
 
             % Sl0
             if strcmpi(solver,'mcmc') 
-                dx  = x(2) - x(1);
-
                 M   = arrayfun(@NEXI_M,x,fa,Da,De,ra,re);
-
-                if ndims(M) == 3
-                    S = sum((M(:,:,2:end) + M(:,:,1:end-1)) * (dx) / 2, ndims(x));
-                elseif ndims(M) == 4
-                    S = sum((M(:,:,:,2:end) + M(:,:,:,1:end-1)) * (dx) / 2, ndims(x));
-                end
 
             else
                 % askadam
                 M = this.M(x, fa, Da, De, ra, re);
 
-                % S = trapz(x(:),M,ndims(x));
-                S = gacelle_trapz(M,x(:),ndims(x));
-                
             end
+
+            S = gacelle_trapz(M,x(:),ndims(x));
 
             % Sl2
             if ~isempty(p2)
@@ -760,19 +969,28 @@ classdef gpuNEXI < handle
                     % M = M.*(3*x.^2-1)/2; 
                     M = arrayfun(@NEXI_MSl2,M,x);
                     % bypass Matlab's trapz for speed
-                    if ndims(M) == 3
-                        Sl2 = sum((M(:,:,2:end) + M(:,:,1:end-1)) * (dx) / 2, ndims(x));
-                    elseif ndims(M) == 4
-                        Sl2 = sum((M(:,:,:,2:end) + M(:,:,:,1:end-1)) * (dx) / 2, ndims(x));
-                    end
+                    Sl2 = gacelle_trapz(M,x(:),ndims(x));
                 else
                     % askadam
-                    % Sl2 = trapz(x(:),M.*(3*x.^2-1)/2,ndims(x));
                     Sl2 = gacelle_trapz(M.*(3*x.^2-1)/2,x(:),ndims(x));
                 end
                 Sl2 = p2.*abs(Sl2);
 
-                S = cat(1,S,Sl2);
+                S = cat(4,S,Sl2);
+
+            end
+
+            % make sure the output is NmeasxNvoxel for GD input
+            if GDinput
+                if isscalar(fa)
+                    S  = squeeze(S);
+                else
+                    S = squeeze(S).';
+                end
+            else
+                if strcmp(solver,'mcmc')
+                    S = permute(S,[4 2 3 1]);
+                end
             end
 
         end
@@ -902,6 +1120,19 @@ classdef gpuNEXI < handle
                     fitting2.regmap = cellstr(fitting2.regmap);
                 end
 
+                % =====================================================================
+                % Regularisation type: 'TV' (default) | 'prior'
+                % Default is 'TV' (not 'none') to exactly preserve pre-existing
+                % behaviour, where any regularisation was implicitly TV/surfaceTV,
+                % gated only on fitting.lambda{1}>0. 'none' is still expressed by
+                % lambda{1}==0 elsewhere and does not need a separate flag value here.
+                % =====================================================================
+                if ~isfield(fitting,'regularisationType');  fitting2.regularisationType = 'TV';              end
+                if ~ismember(lower(fitting2.regularisationType), {'tv','prior'})
+                    error('GACELLE:invalidRegularisationType', ...
+                        "fitting.regularisationType must be 'TV' or 'prior', got '%s'.", fitting2.regularisationType);
+                end
+
             end
 
 
@@ -909,7 +1140,169 @@ classdef gpuNEXI < handle
             if ~isfield(fitting,'lmax');                fitting2.lmax               = 0;                end
             if ~isfield(fitting,'start');               fitting2.start              = 'likelihood';     end
 
-            
+            % =====================================================================
+            % Data geometry: 'volumetric' (default) | 'surface'
+            % 'surface' bypasses fitting.TVmode entirely - TVmode only selects the
+            % axis convention for the built-in volumetric TV operator, and surface
+            % regularisation is dispatched through a separate custom-function path
+            % (surface_total_variation) regardless of what TVmode is set to.
+            % =====================================================================
+            if ~isfield(fitting,'dataType');            fitting2.dataType           = 'volumetric';     end
+            if ~ismember(lower(fitting2.dataType), {'volumetric','surface'})
+                error('GACELLE:invalidDataType', ...
+                    "fitting.dataType must be 'volumetric' or 'surface', got '%s'.", fitting2.dataType);
+            end
+            if strcmpi(fitting2.dataType, 'surface') && ~isempty(fitting2.NSegmentUser)
+                if fitting2.NSegmentUser > 2
+                    fitting2.NSegmentUser = 2;
+                    warning('GACELLE:invalidNSegmentUser', ...
+                    "fitting.NSegmentUser must be <= 2 for surface-based estimation, got '%s'. Set to 2 instead.", fitting2.NSegmentUser);
+                end
+            end
+        end
+
+        
+        function loss_reg = surface_total_variation(parameters, mask, neighbours, lambda, regmap, edgeLength)
+        % loss_reg = surface_total_variation(parameters, mask, neighbours, lambda, regmap, edgeLength)
+        %
+        % Input
+        % --------------
+        % parameters    : structure variable containing the model parameters (same as forward model function)
+        % mask          : 3D mask, [1,Nvertex,Nhemi]
+        % neighbours    : [1,Nvertex,Nhemi,maxNeighbours] per-hemisphere-LOCAL vertex indices
+        %                  (see utils.get_surface_neighbours; NOT global linear indices)
+        % lambda        : 1D cell array of regularisation parameter
+        % regmap        : 1D cell array of the names of the parameter maps where TV applies to
+        % edgeLength    : [1,Nvertex,Nhemi,maxNeighbours] scalar Euclidean edge length to each
+        %                  neighbour, precomputed once by utils.get_surface_neighbours (fixed
+        %                  mesh geometry - not recomputed here on every optimiser iteration)
+        %
+        % Output
+        % --------------
+        % loss_reg      : regularisation loss
+        %
+        % Description: distance-normalised surface total variation regularisation loss,
+        % i.e. sum over mesh edges of |theta(vi)-theta(vj)| / ||vi-vj||. Padding entries
+        % (self-indexed neighbours, from ragged per-vertex neighbour counts) have
+        % ||vi-vj|| = 0 by construction and are excluded from the sum.
+        %
+        % Note: this is a distance-weighted regulariser, not the unweighted absolute
+        % difference stated in Eq. 5 of the manuscript - Eq. 5 needs updating to match
+        % if this is the version being reported, and lambda should be re-tuned after
+        % this change since the loss scale differs from the unweighted/per-axis forms
+        % previously used.
+        
+        % Kwok-Shing Chan @ MGH
+        % kchan2@mgh.harvard.edu
+        %
+        % Date created: 11 April 2025
+        % Date modified: 3 July 2026 (takes precomputed scalar edgeLength directly
+        %                 instead of the per-axis dr vector, so the sqrt(sum(dr.^2,5))
+        %                 reduction happens once in utils.get_surface_neighbours rather
+        %                 than once per optimiser iteration inside this loss function;
+        %                 also replaces the earlier per-axis dx/dy/dz division, which
+        %                 spuriously produced Inf for any edge that happened to be
+        %                 axis-aligned on one coordinate - a real, not-rare occurrence
+        %                 on a curved mesh, silently discarding those edges from every
+        %                 loss evaluation; fixed neighbour indexing to use global
+        %                 linear indices across hemispheres, since neighbours holds
+        %                 per-hemisphere-local indices but was being used directly as a
+        %                 linear index into the full [1,Nvertex,Nhemi] theta array,
+        %                 silently reading hemisphere-1 data for every hemisphere;
+        %                 replaced isnan/isinf boolean compaction - whose OUTPUT LENGTH
+        %                 varies with how many entries are invalid - with in-place
+        %                 zeroing, since dlaccelerate requires every intermediate
+        %                 tensor's shape to stay fixed across calls to a cached trace,
+        %                 and a shape-varying selection breaks that the moment the
+        %                 invalid-entry count differs from the traced call
+        %
+
+        % regularisation term
+        loss_reg = 0;
+        if lambda{1} > 0
+            Nsample  = numel(mask(mask ~= 0));
+            Nvertex  = size(mask, 2);
+            Nhemi    = size(mask, 3);
+        
+            % neighbours holds per-hemisphere-LOCAL vertex indices (1:Nvertex, reset
+            % for every hemisphere) - convert to global linear indices into the full
+            % [1,Nvertex,Nhemi] theta array before using them to index theta directly.
+            % No-op when Nhemi==1 (e.g. inside a per-hemisphere-segmented fit()).
+            hemiOffset       = reshape((0:Nhemi-1) * Nvertex, 1, 1, []);
+            neighboursGlobal = neighbours + hemiOffset;
+        
+            for kreg = 1:numel(lambda)
+        
+                theta               = utils.reshape_GD2ND(parameters.(regmap{kreg}),mask);
+                thetaNeighbours     = zeros(size(neighbours), "like",theta);
+                thetaNeighbours(:)  = theta(neighboursGlobal(:));
+        
+                dthetadr = (theta - thetaNeighbours) ./ edgeLength;
+        
+                % zero invalid entries in place rather than compacting them out, so
+                % size(dthetadr) stays fixed across calls - required for dlaccelerate
+                % to safely reuse a cached trace (see header note above)
+                invalid              = ~isfinite(dthetadr);
+                dthetadr(invalid)    = 0;
+                dthetadr             = utils.reshape_ND2GD(dthetadr,mask);
+        
+                loss_reg = sum(abs(dthetadr(:)))/Nsample*lambda{kreg} + loss_reg;
+        
+            end
+        end
+        
+        end
+
+        function loss_reg = prior_distribution_normal(parameters, mask, lambda, regmap, mu, sigma)
+        % loss_reg = prior_distribution_normal(parameters, mask, lambda, regmap, mu, sigma)
+        %
+        % Input
+        % --------------
+        % parameters    : structure variable containing the model parameters (same as forward model function)
+        % mask          : signal mask, 3D [x,y,z] (volumetric) or [1,Nvertex,Nhemi] (surface)
+        % lambda        : 1D cell array of regularisation parameter
+        % regmap        : 1D cell array of the names of the parameter maps where the prior applies to
+        % mu            : structure variable containing the mean of model parameters distribution,
+        %                  one field per name in regmap, same spatial shape as mask
+        % sigma         : structure variable containing the SD of model parameters distribution,
+        %                  one field per name in regmap, same spatial shape as mask
+        %
+        % Output
+        % --------------
+        % loss_reg      : regularisation loss
+        %
+        % Description: penalises deviation of each regmap parameter map from an externally
+        % supplied (e.g. group-level, registered) mean/SD prior, in z-score units. Geometry
+        % agnostic - works for both 'volumetric' and 'surface' fitting.dataType, since
+        % utils.reshape_GD2ND/mask handles both mask conventions identically to the forward
+        % model. Ported from the standalone prior_distribution_normal.m used previously only
+        % via the surface-only gpuNEXI_priorDistribution.m; folded in here so both dataTypes
+        % share the same fit()/slice_segment()/segmentation machinery instead of a separate
+        % model class. mu/sigma are only ever populated (gpu-converted, sliced per segment)
+        % for the fields listed in regmap - see fit() and slice_extradata_recursive().
+        %
+        % Kwok-Shing Chan @ MGH
+        % kchan2@mgh.harvard.edu
+        % Date created: 11 April 2025
+        % Date modified: 6 July 2026 (folded into gpuNEXI.m as a static method so it shares
+        %                 segmentation/slicing with the volumetric and surface paths; fixed
+        %                 a caller-side bug where mu/sigma were gpu-converted by looping
+        %                 over this.modelParams instead of fitting.regmap - see fit())
+
+        % regularisation term
+        loss_reg = 0;
+        if lambda{1} > 0
+            Nsample = numel(mask(mask ~= 0));
+
+            for kreg = 1:numel(lambda)
+
+                theta  = utils.reshape_GD2ND(parameters.(regmap{kreg}), mask);
+                zscore = (theta - mu.(regmap{kreg})) ./ sigma.(regmap{kreg});
+
+                loss_reg = sum(abs(zscore(and(~isnan(zscore),~isinf(zscore)))))/Nsample*lambda{kreg} + loss_reg;
+
+            end
+        end
 
         end
 

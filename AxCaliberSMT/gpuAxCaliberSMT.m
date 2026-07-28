@@ -338,13 +338,11 @@ classdef gpuAxCaliberSMT < handle
             % 2.3 optimisation main
             switch fitting.solver
                 case 'askadam'
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation( data, mask, w, pars0, fitting, @this.FWD, fitting.model, fitting.solver);
+                    out         = askadam().optimisation( data, mask, w, pars0, fitting, @this.FWD, fitting.model, fitting.solver);
                 case 'mcmc'
                     fitting.xStepSize = this.step;
                     
-                    mcmcObj     = mcmc(); 
-                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.model, fitting.solver);
+                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.model, fitting.solver);
             end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
@@ -512,7 +510,7 @@ classdef gpuAxCaliberSMT < handle
         function pars0 = estimate_prior(this,dwi,mask, Nsample)
         % Estimation starting points for NEXI using likehood method
 
-            rng(this.seed); % for reproducible dictionary
+            rng('default');rng(this.seed); % for reproducible dictionary
 
             bval = gather(this.b);
 
@@ -762,8 +760,13 @@ classdef gpuAxCaliberSMT < handle
             bm2_tmp     = shiftdim(bm2_tmp,-(ndims(r)-1));
             % bm2_tmp     = permute(bm2_tmp(:),[2 3 1]);
 
+            % if ~isscalar(r)
             s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part1,r,bm2_tmp,this.delta,this.Delta,this.D0);
             s = arrayfun(@AxCaliberSMT_vanGelderen_decay_part2,sum(s,ndims(bm2_tmp)),r,this.D0,this.g);
+            % else
+            %     s = AxCaliberSMT_vanGelderen_decay_part1(r,bm2_tmp,this.delta,this.Delta,this.D0);
+            %     s = AxCaliberSMT_vanGelderen_decay_part2(sum(s,ndims(bm2_tmp)),r,this.D0,this.g);
+            % end
             
         end
 

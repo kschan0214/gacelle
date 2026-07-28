@@ -119,7 +119,7 @@ classdef gpuMCRMWI < handle
                 if isfield(fixed_params,'B0');          this.B0             = single(fixed_params.B0);              end
                 if isfield(fixed_params,'B0dir');       this.B0dir          = single(fixed_params.B0dir);           end
                 if isfield(fixed_params,'t1_mw');       this.t1_mw          = single(fixed_params.t1_mw);           end
-                if isfield(fixed_params,'thres_R2s');   this.thres_R2star   = single(fixed_params.thres_R2star);    end
+                if isfield(fixed_params,'thres_R2star');this.thres_R2star   = single(fixed_params.thres_R2star);    end
                 if isfield(fixed_params,'thres_T1');    this.thres_T1       = single(fixed_params.thres_T1);        end
             end
         end
@@ -409,8 +409,7 @@ classdef gpuMCRMWI < handle
             switch fitting.solver
                 case 'askadam'
 
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
+                    out         = askadam().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
                     
                     if fitting.isComplex
                         out.final.dfreqBKG  = permute(out.final.dfreqBKG,[1 2 3 5 4]);
@@ -420,9 +419,8 @@ classdef gpuMCRMWI < handle
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    mcmcObj     = mcmc();
                     % 3.1. initial global optimisation
-                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
+                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting, extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
 
                     % if fitting.isComplex
                     %     out.final.dfreqBKG  = permute(out.final.dfreqBKG,[1 2 3 5 4]);

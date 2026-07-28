@@ -283,13 +283,11 @@ classdef gpuSANDI < handle
             % 2.3 askAdam optimisation main
             switch fitting.solver
                 case 'askadam'
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
+                    out         = askadam().optimisation( dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    mcmcObj     = mcmc(); 
-                    out         = mcmcObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
+                    out         = mcmc().optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
             end
             
 

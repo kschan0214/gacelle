@@ -395,13 +395,11 @@ classdef gpuMEAxCaliberSMT < handle
             % 2.3 optimisation main
             switch fitting.solver
                 case 'askadam'
-                    askadamObj  = askadam();
-                    out         = askadamObj.optimisation( data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+                    out         = askadam().optimisation( data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
                 case 'mcmc'
                     fitting.xStepSize = this.step;
                     
-                    mcmcObj     = mcmc(); 
-                    out         = mcmcObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
             end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%

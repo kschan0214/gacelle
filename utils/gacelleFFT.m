@@ -16,6 +16,14 @@ classdef gacelleFFT
 
     methods(Static)
 
+        function output = fft3s_(input)
+            output = fft(fft(fft(input,[],1),[],2),[],3);
+        end
+        
+        function output = ifft3s_(input)
+            output = ifft(ifft(ifft(input,[],1),[],2),[],3);
+        end
+
         % Apply 1D FFT to the specified dimension
         function output = fft(input,dim)
         % 

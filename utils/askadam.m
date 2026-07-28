@@ -217,6 +217,16 @@ classdef askadam < handle
             parameters_prev              = parameters;
             gradNorm_curr                = Inf;
             epochsWithoutImprovementGrad = 0;
+
+            % Convergence-mask freeze state (robustConvergence path only).
+            % mainMask_conv is the voxel set the convergence signal is computed over.
+            % It is refreshed only on convergenceWindow boundaries (not every
+            % weightUpdateInterval), so no linear-slope/EMA window ever straddles a
+            % membership change. convReprimeCount counts down the epochs after a
+            % refresh during which the buffer is still repopulating with the new
+            % set; convergence cannot fire while it is > 0.
+            mainMask_conv                = true(1, Nvol);   % [1 x Nvol], CPU
+            convReprimeCount             = 0;
             
             % --- 2.8 Robust convergence state ---
             % mainMask, outlierFlagCount, perVoxelLossHistory always initialised
@@ -260,10 +270,15 @@ classdef askadam < handle
                     %%%%%%%%%%%%%%%%%%%% 3.3. Outlier detection and weight update %%%%%%%%%%%%%%%%%%%%
                     [mainMask, weights, outlierFlagCount, perVoxelLossHistory, perVoxelLoss] = this.update_outlier_mask(residuals, perVoxelLossInit, mainMask, outlierFlagCount, ...
                                                                                                                             perVoxelLossHistory, weights_original, Nmeas, Nvol, epoch, fitting);
-
+                    % %%%%%%%%%%%%%%%%%%%% DIAGNOSTIC: robustConvergence mainMask tracking %%%%%%%%%%%%%%%%%%%%
+                    % if fitting.robustConvergence
+                    %     fprintf('DIAG epoch %4d | mainMask %5d/%5d (%5.1f%%) | mean loss (main) = %.6e | mean loss (full) = %.6e | full-population loss = %.6e\n', ...
+                    %         epoch, sum(mainMask), Nvol, 100*sum(mainMask)/Nvol, ...
+                    %         mean(perVoxelLoss(mainMask)), mean(perVoxelLoss), loss);
+                    % end
                     %%%%%%%%%%%%%%%%%%%% 3.4. Convergence signals %%%%%%%%%%%%%%%%%%%%
                     [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, ...
-                         epochsWithoutImprovementGrad, gradNorm_curr] = this.update_convergence_signals(loss, mainMask, perVoxelLoss, ...
+                         epochsWithoutImprovementGrad, gradNorm_curr, mainMask_conv, convReprimeCount] = this.update_convergence_signals(loss, mainMask, mainMask_conv, convReprimeCount, perVoxelLoss, ...
                                                                                                             parameters, parameters_prev, gradients, ema_loss, convergenceBuffer, ...
                                                                                                             epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, ...
                                                                                                             epochsWithoutImprovementGrad, gradNorm_curr, minLoss, epoch, fitting);
@@ -288,9 +303,11 @@ classdef askadam < handle
             %%%%%%%%%%%%%%%%%%%%%%%%%% 4. Finalisation %%%%%%%%%%%%%%%%%%%%%%%%%%
             % display final message
             if fitting.iteration > 0
+                D   = duration(0, 0, toc(start), 'Format', 'hh:mm:ss');
                 fprintf('Final loss         =  %e\n',double(loss));
                 fprintf('Final convergence  =  %e\n',double(convergenceCurr));
                 fprintf('Final #iterations  =  %d\n',epoch);
+                fprintf('Total Elapsed time =  %s\n', string(D));
             end
             % make sure the final results stay within boundary (linear mode only;
             % sigmoid mode guarantees bounds via sigmoid recovery so clamping is not needed)
@@ -311,9 +328,15 @@ classdef askadam < handle
                 % final iteration result
                 % if ~isscalar(parameters.(fitting.modelParams{k}))
                 if isequal(size(parameters.(fitting.modelParams{k}),1:3),size(mask))
-                    tmp = utils.dlarray2single(parameters.(fitting.modelParams{k}) .* mask); 
-                    % minimum loss result
-                    tmp2 = utils.dlarray2single(parameters_minLoss.(fitting.modelParams{k}) .* mask); 
+                    if fitting.isMaskedOut
+                        tmp = utils.dlarray2single(parameters.(fitting.modelParams{k}) .* mask); 
+                        % minimum loss result
+                        tmp2 = utils.dlarray2single(parameters_minLoss.(fitting.modelParams{k}) .* mask); 
+                    else
+                        tmp = utils.dlarray2single(parameters.(fitting.modelParams{k})); 
+                        % minimum loss result
+                        tmp2 = utils.dlarray2single(parameters_minLoss.(fitting.modelParams{k})); 
+                    end
                 else
                     tmp = utils.dlarray2single(parameters.(fitting.modelParams{k}));
                     % minimum loss result
@@ -486,24 +509,63 @@ classdef askadam < handle
             end
         end
 
-        function [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, epochsWithoutImprovementGrad, gradNorm_curr] = update_convergence_signals(this, loss, mainMask, perVoxelLoss, ...
+        function [convergenceCurr, ema_loss, convergenceBuffer, epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, parameters_prev, epochsWithoutImprovementGrad, gradNorm_curr, mainMask_conv, convReprimeCount] = update_convergence_signals(this, loss, mainMask, mainMask_conv, convReprimeCount, perVoxelLoss, ...
                                                                                                                                                                                                                                     parameters, parameters_prev, gradients, ema_loss, convergenceBuffer, ...
                                                                                                                                                                                                                                     epochsWithoutImprovementConv, epochsWithoutImprovementStep, stepNorm_curr, ...
                                                                                                                                                                                                                                     epochsWithoutImprovementGrad, gradNorm_curr, minLoss, epoch, fitting)
             % Compute all active convergence signals and update their patience counters.
             %
-            % Signal 1 (always active): loss-based convergence via linear slope or EMA,
-            %   computed on main population loss if robustConvergence, else global loss.
+            % Signal 1 (always active): loss-based convergence via linear slope or EMA.
+            %   robustConvergence = false : computed on the full-population loss (original,
+            %       unchanged behaviour).
+            %   robustConvergence = true  : computed on the main (non-outlier) population,
+            %       so that a small number of persistently poorly-fitting voxels do not
+            %       drive the stopping decision for the well-behaved majority.
             % Signal 2 (optional): relative parameter step norm, analogous to StepTolerance
             %   in lsqnonlin. Active when fitting.convergenceStepTol > 0.
             % Signal 3 (optional): raw gradient norm before Adam correction.
             %   Active when fitting.convergenceGradTol > 0.
         
             % --- signal 1: loss-based ---
-            if fitting.robustConvergence
-                loss_convergence = mean(perVoxelLoss(mainMask));  % use precomputed perVoxelLoss
-            else
+            if ~fitting.robustConvergence
+                % Original behaviour: full-population loss, untouched.
                 loss_convergence = loss;
+            else
+                % Robust behaviour (mask-freeze scheme).
+                %
+                % The convergence signal must exclude outlier voxels, but the outlier
+                % set (mainMask) is refreshed every weightUpdateInterval epochs by
+                % update_outlier_mask. Feeding a loss computed over a set that changes
+                % mid-window into the windowed linear-slope/EMA check injects level-shift
+                % discontinuities that can corrupt (including sign-flip) the fitted slope
+                % and trigger false-positive convergence (observed 2026-07-10).
+                %
+                % Fix: hold the convergence voxel set (mainMask_conv) fixed and only
+                % refresh it on convergenceWindow boundaries when the outlier set has
+                % actually changed, so no window ever straddles a membership change. On
+                % each refresh the loss level shifts (different set), so the slope buffer
+                % is repriming for the next convergenceWindow epochs, during which
+                % convergence is not allowed to fire (convReprimeCount).
+                %
+                % Outlier voxels are still updated every iteration (downweighted, not
+                % frozen) via update_outlier_mask; they are only excluded from the
+                % convergence *decision*, not from optimisation.
+                %
+                % The "actually changed" guard matters: refreshing unconditionally every
+                % convergenceWindow epochs would re-arm convReprimeCount before it clears,
+                % gating the convergence test permanently. When mainMask is stable (the
+                % common case once outliers settle), there is no level discontinuity to
+                % protect against, so mainMask_conv is left untouched and the slope/EMA
+                % window runs normally.
+                % Known limitation: if the outlier set never settles (voxels oscillating
+                % in and out of the flagged set at every boundary), the reprime gate can
+                % stay armed and convergence will only stop on max iterations. Add a
+                % change-magnitude tolerance here if that failure mode is observed.
+                if mod(epoch, fitting.convergenceWindow) == 0 && ~isequal(mainMask, mainMask_conv)
+                    mainMask_conv    = mainMask;                    % adopt current outlier set
+                    convReprimeCount = fitting.convergenceWindow;   % buffer must refill for new set
+                end
+                loss_convergence = mean(perVoxelLoss(mainMask_conv));
             end
         
             switch fitting.convergenceModel
@@ -513,9 +575,21 @@ classdef askadam < handle
                     [convergenceCurr, convergenceBuffer]    = this.update_convergence([convergenceBuffer(2:end); loss_convergence]);
             end
         
-            if convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
+            % While the convergence buffer is repriming after a mask refresh, the
+            % windowed slope/EMA spans a level discontinuity and is not trustworthy;
+            % hold the patience counter at zero until the window is clean again.
+            if convReprimeCount > 0
+                convReprimeCount             = convReprimeCount - 1;
                 epochsWithoutImprovementConv = 0;
-            elseif (minLoss - loss) > fitting.convergenceValue
+            elseif convergenceCurr > fitting.convergenceValue || epoch <= fitting.convergenceWindow
+                epochsWithoutImprovementConv = 0;
+            elseif ~fitting.robustConvergence && (minLoss - loss) > fitting.convergenceValue
+                % Full-population minLoss override. Retained unchanged for the
+                % non-robust path. Deliberately NOT applied in the robust path: it
+                % uses the full loss (outliers included) and would reintroduce the
+                % outlier coupling that the main-population convergence signal exists
+                % to remove. In the robust path the frozen main-population slope/EMA
+                % above already carries the "still improving?" signal.
                 epochsWithoutImprovementConv = 0;
             else
                 epochsWithoutImprovementConv = epochsWithoutImprovementConv + 1;
@@ -567,13 +641,8 @@ classdef askadam < handle
             % loss convergence
             if epochsWithoutImprovementConv > fitting.patienceConvergence
                 doStop = true;
-                if fitting.robustConvergence
-                    stopMsg = sprintf('Optimisation is done. Main population loss convergence below tolerance %e (patience %d).\n', ...
-                        fitting.convergenceValue, fitting.patienceConvergence);
-                else
-                    stopMsg = sprintf('Optimisation is done. Loss convergence below tolerance %e (patience %d).\n', ...
-                        fitting.convergenceValue, fitting.patienceConvergence);
-                end
+                stopMsg = sprintf('Optimisation is done. Loss convergence below tolerance %e (patience %d).\n', ...
+                    fitting.convergenceValue, fitting.patienceConvergence);
                 return
             end
         
@@ -636,13 +705,10 @@ classdef askadam < handle
             msg = sprintf('Iteration #%4d | Loss = %.3e (fidelity = %.3e, reg = %.3e) | LR = %.3e', ...
                 epoch, loss, loss_fidelity, loss_reg, learningRate);
         
+            msg = [msg sprintf(' | Conv = %.3e [patience %d/%d]', ...
+                convergenceCurr, epochsWithoutImprovementConv, fitting.patienceConvergence)];
             if fitting.robustConvergence
-                msg = [msg sprintf(' | Conv (main, n=%d) = %.3e [patience %d/%d]', ...
-                    sum(mainMask), convergenceCurr, epochsWithoutImprovementConv, fitting.patienceConvergence)];
-                msg = [msg sprintf(' | Outliers = %d/%d', sum(~mainMask), Nvol)];
-            else
-                msg = [msg sprintf(' | Conv = %.3e [patience %d/%d]', ...
-                    convergenceCurr, epochsWithoutImprovementConv, fitting.patienceConvergence)];
+                msg = [msg sprintf(' | Outliers = %d/%d (downweighted, gradient only)', sum(~mainMask), Nvol)];
             end
         
             if fitting.convergenceStepTol > 0
@@ -746,7 +812,7 @@ classdef askadam < handle
             % downweights their gradient contribution. Convergence signal is computed
             % on the main (non-outlier) population only.
             % =====================================================================
-            if ~isfield(fitting,'robustConvergence');      fitting2.robustConvergence      = true;         end
+            if ~isfield(fitting,'robustConvergence');      fitting2.robustConvergence      = false;        end
             if ~isfield(fitting,'outlierThresholdMethod'); fitting2.outlierThresholdMethod = 'behaviour';  end  % placeholder for future options
             if ~isfield(fitting,'outlierWeight');          fitting2.outlierWeight          = 0.1;          end  % gradient contribution of outlier voxels
             if ~isfield(fitting,'weightUpdateInterval');   fitting2.weightUpdateInterval   = 5;            end  % iterations between outlier mask updates
@@ -793,6 +859,7 @@ classdef askadam < handle
             if ~isfield(fitting,'lb');             fitting2.lb             = [];        end
             if ~isfield(fitting,'debug');          fitting2.debug          = false;     end
             if ~isfield(fitting,'isDisplay');      fitting2.isDisplay      = 0;     end
+            if ~isfield(fitting,'isMaskedOut');    fitting2.isMaskedOut    = true; end
             
             % =====================================================================
             % Deprecated (kept for backward compatibility, will be removed in v1.2)

@@ -6,7 +6,7 @@ clear;
 
 % for reproducibility
 seed        = 23439; rng(seed);
-Nsample     = 1e4;  % #voxel
+Nsample     = 1e3;  % #voxel
 SNR         = 100;
 
 Nt  = 15; 

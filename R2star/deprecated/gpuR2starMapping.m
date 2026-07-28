@@ -2,56 +2,28 @@ classdef gpuR2starMapping < handle
 % This is the method to perform joint R1-R2* mapping using variable flip angle (vFA), multiecho GRE (mGRE) data
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 5 April 2024
-% Date modified: 25 September 2024
-% Date modified: 10 June 2026 (update memory manager, support MCMC under same script)
-
-    properties (GetAccess = public, SetAccess = protected)
-    % ===== MODEL PARAMETER CONTRACT =====
-    % M0        : Proton density weighted signal
-    % R2star    : R2* in s^-1   
-    % noise     : noise
-    %
-    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
-    % These five arrays MUST stay the same length and index-aligned.
-    % Mutate only as a set, via updateProperty() - never assign into a
-    % single element from outside the class, or these will desync.
-    %
-    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
-    % updateProperty() can strip it by name without hardcoding an index,
-    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
-    % future solver-conditional parameter should likewise go last.
-        modelParams    = {'M0';'R2star';'noise'};
-        ub              = [   2;    200;    0.1];
-        lb              = [   0;    0.1;  0.001];
-        startPoint      = [   1;     30;   0.05];
-        step            = [0.01;      1;  0.005];
-    end
-
-    properties
-    % ===== USER-TUNABLE OPTIONS =====
-    % Freely settable by users before fitting; no coupling between these.
-        thres_similarity    = 0.1; 
-        thres_impossible    = 0.1;
-        thres_bkg           = 0.01;
-
-        seed = 48463;   % for reproducible random number generation
-
-        epsilon = utils.epsilon;
-    end
-
-    properties (GetAccess = public, SetAccess = protected)
-    % ===== ACQUISITION PARAMETERS =====
-    % Set once in the constructor from user-provided acquisition info.
-    % Read-only after construction.
-        te;
-        B0      = 3;
-    end
+% Date created: 23 June 2025
+% Date modified: 
 
     properties
         % default model parameters and estimation boundary
+        % S0    : Proton density weighted signal
+        % R1    : (=1/T1) in s^-1
+        % R2star: R2* in s^-1   
+        % modelParams     = {'S0';'R2star';'SNR'};
+        % ub              = [  2;      500;   70];
+        % lb              = [  0;      0.1;  0.1];
+        % startPoint      = [  1;      30;    10];
+        modelParams     = {'S0';'R2star';'sigma'};
+        ub              = [  2;      500;   4];
+        lb              = [  0;      0.1;  0.01];
+        startPoint      = [  1;      30;    0.1];
     end
 
+    properties (GetAccess = public, SetAccess = protected)
+        te;
+    end
+    
     methods
 
         % constructuor
@@ -60,13 +32,32 @@ classdef gpuR2starMapping < handle
             this.te = single(te(:));
 
         end
+
+        % update properties according to lmax
+        function this = updateProperty(this, fitting)
+
+            dt = diff(this.te);
+
+            this.ub(2) = min(1/min(dt) * 3, this.ub(2));
+            this.lb(2) = max(1/max(this.te) /20, this.lb(2));
+
+            % Rician noise or not
+            if ~fitting.isRician
+                idx = find(ismember(this.modelParams,'sigma'));
+                this.modelParams(idx)     = [];
+                this.lb(idx)              = [];
+                this.ub(idx)              = [];
+                this.startPoint(idx)      = [];
+            end
+
+        end
         
         % display some info about the input data and model parameters
         function display_data_model_info(this)
 
-            disp('==========================');
-            disp('R2* mapping with mGRE data');
-            disp('==========================');
+            disp('========================================================');
+            disp('R2* mapping with Rician noise data - askAdam solver');
+            disp('========================================================');
 
             
             disp('----------------')
@@ -77,24 +68,9 @@ classdef gpuR2starMapping < handle
 
         end
 
-        % update properties according to lmax
-        function this = updateProperty(this, fitting)
-
-            % property change in related to solver
-            if ~strcmpi(fitting.solver,'mcmc')
-                idx = find(ismember(this.modelParams,'noise'));
-                this.modelParams(idx)       = [];
-                this.lb(idx)                = [];
-                this.ub(idx)                = [];
-                this.startPoint(idx)        = [];
-                this.step(idx)              = [];
-            end
-
-        end
-
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out] = estimate(this, data, mask, fitting)
+        function  [out] = estimate(this, data, mask, extraData, fitting)
         % Perform joint R1 and R2* model parameter estimation using askAdam
         % Input data are expected in multi-dimensional image format
         % 
@@ -109,7 +85,7 @@ classdef gpuR2starMapping < handle
         % Output
         % -----------
         % out       : output structure contains all estimation results
-        % M0        : Proton desity weighted signal
+        % S0        : Proton desity weighted signal
         % R1        : R1 map
         % R2star    : R2* map
         % 
@@ -118,74 +94,69 @@ classdef gpuR2starMapping < handle
             this.display_data_model_info;
             
             % get all fitting algorithm parameters 
-            fitting                     = this.check_set_default(fitting);
+            fitting             = this.check_set_default(fitting);
+
+            % get matrix size
+            dims = size(data,1:3);
+
+            % make sure input data are valid
+            [mask,extraData]    = this.validate_input(data,mask,extraData);
 
             % normalised data if needed
-            [data, mask, scaleFactor]   = this.prepare_data( data, mask);
+            [data, scaleFactor] = this.prepare_data(data,mask);
+
+            % mask sure no nan or inf
+            [data,mask] = utils.remove_img_naninf(data,mask);
 
             % convert datatype to single
             data    = single(data);
             mask    = mask > 0;
 
-            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
-            
-            % --- [Experimental] estimate memory usage using a small batch of data size ---
-            % this method tends to be more conservative than the actual memory ussage
-            [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting);
+            % determine if we need to divide the data to fit in GPU
+            g = gpuDevice; reset(g);
+            memoryFixPerVoxel       = 0.0013/3;   % get this number based on mdl fit
+            memoryDynamicPerVoxel   = 0.05/3;     % get this number based on mdl fit
+            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
 
             % parameter estimation
-            out = [];
-            for kseg = 1:NSegment
-                
-                if NSegment > 1
-                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
-                    disp   ('------------------------')
-                end
+            out     = [];
+            for ks = 1:NSegment
+
+                fprintf('Running #Segment = %d/%d \n',ks,NSegment);
+                disp   ('------------------------')
     
-                % divide the data; fitRange includes halo slices (if any), ownedRange
-                % is what this segment is responsible for writing back
-                fitRange                        = seg(kseg).fit;
-                ownedRange                      = seg(kseg).owned;
-                [dataSeg, maskSeg]              = this.slice_segment(data, mask, fitRange);
+                % determine slice# given a segment
+                if ks ~= NSegment
+                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
+                else
+                    slice = 1+(ks-1)*maxSlice : dims(3);
+                end
+                
+                % divide the data
+                data_tmp    = data(:,:,slice,:,:);
+                mask_tmp    = mask(:,:,slice);
+                % fields      = fieldnames(extraData); for kfield = 1:numel(fields); extraData_tmp.(fields{kfield}) = extraData.(fields{kfield})(:,:,slice,:,:,:,:); end
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting);
-
-                % discard halo slices from this segment's output before restoring,
-                % so segment boundaries never keep voxels from a neighbour's
-                % independently-converged fit (no-op when seg(kseg).fit == .owned)
-                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
+                [out_tmp] = this.fit(data_tmp,mask_tmp,fitting);
+                % [out_tmp] = this.fit(data_tmp,mask_tmp,fitting,extraData_tmp);
 
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
+                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
 
             end
-            out.mask = mask;
-            %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
+            out.mask        = mask;
+            out.min.S0      = out.min.S0 * scaleFactor; % undo scaling
+            out.final.S0    = out.final.S0 * scaleFactor; % undo scaling
 
             % save the estimation results if the output filename is provided
-            % askadam.save_askadam_output(fitting.outputFilename,out)
-            switch fitting.solver
-                case 'askadam'
-
-                    out.min.M0      = out.min.M0 * scaleFactor; % undo scaling
-                    out.final.M0    = out.final.M0 * scaleFactor; % undo scaling
-
-                    askadam.save_askadam_output(fitting.outputFilename,out)
-                case 'mcmc'
-
-                    % rescale M0
-                    for k = 1:numel(fitting.metric)
-                        out.(fitting.metric{k}).M0 = out.(fitting.metric{k}).M0 *scaleFactor;
-                    end
-                    out.posterior.M0 = out.posterior.M0 *scaleFactor;
-                    mcmc.save_mcmc_output(fitting.outputFilename,out)
-            end
+            askadam.save_askadam_output(fitting.outputFilename,out)
 
         end
 
         % Data fitting function, can be 3D (voxel-based) or 5D (image-based)
         function [out] = fit(this, data, mask, fitting)
+        % function [out] = fit(this, data, mask, fitting, extraData)
         %
         % Input
         % -----------
@@ -223,6 +194,9 @@ classdef gpuR2starMapping < handle
         %
         %
             
+            % check GPU
+            gpool = gpuDevice;
+            
             % get image size
             dims = size(data,1:3);
 
@@ -232,6 +206,7 @@ classdef gpuR2starMapping < handle
 
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
+            this                    = this.updateProperty(fitting);
             % determine fitting parameters
             fitting.modelParams     = this.modelParams;
             % set fitting boundary if no input from user
@@ -250,27 +225,18 @@ classdef gpuR2starMapping < handle
             % 2.2 display optimisation algorithm parameters
             this.display_algorithm_info(fitting)
 
-
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
-            % 2.3 askAdam optimisation main
-            switch fitting.solver
-                case 'askadam'
-
-                    out         = askadam().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
-
-                case 'mcmc'
-                    fitting.xStepSize = this.step;
-
-                    % 3.1. initial global optimisation
-                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver, fitting);
-                    
-            end
+            % 3. askAdam optimisation main
+            askadamObj  = askadam();
+            % 3.1. initial global optimisation
+            % extraData   = utils.gpu_reshape_ND2GD_struct(extraData,mask);
+            out         = askadamObj.optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.isRician);
 
             disp('The process is completed.')
             
             % clear GPU
-            reset(gpuDevice)
+            reset(gpool)
             
         end
         
@@ -318,6 +284,8 @@ classdef gpuR2starMapping < handle
 
             dims = size(data,1:3);
 
+            defaultSNR = 10;
+
             for k = 1:numel(this.modelParams)
                 pars0.(this.modelParams{k}) = single(this.startPoint(k)*ones(dims));
             end
@@ -326,13 +294,17 @@ classdef gpuR2starMapping < handle
             
             start = tic;
             % R2* closed-form solution
-            R2s0            = this.R2star_trapezoidal(mean(abs(data),5),this.te);
+            [R2s0,S00]            = this.R2star_trapezoidal(mean(abs(data),5),this.te);
             mask_valid = and(~isnan(R2s0),~isinf(R2s0));
-            R2s0(mask_valid == 0) = this.lb(3); R2s0(R2s0<this.lb(2)) = this.lb(3); R2s0(R2s0>this.ub(2)) = this.ub(2);
+            R2s0(mask_valid == 0) = this.lb(2); R2s0(R2s0<this.lb(2)) = this.lb(2); R2s0(R2s0>this.ub(2)) = this.ub(2);
 
             % always follow the order specified in the beginning of the file
-            pars0.(this.modelParams{1}) = single(abs(data(:,:,:,1))); 
+            pars0.(this.modelParams{1}) = single(S00); 
             pars0.(this.modelParams{2}) = single(R2s0);
+            if numel(this.modelParams) > 2
+                pars0.(this.modelParams{3}) = single(S00./defaultSNR);
+            end
+            % pars0 = cat(4, S00, R10, r2s0);
 
             ET  = duration(0,0,toc(start),'Format','hh:mm:ss');
             fprintf('Starting points estimated. Elapsed time (hh:mm:ss): %s \n',string(ET));
@@ -340,71 +312,40 @@ classdef gpuR2starMapping < handle
         end
 
         %% Signal related functions
-
         % compute the forward model
-        function [s] = FWD(this, pars, solver, fitting)
-
-            if nargin < 3
-                solver = [];
-            end
-            if nargin < 4
-                fitting = [];
-            end
+        function [s] = FWD(this, pars, isRician)
             
-            TE  =  permute(this.te,[2 3 4 1]); % TE in 4th dimension
+            TE  = gpuArray(dlarray( permute(this.te,[2 3 4 1]))); % TE in 4th dimension
             
-            M0      = pars.M0;
+            S0      = pars.S0;
             R2star  = pars.R2star;
             
-            if strcmpi(solver, 'mcmc')
+            s = this.model_R2s(S0, R2star, TE);
 
-                % MCMC
-
-                s = arrayfun(@model_R2s_singlecompartment,M0, R2star, TE);
-
-                % vectorise to match masked measurement data
-                s = utils.reshape_ND2GD(s,[]);
-                % reshape s for GW
-                if ~isempty(fitting)
-                    if strcmpi(fitting.algorithm,'ensemble')
-                        s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
-                    end
-                end
-
-            else
-
-                % askadam
-
-                s = this.model_R2s(M0, R2star, TE);
-
-                if ismatrix(M0)
-                    % vectorise to match maksed measurement data
-                    s = utils.reshape_ND2GD(s,[]);
-                end
-
+            if isRician
+                sigma   = pars.sigma;
+                s       = rician.rician_mean_gacelle(s,sigma);
             end
+
+            % vectorise to match maksed measurement data
+            s = utils.reshape_ND2GD(s,[]);
                 
         end
         
         %% utility
-        
-        % make sure input data are valid
         function [mask,extradata] = validate_input(this,data,mask,extradata)
-           
             %%%%%%%%%% 2. check data integrity %%%%%%%%%%
             disp('-----------------------');
             disp('Checking data integrity');
             disp('-----------------------');
-
             % check if the number of echo times matches with the data
             if numel(this.te) ~= size(data,4)
                 error('The size of TE does not match with the 4th dimension of the image.');
             end
-
             % check signal mask
             if ~isempty(mask)
                 disp('Mask input                : True');
-                if ~isequal(size(data,1:3), size(mask,1:3))
+                if min(size(data(:,:,:,1,1)) == size(mask)) == 0
                     error('The dimension of the mask does not match the inpt image.');
                 end
             else
@@ -418,43 +359,16 @@ classdef gpuR2starMapping < handle
             disp('Input data is valid.')
         end
 
-        % normalise input data based on masked signal intensity at 98%
-        function [img, mask, scaleFactor] = prepare_data(this, img, mask)
-            
-            mask = mask>0;
-
-            % make sure input data are valid
-            [mask] = this.validate_input(img,mask);
-
-            tmp = abs(img(:,:,:,1));
-
-            scaleFactor = prctile( tmp(mask>0), 98);
-
-            img = img ./ scaleFactor;
-
-            % mask sure no nan or inf
-            [img,mask] = utils.remove_img_naninf(img,mask);
-
-        end
-
-        % segment data based on slice
-        function [dataSeg, maskSeg] = slice_segment(this, data, mask, slice)
-
-            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
-            maskSeg     = mask(:,:,slice);
-        end
-
     end
 
     methods(Static)
         %% Signal related
-        function signal = model_R2s(m0,r2s,te)
-        % m0    : proton density weighted signal
-        % r2s   : R2*, in s^-1 or ms^-1
-        % te    : echo time, in s or ms
+        function signal = model_R2s(S0,r2s,te)
+        % S0    : T1 weighted signal
+        % r2s   : R2*, in s^-1
+        % te    : echo time, in s 
 
-            signal = m0 .* exp(-te .* r2s);
-        
+            signal = S0 .* exp(-te .* r2s);
         
         end
 
@@ -484,29 +398,28 @@ classdef gpuR2starMapping < handle
         end
 
         %% Utilities
+        % normalise input data based on masked signal intensity at 98%
+        function [img, scaleFactor] = prepare_data(img, mask)
+
+            tmp = abs(img(:,:,:,1));
+
+            scaleFactor = prctile( tmp(mask>0), 98);
+
+            img = img ./ scaleFactor;
+
+        end
+
         % check and set default fitting algorithm parameters
         function fitting2 = check_set_default(fitting)
-
-            if ~isfield(fitting,'solver');      fitting.solver = 'askadam';        end
-
             % get basic fitting setting check
-            if strcmpi(fitting.solver,'mcmc')
-
-                % mcmc
-                fitting2 = mcmc.check_set_default_basic(fitting);
-
-            else
-
-                % askadam
-                fitting2 = askadam.check_set_default_basic(fitting);
-
-            end
+            fitting2 = askadam.check_set_default_basic(fitting);
 
             % get customised fitting setting check
             if ~isfield(fitting,'weightMethod');        fitting2.weightMethod   = '1stecho';        end
             if ~isfield(fitting,'isWeighted');          fitting2.isWeighted     = false;            end
             if ~isfield(fitting,'weightPower');         fitting2.weightPower    = 2;                end
             if ~isfield(fitting,'start');               fitting2.start          = 'prior';          end
+            if ~isfield(fitting,'isRician');            fitting2.isRician       = false;            end
 
         end
 
@@ -524,7 +437,8 @@ classdef gpuR2starMapping < handle
             else
                 disp('Cost function weighted by echo intensity: False');
             end
-            
+            fprintf('Estimate Rician noise: ')
+            if fitting.isRician; fprintf('true\n');else fprintf('false\n'); end
             
         end
 
@@ -544,7 +458,7 @@ classdef gpuR2starMapping < handle
                     case '1stecho'
                         p = fitting.weightPower;
                         % weights using the 1st echo intensity of each flip angle
-                        w = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1,:)).^p);
+                        w       = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1,:)).^p);
                 end
             else
                 % compute the cost without weights
