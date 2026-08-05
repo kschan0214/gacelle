@@ -41,6 +41,7 @@ Table of Contents
 
    supported_models/AxCaliberSMT
    supported_models/NEXI
+   supported_models/mcmicro
    supported_models/MCRMWI
    supported_models/GREMWI
    supported_models/JointR1R2star

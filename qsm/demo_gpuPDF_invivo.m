@@ -1,5 +1,5 @@
 %% add paths
-addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
+addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 
 %% I/O: Load data

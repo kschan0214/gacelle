@@ -1,6 +1,6 @@
-%% demo_gpuAxCaliberSMTmcmc_RealData.m
+%% demo_gpuAxCaliberSMT_invivoData.m
 %
-% This demo provides several examples on the ulitisation of gpuAxCaliberSMTmcmc.m 
+% This demo provides several examples on the ulitisation of gpuAxCaliberSMT.m 
 % for parameter estimation with in vivo data
 % 
 % Kwok-Shing Chan 
@@ -73,7 +73,7 @@ seed = 892396; rng(seed); gpurng(seed);
 % askadam estimation
 out_3DTV = dwi_smt.estimate(dwi, mask, extractdata, fitting);
 
-%% Usage #3: Metropolis-Hasting 
+%% Usage #3: MCMC Metropolis-Hasting 
 fitting                     = [];
 fitting.solver              = 'mcmc';
 fitting                     = dwi_smt.check_set_default(fitting);
@@ -87,7 +87,7 @@ seed = 892396; rng(seed); gpurng(seed);
 % askadam estimation
 out_mh = dwi_smt.estimate(dwi, mask, extractdata, fitting);
 
-%% Usage #4: Affine-invariant ensemble
+%% Usage #4: MCMC Affine-invariant ensemble
 fitting                     = [];
 fitting.solver              = 'mcmc';
 fitting                     = dwi_smt.check_set_default(fitting);

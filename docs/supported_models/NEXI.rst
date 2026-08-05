@@ -2,38 +2,29 @@
 .. role::  raw-html(raw)
     :format: html
 
-NEXI
-====
-
-Neurite EXchange Imaging based on diffusion MRI (dMRI).
-
 gpuNEXI
--------
+========
 
-NEXI with askAdam solver.
+NEXI (Neurite EXchange Imaging) estimates neurite volume fraction, intra- and extra-neurite diffusivities, and the inter-compartment water exchange rate from multi-shell, multi-diffusion-time dMRI. It extends the Standard Model of white/gray matter diffusion with the anisotropic Kärger model of two exchanging compartments, and is fitted here using the spherical mean (rotationally invariant) signal to remove the confound of fibre orientation dispersion.
+
+Reference: `Chan, K.-S., Ma, Y., Lee, H., Marques, J.P., Olesen, J.L., Coelho, S., Novikov, D.S., Jespersen, S.N., Huang, S.Y., Lee, H.-H., 2025. In vivo human neurite exchange time imaging at 500 mT/m diffusion gradients. Imaging Neuroscience 3, imag_a_00544. <https://doi.org/10.1162/imag_a_00544>`_
+
+The underlying NEXI model was originally proposed by Jelescu, I.O., de Skowronski, A., Geffroy, F., Palombo, M., Novikov, D.S., 2022. Neurite Exchange Imaging (NEXI): A minimal model of diffusion in gray matter with inter-compartment water exchange. NeuroImage 256, 119277.
 
 Usage
 ^^^^^
 
 .. code-block::
 
-    obj = gpuNEXI(bval, BDELTA);
+    obj = gpuNEXI(bval, BDELTA, varargin)
     out = obj.estimate(dwi, mask, extradata, fitting);
 
 Model parameters
 ^^^^^^^^^^^^^^^^
 
-.. code-block::
-    
-    % fa        : Neurite volume fraction
-    % Da        : longitudinal diffusivity of neurite [ms/us^2]
-    % De        : diffusivity of extracellular water [ms/us^2]
-    % ra        : exchange rate from neurite to extracellular space [1/s]
-    % p2        : non-linear neurite dispersion index
-    model_params    = {'fa','Da','De','ra','p2'};
-    ub              = [   1,   3,   3,   1,  1];
-    lb              = [ eps, eps, eps,1/250, eps];
-    startpoint      = [ 0.4,   2,   1, 0.05, 0.2];
+.. literalinclude:: ../../NEXI/gpuNEXI.m
+    :language: matlab
+    :lines: 28-32
 
 I/O overview
 ^^^^^^^^^^^^
@@ -47,17 +38,19 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | BDELTA                    | 1xNshell diffusion time, same size as 'bval' [ms]                                                            |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
+| varargin{1}               | Number of gradient directions per shell, same size as 'bval' (Optional, default = 1 per shell)               |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
 
 ``out = obj.estimate(dwi, mask, extradata, fitting);``
 
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | Input                     | Description                                                                                                  |
 +===========================+==============================================================================================================+
-| dwi                       | 4D dMRI data, can be either full acquisition or SMT signal [x,y,z,diffusion]                                 |
+| dwi                       | 4D dMRI data, can be either full acquisition or rotationally invariant signal [x,y,z,diffusion]              |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| mask                      | 3D mask, [x,y,z]                                                                                             |
+| mask                      | 3D mask, [x,y,z] (volumetric) | [1,Nvertex,Nhemi] (surface, see fitting.dataType below)                      |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extradata                 | Structure array with additional data (Optional)                                                              |
+| extradata                 | Structure array with additional data (Optional unless noted)                                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extradata.bval            | 1D b-values [1xdiffusion], same order as 'dwi' [ms/um2] (Optional, only if 'dwi' is full acquisition)        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
@@ -67,151 +60,52 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extradata.BDELTA          | 1D diffusion time [1xdiffusion], same order as 'dwi' [ms] (Optional, only if 'dwi' is full acquisition)      |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation                                                               |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.optimiser         | Algorithm for parameter update, 'adam' (default) | 'sgdm' | 'rmsprop'                                        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.isdisplay         | boolean, display optimisation process in graphic plot                                                        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation                                                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceWindow | # of elements in which 'convergenceValue' is computed                                                        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.iteration         | maximum # of optimisation iterations                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.initialLearnRate  | initial learn rate of Adam optimiser                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.tol               | tolerance in loss                                                                                            |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lambda            | regularisation parameter(s)                                                                                  |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.regmap            | model parameter(s) in which regularisation is applied, 'fa'|'ra'|'Da'|'De'                                   |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D'|'3D'                                                      |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lossFunction      | loss function, 'L1'|'L2'|'huber'|'mse'                                                                       |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lmax              | Maximum order of rotational invariant, 0|2, default = 0                                                      |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.isPrior           | Starting point estimated based on likelihood method instead of fix/random location                           |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| Output                        | Description                                                                                                  |
-+===============================+==============================================================================================================+
-| out                           | structure contains optimisation result                                                                       |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.final                     | output structure at final iteration                                                                          |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.final.loss                | total loss = loss_fidelity + loss_reg                                                                        |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.final.loss_fidelity       | loss of data consistency term                                                                                |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.final.loss_reg            | loss of regularisation term                                                                                  |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.final.(model_params{k})   | estimated model parameter(s)                                                                                 |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.min                       | output structure at loss is minimum                                                                          |
-+-------------------------------+--------------------------------------------------------------------------------------------------------------+
-
-See example here.
-
-
-gpuNEXImcmc
------------
-
-NEXI with MCMC solver.
-
-Usage
-^^^^^
-
-.. code-block::
-
-    obj = gpuNEXImcmc(bval, BDELTA);
-    out = obj.estimate(dwi, mask, extradata, fitting);
-
-Model parameters
-^^^^^^^^^^^^^^^^
-
-.. code-block::
-    
-    % fa        : Intraneurite volume fraction
-    % Da        : Intraneurite diffusivity (um2/ms)
-    % De        : Extraneurite diffusivity (um2/ms)
-    % ra        : exchange rate from intra- to extra-neurite compartment
-    % p2        : dispersion index (if fitting.lmax=2)
-    % default model parameters and estimation boundary
-    model_params    = { 'fa';   'Da';   'De';   'ra';'p2'; 'noise'};
-    ub              = [    1;      3;      3;      1;   1;     0.1];
-    lb              = [    0;  0.002;  0.001;  1/250;   0;    0.01];
-    step            = [  0.05;  0.15;   0.15;  0.005;0.05;   0.005];
-    startpoint      = [  0.2;      2;    0.5;   0.05; 0.2;    0.05];
-
-I/O overview
-^^^^^^^^^^^^
-
-``obj = gpuNEXImcmc(bval, BDELTA);``
-
+| extradata.sigma           | 3D noise map, [x,y,z] (Optional, only needed for the NEXIrice noise model)                                   |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| Input                     | Description                                                                                                  |
-+===========================+==============================================================================================================+
-| bval                      | 1xNshell unique b-values vector [ms/um2]                                                                     |
+| extradata.surf_dir        | FreeSurfer surf directory (Required if fitting.dataType = 'surface')                                         |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| BDELTA                    | 1xNshell diffusion time, same size as 'bval' [ms]                                                            |
+| extradata.hemisphere      | Cell array subset of {'lh','rh'} (Required if fitting.dataType = 'surface'; must match mask dim3)            |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| extradata.depth           | Cortical depth, [0,1] (Optional, surface mode only, default = 0.5)                                           |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting                   | Structure array for model parameter estimation (only class-specific options shown here)                      |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.solver            | Solver used for estimation, 'askadam' (default) | 'mcmc'. See note below.                                    |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.lmax              | Maximum order of rotational invariant, 0 (default) | 2                                                       |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.dataType          | Data geometry, 'volumetric' (default) | 'surface'. See note below.                                           |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.regularisationType| Regularisation dispatch, 'TV' (default) | 'prior'. See note below.                                           |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.start             | Starting point method, 'likelihood' (default) | 'default' | 1xM parameters array                             |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 
-``out = obj.estimate(dwi, mask, extradata, fitting);``
+.. note::
+   As of v0.5.0, ``gpuNEXI`` dispatches internally on ``fitting.solver``: the same object handles both the askAdam and MCMC solvers, and setting ``fitting.solver = 'mcmc'`` runs the MCMC path without needing a separate object. A standalone ``gpuNEXImcmc`` class, if still present in the repository, is likely a thin or legacy wrapper around this dispatch rather than an independently maintained implementation.
 
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| Input                     | Description                                                                                                  |
-+===========================+==============================================================================================================+
-| dwi                       | 4D dMRI data, can be either full acquisition or SMT signal [x,y,z,diffusion]                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| mask                      | 3D mask, [x,y,z]                                                                                             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extradata                 | Structure array with additional data (Optional)                                                              |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extradata.bval            | 1D b-values [1xdiffusion], same order as 'dwi' [ms/um2] (Optional, only if 'dwi' is full acquisition)        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extradata.bvec            | 2D b-vector [3xdiffusion], same order as 'dwi' (Optional, only if 'dwi' is full acquisition)                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extradata.ldelta          | 1D gradient duration [1xdiffusion], same order as 'dwi' [ms] (Optional, only if 'dwi' is full acquisition)   |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extradata.BDELTA          | 1D diffusion time [1xdiffusion], same order as 'dwi' [ms] (Optional, only if 'dwi' is full acquisition)      |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation                                                               |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.algorithm         | MCMC algorithm, 'MH' (Metropolis-Hastings)|'GW' (Affline-invariant ensemble)                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.iteration         | # MCMC iterations                                                                                            |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.repetition        | # repetition of MCMC proposal                                                                                |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.thinning          | sampling interval between iterations                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.burnin            | iterations to be discarded at the beginning, if >1, the exact number will be used; else iteration*burnin     |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.xStepSize         | step size of model parameter in MCMC proposal, same size and order as 'model_params' ('MH' only)             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.StepSize          | step size for 'GW' in MCMC proposal ('GW' only)                                                              |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.Nwalker           | # random walkers ('GW' only)                                                                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.metric            | cell variable, metric(s) derived from posterior distribution, 'mean'|'std'|'median'|'iqr' (can be multiple)  |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.start             | Starting point methods, 'likelihood'|'default'|1xM parameters array                                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+.. note::
+   ``fitting.dataType = 'surface'`` expects ``data``/``mask`` in ``[1, Nvertex, Nhemi]`` convention and requires ``extradata.surf_dir`` and ``extradata.hemisphere``. It bypasses ``fitting.TVmode`` entirely: spatial regularisation is dispatched through a mesh-based total variation operator over the cortical surface rather than the volumetric one. Automatic segmentation in surface mode is exact-only, so ``fitting.NSegmentUser`` must be ``1`` or the number of hemispheres.
 
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| Output                            | Description                                                                                                  |
-+===================================+==============================================================================================================+
-| out                               | structure contains optimisation result                                                                       |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.posterior                     | structure contains MCMC posterior samples                                                                    |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.posterior.(model_params{k})   | Model parameter MCMC posterior samples, masked and unshaped for memory preservation                          |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.{metric}.(model_params{k})    | Posterior statistics chosen in fitting.metric                                                                |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
+   ``fitting.regularisationType = 'prior'`` fits a normal-distribution prior on the parameter(s) named in ``fitting.regmap`` instead of total variation, and requires ``extradata.mu`` and ``extradata.sigma`` (one field per name in ``fitting.regmap``). This path is available for either ``dataType``.
 
-See example here.
+``estimate()`` also runs GACELLE's automatic GPU memory manager (``utils.find_optimal_segment_3D``) transparently, segmenting large volumes if required. See `Automatic GPU Memory Management <https://gacelle.readthedocs.io/en/latest/advanced/automatic_memory_management.html>`_ for the relevant ``fitting.autoMemManage``, ``fitting.NSegmentUser``, and ``fitting.segmentOverlap`` options.
+
+
+Example
+^^^^^^^
+
+Example script for noise propagation:
+
+.. literalinclude:: ../../NEXI/demo_gpuNEXI_NoisePropagation.m
+    :language: matlab
+
+Example script for noise propagation with full diffucion table:
+
+.. literalinclude:: ../../NEXI/demo_gpuNEXI_NoisePropagation_advanced.m
+    :language: matlab
+
+Example script for in vivo data:
+
+.. literalinclude:: ../../NEXI/demo_gpuNEXI_invivo.m
+    :language: matlab

@@ -1,4 +1,4 @@
-addpath(genpath('/autofs/space/linen_001/users/kwokshing/tools/gacelle/'));
+addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 addpath(genpath('../../dwi/C2_protocoldesign'));
 clear;
 

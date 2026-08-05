@@ -2,15 +2,12 @@
 .. role::  raw-html(raw)
     :format: html
 
-JointR1R2star
-==============
+gpuJointR1R2starMapping
+=========================
 
-Joint R2-R2* single compartment relaxometry using variable flip angle and multi-echo GRE data
+JointR1R2star jointly estimates R1 (=1/T1) and R2* from a single-compartment relaxometry model combining variable flip angle (VFA) spoiled gradient echo data with multi-echo GRE data. R1 is obtained from the DESPOT1 steady-state VFA signal model; R2* is obtained from the mono-exponential decay across echo times of the same acquisition, fitted jointly with R1 and the proton-density-weighted signal M0 in a single optimisation.
 
-gpuJointR1R2star
-----------------
-
-With askadam solver
+Reference: `Deoni, S.C.L., Rutt, B.K., Peters, T.M., 2003. Rapid combined T1 and T2 mapping using gradient recalled acquisition in the steady state. Magnetic Resonance in Medicine 49, 515-526. <https://doi.org/10.1002/mrm.10407>`_ (VFA/DESPOT1 R1 model)
 
 Usage
 ^^^^^
@@ -23,18 +20,12 @@ Usage
 Model parameters
 ^^^^^^^^^^^^^^^^
 
-.. code-block::
-    
-    % M0    : Proton density weighted signal
-    % R1    : (=1/T1) in s^-1
-    % R2star: R2* in s^-1   
-    model_params    = {'M0';'R1';'R2star'};
-    ub              = [  2;  10;  200];
-    lb              = [  0; 0.1;  0.1];
-    startpoint      = [   1;   1;  30];
+.. literalinclude:: ../../R1R2s/gpuJointR1R2starMapping.m
+    :language: matlab
+    :lines: 25-29
 
 I/O overview
-------------
+^^^^^^^^^^^^
 
 ``obj = gpuJointR1R2starMapping(te,tr,fa);``
 
@@ -61,36 +52,23 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extraData.b1              | 3D B1+ map [ratio], [x,y,z]                                                                                  |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation                                                               |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.optimiser         | Algorithm for parameter update, 'adam' (default) | 'sgdm' | 'rmsprop'                                        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.isdisplay         | boolean, display optimisation process in graphic plot                                                        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceValue  | tolerance in loss gradient to stop the optimisation                                                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.convergenceWindow | # of elements in which 'convergenceValue' is computed                                                        |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.iteration         | maximum # of optimisation iterations                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.initialLearnRate  | initial learn rate of Adam optimiser                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.tol               | tolerance in loss                                                                                            |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lambda            | regularisation parameter(s)                                                                                  |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.regmap            | model parameter(s) in which regularisation is applied,                                                       |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.TVmode            | Mode for total variation (TV) regularisation, '2D' | '3D'                                                    |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lossFunction      | loss function, 'L1' | 'L2' | 'huber' | 'mse'                                                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.isWeighted        | is cost weighted, true|false, default = true                                                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
+| fitting                   | Structure array for model parameter estimation (only class-specific options shown here)                      |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.solver            | Solver used for estimation, 'askadam' (default) | 'mcmc'. See note below.                                    |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.start             | Starting point method, 'prior' (default, closed-form) | 'default' | 1xM parameters array                     |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.isWeighted        | Weight the cost by echo intensity, true | false (default = false)                                            |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
 | fitting.weightMethod      | Weighting method, '1stecho' (default) | 'norm'                                                               |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.weightPower       | power order of the weight, default = 2                                                                       |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.weightPower       | Power order of the weight (default = 2)                                                                      |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+
+.. note::
+   As of the June 2026 update, ``gpuJointR1R2starMapping`` dispatches internally on ``fitting.solver``: the same object handles both the askAdam and MCMC solvers, and setting ``fitting.solver = 'mcmc'`` runs the MCMC path without needing a separate object. A standalone ``gpuJointR1R2starMappingmcmc`` class, if still present in the repository, is likely a thin or legacy wrapper around this dispatch rather than an independently maintained implementation.
+
+``estimate()`` also runs GACELLE's automatic GPU memory manager (``utils.find_optimal_segment_3D``) transparently, segmenting large volumes if required. See `Automatic GPU Memory Management <https://gacelle.readthedocs.io/en/latest/advanced/automatic_memory_management.html>`_ for the relevant ``fitting.autoMemManage``, ``fitting.NSegmentUser``, and ``fitting.segmentOverlap`` options.
 
 Example
 ^^^^^^^
@@ -100,115 +78,7 @@ Example script for noise propagation:
 .. literalinclude:: ../../R1R2s/demo_gpuJointR1R2starMapping_NoisePropagation.m
     :language: matlab
 
-Example script for real data:
+Example script for in vivo data:
 
-.. literalinclude:: ../../R1R2s/demo_gpuJointR1R2starMapping_RealData.m
-    :language: matlab
-
-
-gpuJointR1R2starmcmc
---------------------
-
-With MCMC solver
-
-Usage
-^^^^^
-
-.. code-block::
-
-    obj     = gpuJointR1R2starMappingmcmc(te,tr,fa);
-    [out]   = obj.estimate( data, mask, extraData, fitting);
-
-Model parameters
-^^^^^^^^^^^^^^^^
-
-.. code-block::
-    
-    % M0    : Proton density weighted signal
-    % R1    : (=1/T1) in s^-1
-    % R2star: R2* in s^-1   
-    model_params    = {'M0';'R1';'R2star';'noise'};
-    ub              = [   2;  10;     200;    0.1];
-    lb              = [   0; 0.1;     0.1;  0.001];
-    startpoint      = [   1;   1;      30;   0.05];
-    step            = [0.01;0.01;       1;  0.005];
-
-I/O overview
-------------
-
-``obj = gpuJointR1R2starMappingmcmc(te,tr,fa);``
-
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| Input                     | Description                                                                                                  |
-+===========================+==============================================================================================================+
-| te                        | 1xNte echo time [s]                                                                                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| tr                        | repetition time [s]                                                                                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fa                        | 1xNfa flip angle vector [degree]                                                                             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-
-``[out] = obj.estimate( data, mask, extraData, fitting);``
-
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| Input                     | Description                                                                                                  |
-+===========================+==============================================================================================================+
-| data                      | 5D MRI data, [x,y,z,t,fa]                                                                                    |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| mask                      | 3D mask, [x,y,z]                                                                                             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extraData                 | Structure array with additional data                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extraData.b1              | 3D B1+ map [ratio], [x,y,z]                                                                                  |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation                                                               |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.algorithm         | MCMC algorithm, 'MH' (Metropolis-Hastings)|'GW' (Affline-invariant ensemble)                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.iteration         | # MCMC iterations                                                                                            |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.repetition        | # repetition of MCMC proposal                                                                                |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.thinning          | sampling interval between iterations                                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.burnin            | iterations to be discarded at the beginning, if >1, the exact number will be used; else iteration*burnin     |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.xStepSize         | step size of model parameter in MCMC proposal, same size and order as 'model_params' ('MH' only)             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.StepSize          | step size for 'GW' in MCMC proposal ('GW' only)                                                              |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.Nwalker           | # random walkers ('GW' only)                                                                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.metric            | cell variable, metric(s) derived from posterior distribution, 'mean'|'std'|'median'|'iqr' (can be multiple)  |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.isWeighted        | is cost weighted, true|false, default = true                                                                 |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.weightMethod      | Weighting method, '1stecho' (default) | 'norm'                                                               |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.weightPower       | power order of the weight, default = 2                                                                       |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| Output                            | Description                                                                                                  |
-+===================================+==============================================================================================================+
-| out                               | structure contains optimisation result                                                                       |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.posterior                     | structure contains MCMC posterior samples                                                                    |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.posterior.(model_params{k})   | Model parameter MCMC posterior samples, masked and unshaped for memory preservation                          |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.{metric}.(model_params{k})    | Posterior statistics chosen in fitting.metric                                                                |
-+-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-
-Example
-^^^^^^^
-
-Example script for noise propagation:
-
-.. literalinclude:: ../../R1R2s/demo_gpuJointR1R2starMappingmcmc_NoisePropagation.m
-    :language: matlab
-
-Example script for real data:
-
-.. literalinclude:: ../../R1R2s/demo_gpuJointR1R2starMappingmcmc_RealData.m
+.. literalinclude:: ../../R1R2s/demo_gpuJointR1R2starMapping_invivo.m
     :language: matlab

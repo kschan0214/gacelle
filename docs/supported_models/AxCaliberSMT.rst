@@ -66,7 +66,7 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extradata.BDELTA          | 1D diffusion time [1xdiffusion], same order as 'dwi' [ms] (Optional, only if 'dwi' is full acquisition)      |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation (only solver specific options shown here)                     |
+| fitting                   | Structure array for model parameter estimation (only class-specific options shown here)                      |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.solver            | Solver used for estimation, 'askadam' (default) | 'mcmc'. See note below.                                    |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
@@ -88,7 +88,7 @@ Example script for noise propagation:
 .. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMT_NoisePropagation.m
     :language: matlab
 
-Example script for real data:
+Example script for in vivo data:
 
 .. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMT_invivoData.m
     :language: matlab
