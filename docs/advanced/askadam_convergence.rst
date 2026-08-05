@@ -50,7 +50,7 @@ Convergence Model
 
 **Formalism**
 
-*Linear model.* The loss values from the last ``convergenceWindow`` iterations are held in a buffer :math:`\{L_1, L_2, \dots, L_N\}` (:math:`N = ` ``convergenceWindow``). A first-order polynomial is fitted to this buffer by ordinary least squares:
+*Linear model.* The loss values from the last ``convergenceWindow`` iterations are held in a buffer :math:`\{L_1, L_2, \dots, L_N\}` (:math:`N =` ``convergenceWindow``). A first-order polynomial is fitted to this buffer by ordinary least squares:
 
 .. math::
 
@@ -88,8 +88,92 @@ with :math:`\varepsilon = 10^{-8}` added to the denominator purely to avoid divi
 .. note::
    With ``convergenceModel = 'ema'``, the EMA already smooths transient dips before thresholding, so ``patienceConvergence = 1`` or ``2`` is often sufficient. The default of ``5`` adds a conservative extra layer that costs little in practice.
 
-Robust Convergence and Outlier Handling
+Step Norm and Gradient Norm Convergence
 -----------------------------------------
+
+These two signals are independent of ``fitting.robustConvergence`` and the convergence model. They provide complementary stopping criteria based on parameter movement and loss landscape flatness respectively.
+
+.. list-table::
+   :widths: 35 15 50
+   :header-rows: 1
+
+   * - Field
+     - Default
+     - Description
+   * - ``fitting.convergenceStepTol``
+     - ``1e-6``
+     - Relative parameter step norm threshold. Optimisation stops when the norm of the parameter update (relative to the parameter norm) is below this value. Set to ``0`` to disable.
+   * - ``fitting.patienceStep``
+     - ``5``
+     - Patience for step norm criterion (consecutive checks below threshold required).
+   * - ``fitting.convergenceGradTol``
+     - ``1e-6``
+     - Gradient norm threshold. Optimisation stops when the gradient norm is below this value. Set to ``0`` to disable.
+   * - ``fitting.patienceGrad``
+     - ``5``
+     - Patience for gradient norm criterion (consecutive checks below threshold required).
+
+With Adam, a small step norm does not necessarily imply a small gradient norm, because Adam normalises gradients via its second moment estimate. The step norm catches parameter stagnation; the gradient norm catches loss landscape flatness. Both are useful but can be disabled by setting their tolerance to ``0`` if you prefer to rely on the loss convergence signal alone.
+
+Quick Reference: Default Behaviour (v1.1)
+------------------------------------------
+
+With all defaults, ``askadam.m`` v1.1 will:
+
+- Use **sigmoid parameter reparameterisation** (``parameterTransform = 'sigmoid'``), eliminating boundary-sticking at the cost of a modified loss surface near bounds.
+- Use **EMA-based convergence** (``convergenceModel = 'ema'``, ``emaDecay = 0.95``) rather than the linear slope.
+- **Robust convergence is disabled by default** (``robustConvergence = false``). Enable it explicitly (``= true``) if your data show persistent outlier voxels; see `Robust Convergence and Outlier Handling`_ below.
+- Stop on any of: loss threshold, EMA convergence, step norm, gradient norm, or maximum iterations.
+
+To replicate v1.0 behaviour exactly::
+
+   fitting.parameterTransform  = 'linear';
+   fitting.convergenceModel    = 'linear';
+   fitting.robustConvergence   = false;
+   fitting.convergenceStepTol  = 0;
+   fitting.convergenceGradTol  = 0;
+
+Example: Default Settings
+--------------------------
+
+No additional fields are required — the defaults are active automatically:
+
+.. code-block:: matlab
+
+   fitting.optimiser    = 'adam';
+   fitting.iteration    = 1e4;
+   fitting.lossFunction = 'L1';
+
+   out = askadam().optimisation(data, mask, weights, parameters, fitting, FWDfunc, varargin);
+
+Example: Disabling Robust Convergence
+---------------------------------------
+
+.. code-block:: matlab
+
+   fitting.robustConvergence  = false;
+   fitting.convergenceModel   = 'ema';    % EMA still active
+   fitting.convergenceValue   = 1e-6;
+
+   out = askadam().optimisation(data, mask, weights, parameters, fitting, FWDfunc, varargin);
+
+Example: Replicating v1.0 Behaviour
+--------------------------------------
+
+.. code-block:: matlab
+
+   fitting.parameterTransform  = 'linear';
+   fitting.convergenceModel    = 'linear';
+   fitting.convergenceWindow   = 20;
+   fitting.convergenceValue    = 1e-8;    % restore your original value if different from 1e-6
+   fitting.robustConvergence   = false;
+   fitting.convergenceStepTol  = 0;
+   fitting.convergenceGradTol  = 0;
+
+   out = askadam().optimisation(data, mask, weights, parameters, fitting, FWDfunc, varargin);
+
+Robust Convergence and Outlier Handling (Experimental)
+-------------------------------------------------------
 
 When ``fitting.robustConvergence = true``, ``askadam.m`` identifies voxels whose loss is not improving relative to the main population and reduces their gradient contribution. The convergence signal (loss-based) is then computed on the main population only, preventing a small number of persistently difficult voxels from masking genuine convergence of the majority.
 
@@ -101,7 +185,7 @@ When ``fitting.robustConvergence = true``, ``askadam.m`` identifies voxels whose
      - Default
      - Description
    * - ``fitting.robustConvergence``
-     - ``true``
+     - ``false``
      - Enable outlier-aware gradient downweighting and main-population convergence checking.
    * - ``fitting.outlierWeight``
      - ``0.1``
@@ -169,93 +253,6 @@ A voxel is flagged as an outlier if it satisfies either of two criteria:
    The outlier mask has a one-iteration lag: it is computed from the loss at iteration *t* and applied from iteration *t+1*. This is an intentional design choice — computing the mask inside the autodiff graph would require ``extractdata`` calls that break gradient flow. TV regularisation gradients are unaffected by voxel downweighting.
 
 .. warning::
-   ``fitting.robustConvergence = true`` is the default. If you need results that are numerically identical to GACELLE v1.0, set ``fitting.robustConvergence = false``.
-
-Step Norm and Gradient Norm Convergence
------------------------------------------
-
-These two signals are independent of ``fitting.robustConvergence`` and the convergence model. They provide complementary stopping criteria based on parameter movement and loss landscape flatness respectively.
-
-.. list-table::
-   :widths: 35 15 50
-   :header-rows: 1
-
-   * - Field
-     - Default
-     - Description
-   * - ``fitting.convergenceStepTol``
-     - ``1e-6``
-     - Relative parameter step norm threshold. Optimisation stops when the norm of the parameter update (relative to the parameter norm) is below this value. Set to ``0`` to disable.
-   * - ``fitting.patienceStep``
-     - ``5``
-     - Patience for step norm criterion (consecutive checks below threshold required).
-   * - ``fitting.convergenceGradTol``
-     - ``1e-6``
-     - Gradient norm threshold. Optimisation stops when the gradient norm is below this value. Set to ``0`` to disable.
-   * - ``fitting.patienceGrad``
-     - ``5``
-     - Patience for gradient norm criterion (consecutive checks below threshold required).
-
-With Adam, a small step norm does not necessarily imply a small gradient norm, because Adam normalises gradients via its second moment estimate. The step norm catches parameter stagnation; the gradient norm catches loss landscape flatness. Both are useful but can be disabled by setting their tolerance to ``0`` if you prefer to rely on the loss convergence signal alone.
-
-Quick Reference: Default Behaviour (v1.1)
-------------------------------------------
-
-With all defaults, ``askadam.m`` v1.1 will:
-
-- Use **sigmoid parameter reparameterisation** (``parameterTransform = 'sigmoid'``), eliminating boundary-sticking at the cost of a modified loss surface near bounds.
-- Use **EMA-based convergence** (``convergenceModel = 'ema'``, ``emaDecay = 0.95``) rather than the linear slope.
-- Enable **robust convergence** (``robustConvergence = true``) with outlier gradient downweighting (``outlierWeight = 0.1``) and a mask updated every 5 iterations.
-- Stop on any of: loss threshold, EMA convergence, step norm, gradient norm, or maximum iterations.
-
-To replicate v1.0 behaviour exactly::
-
-   fitting.parameterTransform  = 'linear';
-   fitting.convergenceModel    = 'linear';
-   fitting.robustConvergence   = false;
-   fitting.convergenceStepTol  = 0;
-   fitting.convergenceGradTol  = 0;
-
-Example: Default Settings
---------------------------
-
-No additional fields are required — the defaults are active automatically:
-
-.. code-block:: matlab
-
-   fitting.optimiser   = 'adam';
-   fitting.iteration   = 1e4;
-   fitting.lossFunction = 'L1';
-
-   obj = askadam;
-   out = obj.optimisation(data, mask, weights, parameters, fitting, FWDfunc, varargin);
-
-Example: Disabling Robust Convergence
----------------------------------------
-
-.. code-block:: matlab
-
-   fitting.robustConvergence  = false;
-   fitting.convergenceModel   = 'ema';    % EMA still active
-   fitting.convergenceValue   = 1e-6;
-
-   obj = askadam;
-   out = obj.optimisation(data, mask, weights, parameters, fitting, FWDfunc, varargin);
-
-Example: Replicating v1.0 Behaviour
---------------------------------------
-
-.. code-block:: matlab
-
-   fitting.parameterTransform  = 'linear';
-   fitting.convergenceModel    = 'linear';
-   fitting.convergenceWindow   = 20;
-   fitting.convergenceValue    = 1e-8;    % restore your original value if different from 1e-6
-   fitting.robustConvergence   = false;
-   fitting.convergenceStepTol  = 0;
-   fitting.convergenceGradTol  = 0;
-
-   obj = askadam;
-   out = obj.optimisation(data, mask, weights, parameters, fitting, FWDfunc, varargin);
+   ``fitting.robustConvergence`` is disabled by default (``false``). Enable it (``= true``) for datasets where a minority of voxels are expected to stagnate persistently relative to the rest of the volume; it is not needed for typical well-conditioned data. Because GACELLE v1.0 did not include this mechanism, the default already reproduces v1.0 behaviour on this option.
 
 See also :ref:`askadam-convergence` and `askAdam basic tutorial <https://gacelle.readthedocs.io/en/latest/getting_started/askadam_basic_tutorial.html>`_.
