@@ -1,10 +1,9 @@
 classdef gpuR2starMapping < handle
-% This is the method to perform joint R1-R2* mapping using variable flip angle (vFA), multiecho GRE (mGRE) data
+% This is the method to perform R2* mapping using multiecho GRE (mGRE) data
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
-% Date created: 5 April 2024
-% Date modified: 25 September 2024
-% Date modified: 10 June 2026 (update memory manager, support MCMC under same script)
+% Date created: 5 August 2026
+% Date modified: 
 
     properties (GetAccess = public, SetAccess = protected)
     % ===== MODEL PARAMETER CONTRACT =====
@@ -17,10 +16,11 @@ classdef gpuR2starMapping < handle
     % Mutate only as a set, via updateProperty() - never assign into a
     % single element from outside the class, or these will desync.
     %
-    % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
-    % updateProperty() can strip it by name without hardcoding an index,
-    % and fit() (~line 521) can locate it via this.modelParams{end}. Any
-    % future solver-conditional parameter should likewise go last.
+    % 'noise' is solver-conditional (mcmc only) and is kept LAST for
+    % index-alignment with ub/lb/startPoint/step. updateProperty() strips
+    % it by name via ismember(), not by index, when the solver is not
+    % mcmc. Any future solver-conditional parameter should likewise go
+    % last.
         modelParams    = {'M0';'R2star';'noise'};
         ub              = [   2;    200;    0.1];
         lb              = [   0;    0.1;  0.001];
@@ -31,9 +31,6 @@ classdef gpuR2starMapping < handle
     properties
     % ===== USER-TUNABLE OPTIONS =====
     % Freely settable by users before fitting; no coupling between these.
-        thres_similarity    = 0.1; 
-        thres_impossible    = 0.1;
-        thres_bkg           = 0.01;
 
         seed = 48463;   % for reproducible random number generation
 
@@ -45,7 +42,7 @@ classdef gpuR2starMapping < handle
     % Set once in the constructor from user-provided acquisition info.
     % Read-only after construction.
         te;
-        B0      = 3;
+        B0 = 3;
     end
 
     properties
@@ -54,7 +51,7 @@ classdef gpuR2starMapping < handle
 
     methods
 
-        % constructuor
+        % constructor
         function this = gpuR2starMapping(te)
 
             this.te = single(te(:));
@@ -95,22 +92,19 @@ classdef gpuR2starMapping < handle
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
         function  [out] = estimate(this, data, mask, fitting)
-        % Perform joint R1 and R2* model parameter estimation using askAdam
+        % Perform R2* model parameter estimation
         % Input data are expected in multi-dimensional image format
         % 
         % Input
         % -----------
         % data      : 4D image data, [x,y,z,echoes]
         % mask      : 3D signal mask, [x,y,z]
-        % extradata : Optional additional data
-        %   .b1  : 3D B1 map, [x,y,z]
         % fitting   : fitting algorithm parameters (see fit function)
         % 
         % Output
         % -----------
         % out       : output structure contains all estimation results
-        % M0        : Proton desity weighted signal
-        % R1        : R1 map
+        % M0        : T1w weighted (and coil sensitivity) signal
         % R2star    : R2* map
         % 
 
@@ -184,27 +178,14 @@ classdef gpuR2starMapping < handle
 
         end
 
-        % Data fitting function, can be 3D (voxel-based) or 5D (image-based)
+        % Data fitting function, can be 2D (voxel-based) or 4D (image-based)
         function [out] = fit(this, data, mask, fitting)
         %
         % Input
         % -----------
-        % data      : Variable flip angle data images, [x,y,z,TE,FA]
+        % data      : multi-echo data images, [x,y,z,TE]
         % mask      : 3D signal mask, [x,y,z]
         % fitting   : fitting algorithm parameters
-        %   .Nepoch             : no. of maximum iterations, default = 4000
-        %   .initialLearnRate   : initial gradient step size, defaulr = 0.01
-        %   .decayRate          : decay rate of gradient step size; learningRate = initialLearnRate / (1+decayRate*epoch), default = 0.0005
-        %   .convergenceValue   : convergence tolerance, based on the slope of last 'convergenceWindow' data points on loss, default = 1e-8
-        %   .convergenceWindow  : number of data points to check convergence, default = 20
-        %   .tol                : stop criteria on metric value, default = 1e-3
-        %   .lambda             : regularisation parameter, default = 0 (no regularisation)
-        %   .TVmode             : mode for TV regulariation, '2D'|'3D', default = '2D'
-        %   .regmap             : parameter map used for regularisation, 'fa'|'ra'|'Da'|'De', default = 'fa'
-        %   .lmax               : Order of rotational invariant, 0|2, default = 0
-        %   .lossFunction       : loss for data fidelity term, 'L1'|'L2'|'MSE', default = 'L1'
-        %   .display            : online display the fitting process on figure, true|false, defualt = false
-        % pars0     : 4D parameter starting points of fitting, [x,y,slice,param], 4th dimension corresponding to fitting  parameters with order [fa,Da,De,ra,p2] (optional)
         % 
         % Output
         % -----------
@@ -214,13 +195,8 @@ classdef gpuR2starMapping < handle
         %   .min        : results with the minimum loss metric across all iterations
         %       .loss       : loss metric      
         %
-        % Description: askAdam Image-based R1R2* model fitting
-        %
         % Kwok-Shing Chan @ MGH
         % kchan2@mgh.harvard.edu
-        % Date created: 8 Dec 2023
-        % Date modified: 3 April 2024
-        %
         %
             
             % get image size
@@ -233,6 +209,7 @@ classdef gpuR2starMapping < handle
             % get all fitting algorithm parameters 
             fitting                 = this.check_set_default(fitting);
             % determine fitting parameters
+            this                    = this.updateProperty(fitting);
             fitting.modelParams     = this.modelParams;
             % set fitting boundary if no input from user
             if isempty( fitting.ub); fitting.ub = this.ub(1:numel(this.modelParams)); end
@@ -262,7 +239,7 @@ classdef gpuR2starMapping < handle
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    % 3.1. initial global optimisation
+                    % initial global optimisation
                     out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver, fitting);
                     
             end
@@ -299,9 +276,8 @@ classdef gpuR2starMapping < handle
                 end
             else
                 % user defined starting point
-                x0 = fitting.start(:);
-                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
-                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+                fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(fitting.start(:).',' %.2f'),' ',','));
+                x0 = utils.initialise_x0(dims,this.modelParams,fitting.start);
 
             end
             
@@ -364,7 +340,7 @@ classdef gpuR2starMapping < handle
 
                 % vectorise to match masked measurement data
                 s = utils.reshape_ND2GD(s,[]);
-                % reshape s for GW
+                % reshape s for ensemble solver
                 if ~isempty(fitting)
                     if strcmpi(fitting.algorithm,'ensemble')
                         s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
@@ -389,7 +365,7 @@ classdef gpuR2starMapping < handle
         %% utility
         
         % make sure input data are valid
-        function [mask,extradata] = validate_input(this,data,mask,extradata)
+        function [mask] = validate_input(this,data,mask)
            
             %%%%%%%%%% 2. check data integrity %%%%%%%%%%
             disp('-----------------------');
@@ -412,7 +388,7 @@ classdef gpuR2starMapping < handle
                 disp('Default masking method is used.');
 
                 % if no mask input then use default method to generate a signal mask
-                mask = max(max(abs(data),[],4),[],5)./max(abs(data(:))) > 0.05;
+                mask = max(abs(data),[],4)./max(abs(data(:))) > 0.05;
             end
 
             disp('Input data is valid.')
@@ -454,7 +430,6 @@ classdef gpuR2starMapping < handle
         % te    : echo time, in s or ms
 
             signal = m0 .* exp(-te .* r2s);
-        
         
         end
 
@@ -543,8 +518,8 @@ classdef gpuR2starMapping < handle
                         w = sqrt(abs(data));
                     case '1stecho'
                         p = fitting.weightPower;
-                        % weights using the 1st echo intensity of each flip angle
-                        w = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1,:)).^p);
+                        % weights using the 1st echo intensity 
+                        w = bsxfun(@rdivide,abs(data).^p,abs(data(:,:,:,1)).^p);
                 end
             else
                 % compute the cost without weights

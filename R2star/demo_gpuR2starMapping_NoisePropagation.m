@@ -1,5 +1,5 @@
 
-addpath(genpath('../../gacelle/'));
+addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
 clear;
 
 %% Simulate data

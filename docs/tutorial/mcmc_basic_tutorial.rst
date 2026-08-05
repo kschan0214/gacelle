@@ -1,4 +1,4 @@
-.. _gettingstarted-mcmc_basic_tutorial:
+.. _tutorial-mcmc_basic_tutorial:
 .. role::  raw-html(raw)
     :format: html
 

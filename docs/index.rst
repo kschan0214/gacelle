@@ -36,6 +36,18 @@ Table of Contents
 
 .. toctree::
    :maxdepth: 1
+   :caption: Tutorial
+   :name: sec-tutorial
+
+   tutorial/askadam_basic_tutorial
+   tutorial/askadam_basicND_tutorial
+   tutorial/mcmc_basic_tutorial
+   tutorial/mcmc_metropolishastings_tutorial
+   tutorial/mcmc_affineinvariantensemble_tutorial
+   tutorial/writing_a_new_model
+
+.. toctree::
+   :maxdepth: 1
    :caption: Supported models
    :name: sec-supportedmodel
 

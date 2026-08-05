@@ -1,4 +1,4 @@
-.. _gettingstarted-askadam_basic_tutorial:
+.. _tutorial-askadam_basic_tutorial:
 .. role::  raw-html(raw)
     :format: html
 
@@ -61,25 +61,25 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 61-62
+    :lines: 62-63
 
 5. Define fitting weights (optional)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 64-65
+    :lines: 65-66
 
 6. Start the optimisation
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 67
+    :lines: 68
 
 7. Plot the estimation results
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 69-75
+    :lines: 70-76
 
 .. figure:: _images/askadam_basic_scatter.png
    :align: center
