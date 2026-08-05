@@ -3,14 +3,18 @@ classdef gpumcTFI < handle
     properties (GetAccess = public, SetAccess = protected)
     % ===== MODEL PARAMETER CONTRACT =====
     % M0        : Proton density weighted signal
-    % R1        : (=1/T1) in s^-1
-    % R2star    : R2* in s^-1   
-    % noise     : noise
+    % R2star    : R2* in s^-1
+    % y         : preconditioned susceptibility; chi = extraData.P .* y [ppm]
+    % phi       : per-voxel phase offset [rad]
     %
-    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
-    % These five arrays MUST stay the same length and index-aligned.
-    % Mutate only as a set, via updateProperty() - never assign into a
-    % single element from outside the class, or these will desync.
+    % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k)
+    % These four arrays MUST stay the same length and index-aligned.
+    % Mutate only as a set - never assign into a single element from
+    % outside the class, or these will desync.
+    %
+    % Unlike most other models in the framework there is no solver-
+    % conditional 'noise' parameter and no 'step' array here, because
+    % mcmc.m is not supported (see check_set_default).
         modelParams    = {'M0';'R2star';  'y'; 'phi'};
         ub              = [  10;    200;  10; 2*pi  ];
         lb              = [   0;    0.1; -10; -2*pi  ];
@@ -115,39 +119,52 @@ classdef gpumcTFI < handle
 
         %% higher-level data fitting functions
         function  [out] = estimate(this, data, mask, extraData, fitting)
-        % Perform TFI QSM reconstruction based on askAdam
+        % Perform mcTFI QSM reconstruction based on askAdam
         %
         % Input
         % -----------
-        % data      : 3D TOTAL field map in Hz, [x,y,z]. Not a local field -
-        %             no background removal should have been applied.
+        % data      : Complex multi-echo GRE data, [x,y,z,nTE]. This is NOT
+        %             a pre-processed field map - no background removal or
+        %             phase unwrapping should have been applied. R2*, M0,
+        %             the morphology mask, and the default fidelity weights
+        %             are all derived from this array directly (there is no
+        %             separate extraData.img; use extraData.R2star/.M0/.MG
+        %             below to override any of them individually).
         % mask      : 3D signal mask, [x,y,z]. Region over which the data
         %             fidelity is evaluated (typically the head, e.g.
         %             magnitude > 0.15*max). NOTE: this does NOT restrict
         %             where susceptibility is estimated - that is the whole
         %             FOV.
-        % extraData : additional data
-        %   .img    : REQUIRED. Multi-echo GRE, [x,y,z,nTE]. Source for R2*,
-        %             MG, the fidelity weights and (precond 'auto') chi_est.
-        %             Deleted from extraData before fitting.
-        %   .MG     : optional. Morphology/edge mask for TV, [x,y,z,3],
-        %             0 at edges. Derived from .img via gradient_mask if
-        %             absent.
-        %   .M2     : optional. Zero-reference mask, e.g. ventricular CSF.
-        %             Derived via extract_CSF if absent and lambdaCSF > 0.
-        %   .R2s    : optional. Precomputed R2* map [Hz]. Recomputed from
-        %             .img if absent.
-        %   .weights: optional. 3D fidelity weights. Defaults to the
-        %             echo-summed magnitude, normalised to max 1. Normalise
-        %             any user-supplied weights the same way, or tol stops
-        %             being portable across datasets.
-        %   .chi0   : optional initial susceptibility estimate [ppm], used
-        %             as y0 = chi0./P. NOTE: precond 'auto' already computes
-        %             a suitable chi_est internally but currently discards
-        %             it - see compute_adaptive_preconditioner.
-        % fitting   : fitting algorithm parameters. Must include lambdaTV
-        %             and lambdaCSF; neither has a default (see
-        %             check_set_default).
+        % extraData : additional data, all optional
+        %   .weights: 3D fidelity weights. Defaults to ones if absent, then
+        %             replicated across echoes and the cos/sin channels.
+        %             Normalise any user-supplied weights to max 1, or tol
+        %             stops being portable across datasets.
+        %   .R2star : precomputed R2* map [Hz]. Recomputed from 'data' via
+        %             a trapezoidal fit if absent.
+        %   .M0     : precomputed M0 map. Recomputed from 'data' via the
+        %             same trapezoidal fit if absent.
+        %   .MG     : morphology/edge mask for TV, [x,y,z,3], 0 at edges.
+        %             Derived from 'data' via gradient_mask if absent.
+        %   .M2     : zero-reference mask, e.g. ventricular CSF. Derived
+        %             via extract_CSF if absent and fitting.lambdaCSF > 0.
+        %   .fint   : initial total field estimate [Hz]. If present, this
+        %             triggers an internal gpuPDF fit whose result
+        %             OVERWRITES extraData.chi_b (see below), regardless of
+        %             whether chi_b was also supplied directly.
+        %   .chi_b  : initial susceptibility estimate [ppm], used as
+        %             y0 = chi_b./P by estimate_prior. Ignored if .fint is
+        %             also present (see above). NOTE: previously documented
+        %             here as '.chi0' - that field name is never read by
+        %             the code; use 'chi_b'.
+        % fitting   : fitting algorithm parameters. fitting.lambdaTV and
+        %             fitting.lambdaCSF both default to 0 (i.e. both
+        %             regularisation terms off) via check_set_default; set
+        %             them explicitly to enable TV/CSF-zero-reference
+        %             regularisation. Values are means, not sums, and the
+        %             fidelity is in ppm^2 - published MEDI/MEDI+0 lambda
+        %             values do not transfer directly and must be
+        %             recalibrated on your own data.
         %
         % Output
         % -----------
@@ -183,22 +200,18 @@ classdef gpumcTFI < handle
         %
         % Input
         % -----------
-        % data      : Variable flip angle data images, [x,y,z,TE]
+        % data      : Complex multi-echo GRE data, [x,y,z,nTE] (see estimate()
+        %             for the full extraData/fitting field reference)
         % mask      : 3D signal mask, [x,y,z]
         % fitting   : fitting algorithm parameters
-        % parM0     : 4D parameter starting points of fitting, [x,y,slice,param], 4th dimension corresponding to fitting  parameters with order [fa,Da,De,ra,p2] (optional)
-        % 
+        % extraData : additional data (see estimate())
+        %
         % Output
         % -----------
         % out       : output structure
         %
-        % Description: askAdam Image-based R1R2* model fitting
-        %
-        % Kwok-Shing Chan @ MGH
-        % kchan2@mgh.harvard.edu
-        % Date created: 8 Dec 2023
-        % Date modified: 3 April 2024
-        %
+        % Description: askAdam image-based mcTFI fitting (joint M0, R2*,
+        % preconditioned susceptibility y, and phase offset phi)
         %
             
             % get image size
@@ -381,11 +394,11 @@ classdef gpumcTFI < handle
         function x0 = determine_x0(this,data,mask,extraData,fitting)
         % Starting point for the preconditioned variable y.
         %
-        % If an approximate susceptibility map chi0 is available (it is, if
-        % the preconditioner was built the Liu 2020 way, since that pipeline
-        % produces chi_est en route), initialise y0 = chi0 ./ P. This costs
+        % If an approximate susceptibility map extraData.chi_b is available
+        % (supplied directly, or derived internally from extraData.fint via
+        % gpuPDF - see estimate()), initialise y0 = chi_b ./ P. This costs
         % nothing and starts the optimiser near the solution. P >= ~1 by
-        % construction so the division is safe, but it is guarded anyway.
+        % construction so the division is safe.
         %
         % For the linear branch a zero start is merely slow. For the
         % nonlinear branch the objective is periodic and non-convex, and the
@@ -663,11 +676,8 @@ classdef gpumcTFI < handle
         % dimensionless, bounded in [0,4] per element, and spread over twice
         % as many elements because of the cos/sin stacking.
         %
-        % NOTE: lambdaTV and lambdaCSF are NOT defaulted here, but are read
-        % unconditionally by regulariser(), prepare_data() and
-        % postprocess(). Calling this class without setting both errors with
-        % "Reference to non-existent field". Add defaults below, or document
-        % them as mandatory in estimate().
+        % NOTE: lambdaTV and lambdaCSF both default to 0 below (both
+        % regularisation terms off) if not supplied by the caller.
         %
         % lambdaTV/lambdaCSF are also NOT the published Liu values: the
         % regularisation terms here are means rather than sums, and the
