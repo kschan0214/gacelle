@@ -30,7 +30,7 @@ We can simulate the measurements using this function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 4-28
+    :lines: 20-43
 
 Now **y** is our 'realistic' noisy data for the estimation.
 
@@ -43,43 +43,43 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 31-32
+    :lines: 46-48
 
 2. Set up the model parameters and fitting boundary.
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 34-39
+    :lines: 52-55
 
 3. Set up optimisation setting
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 40-47
+    :lines: 56-60
 
 4. Define the forward function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 49-50
+    :lines: 61-62
 
 5. Define fitting weights (optional)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 52-53
+    :lines: 64-65
 
 6. Start the optimisation
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 55-56
+    :lines: 67
 
 7. Plot the estimation results
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam.m
     :language: matlab
-    :lines: 58-64
+    :lines: 69-75
 
 .. figure:: _images/askadam_basic_scatter.png
    :align: center

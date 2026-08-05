@@ -1,10 +1,9 @@
-%% S = Example_monoexponential_FWD_askadam_3D_Strategy1( pars, t, mask)
+%% S = Example_monoexponential_FWD_askadam_3D_Strategy1( pars, t)
 %
 % Input
 % --------------
 % pars          : input model parameter structure (This is ALWAYS the first input variable)
 % t             : [1xNt] sampling time (could be any extra input)
-% mask          : 3D signal mask
 %
 % Output
 % --------------

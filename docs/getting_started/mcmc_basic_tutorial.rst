@@ -17,7 +17,7 @@ In this model, we have two parameters to be estimated: :math:`S0` and :math:`R_{
 
 The first thing is to create a function to generate the forward signal. Here is an example:
 
-.. literalinclude:: ../../examples/Example_monoexponential_FWD_mcmc.m
+.. literalinclude:: ../../examples/Example_monoexponential_FWD_GD.m
     :language: matlab
 
 Note that the design of the forward function is slightly stricter for the MCMC solver. The output signal s must have a dimension of Nmeas by Nvoxel.
@@ -26,7 +26,7 @@ We can simulate the measurements using this function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 4-28
+    :lines: 20-43
 
 To estimate :math:`S0` and :math:`R_{2}^{*}` from y, 
 
@@ -34,43 +34,43 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 31-34
+    :lines: 46-49
 
 2. Set up the model parameters and fitting boundary
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 36-41
+    :lines: 53-56
 
 3. Set up optimisation setting
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 42-48
+    :lines: 57-63
 
 4. Define the forward function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 50-51
+    :lines: 65-66
 
 5. Define fitting weights (optional)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 53-54
+    :lines: 68-69
 
 6. Start the optimisation
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 56-57
+    :lines: 71
 
 7. Plot the estimation results
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_mcmc.m
     :language: matlab
-    :lines: 59-65
+    :lines: 73-79
 
 .. figure:: _images/mcmc_basic_scatter.png
    :align: center

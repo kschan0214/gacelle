@@ -1,4 +1,20 @@
-addpath(genpath('../../gacelle/'))
+% Example_monoexponential_estimate_askadam.m
+%
+% Minimal, direct use of askadam.optimisation on vectorised (GACELLE
+% dimension, 'G-D') input: a two-parameter monoexponential decay (S0, R2*) is
+% simulated for Nsample independent voxels, Gaussian noise is added at a
+% fixed SNR, and the parameters are recovered by calling askadam directly
+% against a user-supplied forward function, without going through any of
+% GACELLE's built-in model classes (e.g. gpuNEXI, gpuAxCaliberSMT). Useful as
+% a template for fitting a custom forward model outside the model-class
+% framework. Recovered values are plotted against ground truth and the
+% random starting points.
+%
+% Kwok-Shing Chan
+% Date create: 5 August 2026
+%
+%% add path
+addpath('../../gacelle/');addpath_gacelle;
 clear
 
 %% generate some signal based on monoexponential decay
@@ -39,7 +55,8 @@ fitting.lb                  = [0, 0];   % lower bound
 fitting.ub                  = [2, 50];  % upper bound
 % Estimation algorithm setting
 fitting.iteration           = 10000;
-fitting.initialLearnRate    = 0.001;
+fitting.initialLearnRate    = 0.01;
+fitting.decayRate           = 0.001;
 fitting.lossFunction        = 'l1';
 
 % define your forward model
@@ -48,8 +65,7 @@ modelFWD = @Example_monoexponential_FWD_GD;
 % equal weights
 weights = [];
 
-askadam_obj = askadam;
-out         = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
+out     = askadam().optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %% plot the estimation results
 figure;

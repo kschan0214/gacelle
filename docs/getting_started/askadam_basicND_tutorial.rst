@@ -31,15 +31,7 @@ Here is an example:
 
 .. literalinclude:: ../../examples/Example_monoexponential_FWD_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 20-44
-
-In contrast to :doc:`the basic tutorial <askadam_basic_tutorial>`, we have some extra operations here
-
-.. literalinclude:: ../../examples/Example_monoexponential_FWD_askadam_3D_Strategy1.m
-    :language: matlab
-    :lines: 32-37
-
-This block of code is to handle the input from ``askadam.m``. As discussed in :doc:`designing a new model <designing_model>`, the estimation parameters from askAdam are already masked and reshaped into [1*Nvoxel] arrays. This block essentially has two operations: (1) checks if the estimation parameters are masked, (2) if so then reshape the estimation parameters to their original N-D size using the 3-D mask. *GACELLE* provides a utility function ``reshape_GD2ND`` to simplify the reshaping operation of an array from G-D size to N-D size.
+    :lines: 19-31
 
 Note that the final output **S** of this forward model function is always 4D ([Nx*Ny*Nz*Nt]). When **S** is not 2D, ``askadam.m`` will automatically apply the input mask internally.
 
@@ -47,7 +39,7 @@ We can then simulate the 4D measurements using this function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 4-30
+    :lines: 13-39
 
 Now **y** is our 'realistic' noisy data for the estimation.
 
@@ -55,7 +47,7 @@ This time we also have a spherical non-zero mask to demonstrate the usage of a m
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 17
+    :lines: 26
 
 To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**, 
 
@@ -63,43 +55,43 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 34-35
+    :lines: 42-44
 
 2. Set up the model parameters and fitting boundary
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 37-42
+    :lines: 48-51
 
-3. Set up optimisation setting
+3. Set up optimisation setting. Note that we need to set `fitting.isOptimiseMemory` to 'false' such that the signal mask does not apply to the fitting parameters `S0` and `R2star` to keep these array as their original data size (i.e., 3D in this example)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 43-50
+    :lines: 52-57
 
 4. Define the forward function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 52-53
+    :lines: 58-59
 
 5. Define fitting weights (optional)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 55-56
+    :lines: 61-62
 
 6. Start the optimisation
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 58-59
+    :lines: 64
 
 7. Plot the estimation results
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 61-74
+    :lines: 66-79
 
 .. figure:: _images/strategy1_image.png
    :align: center
@@ -120,7 +112,7 @@ Strategy 2
 
 This strategy provides the most memory and computationally efficient way for the optimisation, but the operation is a bit less intuitive.
 
-The first thing is to create a function to generate the forward signal. To accomodate the first 3 dimensions for spatial information, we will put the time :math:`t` in the 4th dimension.
+Similar to Strategy 1, the first thing is to create a function to generate the forward signal. To accomodate the first 3 dimensions for spatial information, we will put the time :math:`t` in the 4th dimension.
 
 Here is an example:
 
@@ -133,7 +125,7 @@ In contrast to :doc:`the basic tutorial <askadam_basic_tutorial>`, we have some 
 
 .. literalinclude:: ../../examples/Example_monoexponential_FWD_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 38-40
+    :lines: 32-41
 
 This block of code is to handle the input from ``askadam.m``. As discussed in :doc:`designing a new model <designing_model>`, the estimation parameters from askAdam are already masked and reshaped into [1*Nvoxel] arrays. This block essentially has two operations: (1) checks if the estimation parameters are masked, (2) if so then reshape the output **S** to the G-D format. *GACELLE* provides a utility function ``reshape_ND2GD`` to simplify the reshaping operation of an array from the N-D size to G-D size.
 
@@ -145,7 +137,7 @@ We can then simulate the 4D measurements using this function by using 3D :math:`
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 4-30
+    :lines: 14-40
 
 Now **y** is our 'realistic' 4D noisy data for the estimation.
 
@@ -153,7 +145,7 @@ This time we also have a spherical non-zero mask to demonstrate the usage of a m
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 17
+    :lines: 27
 
 To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**, 
 
@@ -161,43 +153,43 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 34-35
+    :lines: 43-45
 
 2. Set up the model parameters and fitting boundary
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 37-42
+    :lines: 49-52
 
-3. Set up optimisation setting
+3. Set up optimisation setting. Note that we set `fitting.isOptimiseMemory` back to 'true' vs Strategy 1 example
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 43-50
+    :lines: 53-58
 
 4. Define the forward function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 52-53
+    :lines: 60-61
 
 5. Define fitting weights (optional)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 55-56
+    :lines: 63-64
 
 6. Start the optimisation
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 58-59
+    :lines: 66
 
 7. Plot the estimation results
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy2.m
     :language: matlab
-    :lines: 61-74
+    :lines: 68-81
 
 .. figure:: _images/strategy2_image.png
    :align: center

@@ -40,11 +40,15 @@ Table of Contents
    :name: sec-supportedmodel
 
    supported_models/AxCaliberSMT
+   supported_models/SANDI
    supported_models/NEXI
    supported_models/mcmicro
-   supported_models/MCRMWI
    supported_models/GREMWI
+   supported_models/MCRMWI
    supported_models/JointR1R2star
+   supported_models/R2starMapping
+   supported_models/PDF
+   supported_models/mcTFI
 
 .. toctree::
    :maxdepth: 1

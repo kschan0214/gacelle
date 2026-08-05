@@ -1,4 +1,13 @@
-addpath(genpath('../../gacelle/'))
+% Example_monoexponential_FWD_askadam_3D_Strategy1.m
+%
+% Example: monoexponential decay fitting on a 4D data
+% using askadam. Generates GT S0/R2* maps, simulates noisy signal at SNR=100,
+% fits with askadam, and plots GT vs. start vs. fitted results.
+%
+% Kwok-Shing Chan
+% Date create: 5 August 2026
+%
+addpath('../../gacelle/');addpath_gacelle;
 clear
 
 %% generate some signal based on monoexponential decay
@@ -41,13 +50,10 @@ fitting.modelParams         = {'S0','R2star'}; % modelParams;
 fitting.lb                  = [0, 0];   % lower bound 
 fitting.ub                  = [2, 50];  % upper bound
 % Estimation algorithm setting
-fitting.iteration           = 4000;
-fitting.initialLearnRate    = 0.001;
+fitting.iteration           = 10000;
+fitting.initialLearnRate    = 0.01;
+fitting.decayRate           = 0.001;
 fitting.lossFunction        = 'l1';
-fitting.tol                 = 1e-4;
-fitting.convergenceValue    = 1e-8;
-fitting.convergenceWindow   = 20;
-fitting.isDisplay           = false;
 fitting.isOptimiseMemory    = false; 
 
 % define your forward model
@@ -56,8 +62,7 @@ modelFWD = @Example_monoexponential_FWD_askadam_3D_Strategy1;
 % equal weights
 weights = [];
 
-askadam_obj = askadam;
-out         = askadam_obj.optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
+out         = askadam().optimisation(y,mask,weights,pars0,fitting,modelFWD,t);
 
 %% plot the estimation results
 figure;
@@ -73,4 +78,3 @@ nexttile;imshow(out.final.S0(:,:,11),[0 2]);title('S0 Fitted')
 nexttile;imshow(R2star(:,:,11).*mask(:,:,11),[10 60]);title('R2* GT')
 nexttile;imshow(pars0.(modelParams{2})(:,:,11).*mask(:,:,11),[10 60]);title('R2* Start')
 nexttile;imshow(out.final.R2star(:,:,11),[10 60]);title('R2* Fitted')
-

@@ -1,10 +1,25 @@
-addpath('/autofs/space/linen_001/users/kwokshing/tools/askadam/')
+% Example_monoexponential_estimate_mcmc_ensemble.m
+%
+% Minimal, direct use of ensemble solve in mcmc.m on vectorised (GACELLE
+% dimension, 'G-D') input: a two-parameter monoexponential decay (S0, R2*) is
+% simulated for Nsample independent voxels, Gaussian noise is added at a
+% fixed SNR, and the parameters are recovered by calling askadam directly
+% against a user-supplied forward function, without going through any of
+% GACELLE's built-in model classes (e.g. gpuNEXI, gpuAxCaliberSMT). Useful as
+% a template for fitting a custom forward model outside the model-class
+% framework. Recovered values are plotted against ground truth and the
+% random starting points.
+%
+% Kwok-Shing Chan
+% Date create: 5 August 2026
+%
+%% add path
+addpath('../../gacelle/');addpath_gacelle;
 clear
 
 %% generate some signal based on monoexponential decay
 % reproducibility
 seed = 5438973; rng(seed); gpurng(seed);
-
 
 % set up estimation parameters; must be the same as in FWD function
 modelParams = {'S0','R2star','noise'};
@@ -52,8 +67,7 @@ modelFWD = @Example_monoexponential_FWD_GD;
 % equal weights
 weights = [];
 
-mcmc_obj    = mcmc;
-xPosterior  = mcmc_obj.goodman_weare(y,pars0,weights,fitting,modelFWD,t);
+xPosterior  = mcmc().goodman_weare(y,pars0,weights,fitting,modelFWD,t);
 
 %% plot the estimation results
 % compute the mean values of the posterior distribution
