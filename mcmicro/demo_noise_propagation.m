@@ -1,3 +1,14 @@
+%% demo_noise_propagation.m
+%
+% This demo provides several examples on the ulitisation of gpumcmicro.m 
+% for parameter estimation with simulated data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 5 August 2026 
+% Date modified: 
+%
 addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 %% Simulate data
@@ -43,7 +54,7 @@ rng(seed); gpurng(seed);
 fitting.iteration   = 0;
 [~,pars0] = evalc('objGPU.estimate( y, mask, fitting)');
 
-%% askadam estimation
+%% mcmc estimation
 % reset class object
 objGPU      = gpumcmicro(bval_sorted);
 

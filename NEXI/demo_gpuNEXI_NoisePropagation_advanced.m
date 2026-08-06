@@ -1,4 +1,15 @@
 
+%% demo_gpuNEXI_NoisePropagation_advanced.m
+%
+% This demo provides several examples on the ulitisation of gpuNEXI.m 
+% for parameter estimation with full diffusion table (instead of SMT signal) on simulated data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 5 August 2026 
+% Date modified: 
+%
 addpath(genpath('../../dwi/C2_protocoldesign'));
 clear
 

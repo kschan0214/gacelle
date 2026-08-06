@@ -1,3 +1,14 @@
+%% demo_gpuNEXI_NoisePropagation.m
+%
+% This demo provides several examples on the ulitisation of gpuNEXI.m 
+% for parameter estimation with simulated data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 5 August 2026 
+% Date modified: 
+%
 addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 %% Simulate data

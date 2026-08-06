@@ -1,4 +1,14 @@
-
+%% demo_gpuJointR1R2starMapping_NoisePropagation.m
+%
+% This demo provides several examples on the ulitisation of gpuJointR1R2starMapping.m 
+% for parameter estimation with simulated data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 5 August 2026 
+% Date modified: 
+%
 addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
 clear;
 

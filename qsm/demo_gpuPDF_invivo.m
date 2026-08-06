@@ -1,3 +1,14 @@
+%% demo_gpuPDF_invivo.m
+%
+% This demo provides several examples on the ulitisation of gpuPDF.m 
+% for parameter estimation on in vivo data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 5 August 2026 
+% Date modified: 
+%
 %% add paths
 addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;

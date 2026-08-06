@@ -1,3 +1,14 @@
+%% demo_noise_propagation_wR2.m
+%
+% This demo provides an example on the ulitisation of gpumcmicro.m 
+% for parameter estimation with additional (experimental) compartmental R2(=1/T2) on simulated data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 5 August 2026 
+% Date modified: 
+%
 addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 %% Simulate data
