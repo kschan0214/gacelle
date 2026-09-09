@@ -13,7 +13,7 @@ addpath('../../gacelle/');addpath_gacelle;
 clear;
 
 %% I/O: Load data
-gre_invivo_dir = fullfile('~/Downloads','ds006181'); % this is where the data locates, feel free to update this path
+gre_invivo_dir = fullfile('~/Downloads','zenodo22666992'); % this is where the data locates, feel free to update this path
 check_gre_invivo_demo_data; % check if the demo data exists, if not then download it to gre_invivo_dir
 
 subj_label = 'sub-003';
