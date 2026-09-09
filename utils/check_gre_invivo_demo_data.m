@@ -22,9 +22,24 @@ else
     % (the in vivo GRE/MCR-MWI example dataset the demos below expect at
     % fullfile(gre_invivo_dir,'bids')) is extracted here; curl is piped
     % straight into tar so the full archive is never written to disk.
+    %
+    % LD_LIBRARY_PATH="" and `bash -c ... pipefail` work around two
+    % Linux/MATLAB system()-call gotchas: (1) MATLAB prepends its own
+    % bundled (older) libcurl to LD_LIBRARY_PATH, which breaks the
+    % system curl binary with "unknown option was passed in to libcurl"
+    % on flags like -L/-f; (2) without pipefail, `curl | tar` silently
+    % reports success (tar's exit code) even if curl itself failed and
+    % piped nothing/an error page into tar.
     zenodo_url = 'https://zenodo.org/records/22666992/files/gacelle_dsc_20260908.tar.gz?download=1';
-    cmd_txt    = sprintf(['curl -L "%s" | tar xz -C "%s" --strip-components=2 ' ...
-                           'dsc/example_dataset_mcrmwi/bids'], zenodo_url, gre_invivo_dir);
-    system(cmd_txt);
+    cmd_txt    = sprintf(['bash -c ''set -o pipefail; LD_LIBRARY_PATH="" curl -fL "%s" | ' ...
+                           'tar xz -C "%s" --strip-components=2 dsc/example_dataset_mcrmwi/bids'''], ...
+                           zenodo_url, gre_invivo_dir);
+    status = system(cmd_txt);
+    if status ~= 0
+        error('check_gre_invivo_demo_data:downloadFailed', ...
+            ['Failed to download/extract the demo data from Zenodo (exit status %d).\n' ...
+             'Try running this command directly in a terminal (not inside MATLAB) to see the ' ...
+             'actual curl/tar error:\n%s'], status, cmd_txt);
+    end
     disp('Download is completed.');
 end
