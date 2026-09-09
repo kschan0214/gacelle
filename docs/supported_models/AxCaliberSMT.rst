@@ -76,7 +76,7 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 
 .. note::
-   As of v1.1, ``gpuAxCaliberSMT`` dispatches internally on ``fitting.solver``: the same object handles both the askAdam and MCMC solvers, and setting ``fitting.solver = 'mcmc'`` runs the MCMC path described under `gpuAxCaliberSMTmcmc`_ below without needing a separate object.
+   As of v1.1, ``gpuAxCaliberSMT`` dispatches internally on ``fitting.solver``: the same object handles both the askAdam and MCMC solvers, and setting ``fitting.solver = 'mcmc'`` runs the MCMC path without needing a separate object. A standalone ``gpuAxCaliberSMTmcmc`` class, if still present in the repository, is likely a thin or legacy wrapper around this dispatch rather than an independently maintained implementation.
 
 ``estimate()`` also runs GACELLE's automatic GPU memory manager (``utils.find_optimal_segment_3D``) transparently, segmenting large volumes if required. See `Automatic GPU Memory Management <https://gacelle.readthedocs.io/en/latest/advanced/automatic_memory_management.html>`_ for the relevant ``fitting.autoMemManage``, ``fitting.NSegmentUser``, and ``fitting.segmentOverlap`` options.
 
