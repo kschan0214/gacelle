@@ -832,47 +832,6 @@ classdef utils < handle
 
         end
 
-        % TODO: determine how the dataset will be divided based on vailable memory in GPU
-        function [NSegment,maxSlice] = find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel)
-        % Input
-        % -----
-        % mask                  : 3D signal mask
-        % memoryFixPerVoxel     : memory usage 
-        %
-            % % get these number based on mdl fit
-            % memoryFixPerVoxel       = 0.0013;
-            % memoryDynamicPerVoxel   = 0.05;
-
-            dims = size(mask,1:3);
-
-            % GPU info
-            gpu         = gpuDevice;    
-            maxMemory   = floor(gpu.TotalMemory / 1024^3)*1024^3 / (1024^2);        % Mb
-
-            % find max. memory required
-            memoryRequiredFix       = memoryFixPerVoxel * prod(dims(1:3)) ;         % Mb
-            memoryRequiredDynamic   = memoryDynamicPerVoxel * numel(mask(mask>0));  % Mb
-
-            if maxMemory > (memoryRequiredFix + memoryRequiredDynamic)
-                % if everything fit in GPU
-                maxSlice = dims(3);
-                NSegment = 1;
-            else
-                % if not then divide the data
-                 NvolSliceMax= 0;
-                for k = 1:dims(3)
-                    tmp             = mask(:,:,k);
-                    NvolSliceMax    = max(NvolSliceMax,numel(tmp(tmp>0)));
-                end
-                maxMemoryPerSlice = memoryDynamicPerVoxel * NvolSliceMax;
-                maxSlice = floor((maxMemory - memoryRequiredFix)/maxMemoryPerSlice);
-                NSegment = ceil(dims(3)/maxSlice);
-            end
-            if NSegment ~= 1
-                fprintf('Data is divided into %d segments\n',NSegment);
-            end
-        end
-
         function boundaries = build_balanced_boundaries(mask, NvoxPerSeg, NSegmentMin)
         % Divide slices into segments with approximately equal voxel counts,
         % where each segment stays <= NvoxPerSeg masked voxels.
