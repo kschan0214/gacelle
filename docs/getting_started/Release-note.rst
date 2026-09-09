@@ -18,6 +18,7 @@ Unified solver architecture
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 * Every model class now exposes a single ``fitting.solver = 'askadam' | 'mcmc'`` option and one ``estimate(...)`` entry point, replacing the previous pattern of separate ``gpu<Model>`` / ``gpu<Model>mcmc`` classes per solver (e.g. ``gpuNEXI`` + ``gpuNEXImcmc``, ``gpuJointR1R2starMapping`` + ``gpuJointR1R2starMappingmcmc``, ``gpuAxCaliberSMT`` + ``gpuAxCaliberSMTmcmc`` are each now a single class). The old solver-specific classes have been removed from the main model folders (old implementations kept only under each model's ``sandbox/deprecated/`` for reference). ``gpuMEAxCaliberSMT`` and ``gpuNEXIrice`` remain experimental and live under their model's ``sandbox/`` rather than being part of this release's supported model set.
 * All demo/example scripts across every model were updated and re-validated against the new interface.
+* **Breaking:** ``gpuSANDI`` and ``gpumcmicro``'s ``estimate()`` now take arguments in the same ``(data, mask, extraData, fitting, pars0)`` order as every other model class. Both previously took ``(data, mask, fitting, extraData, pars0)`` - ``fitting`` before ``extraData`` - which was the odd one out and easy to get wrong when adapting a script from another model's page. Update any existing calls to these two models' ``estimate()`` accordingly.
 
 Automatic GPU memory management
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

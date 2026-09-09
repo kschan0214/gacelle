@@ -15,7 +15,7 @@ Usage
 .. code-block::
 
     obj = gpumcmicro(b, te);
-    [out] = obj.estimate( data, mask, fitting, extraData, pars0);
+    [out] = obj.estimate( data, mask, extraData, fitting, pars0);
 
 Model parameters
 ^^^^^^^^^^^^^^^^
@@ -37,10 +37,7 @@ I/O overview
 | te                        | 1xNshell echo time [s] (Optional; scalar broadcasts to all shells; omitted = single TE, R2a/R2e not fitted)  |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 
-``[out] = obj.estimate( data, mask, fitting, extraData, pars0);``
-
-.. note::
-   ``estimate()`` takes its arguments in the order ``(data, mask, fitting, extraData, pars0)`` - ``fitting`` before ``extraData`` - which differs from every other GACELLE model class (``data, mask, extraData, fitting``). Double-check argument order if adapting a script from another model page.
+``[out] = obj.estimate( data, mask, extraData, fitting, pars0);``
 
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | Input                     | Description                                                                                                  |
@@ -48,14 +45,6 @@ I/O overview
 | data                      | 4D DWI, [x,y,z,dwi], full acquisition or rotationally invariant (l=0) signal                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | mask                      | 3D mask, [x,y,z]                                                                                             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation (only class-specific options shown; note argument order below)|
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting.solver            | Solver used for estimation, 'askadam' (default) | 'mcmc'                                                     |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting.start             | Starting point method, 'likelihood' (default) | 1xM parameters array                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting.isFitD            | Intrinsic diffusivity 'D' is a free parameter, true (default) | false. See note below.                       |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extraData                 | Structure array with additional data (Optional unless noted)                                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
@@ -68,6 +57,14 @@ I/O overview
 | extraData.BDELTA          | 1D diffusion time [1xdwi], same order as 'data' [ms] (Optional, only if 'data' is full acquisition)          |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | extraData.D               | 3D fixed intrinsic diffusivity map, [x,y,z] [um2/ms] (Required if fitting.isFitD = false)                    |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting                   | Structure array for model parameter estimation (only class-specific options shown)                          |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.solver            | Solver used for estimation, 'askadam' (default) | 'mcmc'                                                     |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.start             | Starting point method, 'likelihood' (default) | 1xM parameters array                                         |
++---------------------------+--------------------------------------------------------------------------------------------------------------+
+| fitting.isFitD            | Intrinsic diffusivity 'D' is a free parameter, true (default) | false. See note below.                       |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
 | pars0                     | Structure array of starting points, one field per model parameter, same spatial size as 'data' (Optional)    |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+
