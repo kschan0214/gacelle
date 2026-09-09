@@ -47,12 +47,12 @@ rng(seed); gpurng(seed);
 fitting             = [];
 fitting.solver      = 'askadam';
 fitting             = objGPU.check_set_default(fitting);
-out_adam            = objGPU.estimate(y, mask, fitting);
+out_adam            = objGPU.estimate(y, mask, [], fitting);
 
 % get initial starting point based on likelihood method for scatter plots
 rng(seed); gpurng(seed);
 fitting.iteration   = 0;
-[~,pars0] = evalc('objGPU.estimate( y, mask, fitting)');
+[~,pars0] = evalc('objGPU.estimate( y, mask, [], fitting)');
 
 %% mcmc estimation
 % reset class object
@@ -63,7 +63,7 @@ rng(seed); gpurng(seed);
 fitting         = [];
 fitting.solver  = 'mcmc';
 fitting         = objGPU.check_set_default(fitting);
-out_mcmc        = objGPU.estimate(y, mask, fitting);
+out_mcmc        = objGPU.estimate(y, mask, [], fitting);
 
 %% make some plots
 
@@ -72,7 +72,7 @@ fitting             = [];
 fitting.solver      = 'askadam';
 fitting.iteration   = 0;
 fitting             = objGPU.check_set_default(fitting);
-[~,loss_mcmc] = evalc('objGPU.estimate( y, mask, fitting, [], out_mcmc.mean)');
+[~,loss_mcmc] = evalc('objGPU.estimate( y, mask, [], fitting, out_mcmc.mean)');
 
 % plot result
 field = fieldnames(pars);

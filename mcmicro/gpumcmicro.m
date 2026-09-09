@@ -145,9 +145,9 @@ classdef gpumcmicro < handle
 
         % This is a wrapper of the 'fit' function.
         % The main purpose of this function is to handle memory issue and ensure the input data is correct for 'fit'
-        function  [out] = estimate(this, data, mask, fitting, extraData, pars0)
+        function  [out] = estimate(this, data, mask, extraData, fitting, pars0)
         % Input data are expected in multi-dimensional image
-        % 
+        %
         % Input
         % -----------
         % data      : 4D DWI, [x,y,z,dwi]
@@ -158,22 +158,24 @@ classdef gpumcmicro < handle
         %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
         %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
         % fitting   : fitting algorithm parameters (see fit function)
-        % 
+        %
         % Output
         % -----------
         % out       : output structure contains all parameter estimation results
-        % 
-            
+        %
+
             % display basic info
             this.display_data_model_info;
 
-            % get all fitting algorithm parameters 
+            % if no extraData input at all (not even empty) then assume none
+            if nargin < 4; extraData    = []; end
+
+            % get all fitting algorithm parameters
             fitting = this.check_set_default(fitting);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0        = []; end
-            if nargin < 5; extraData    = []; end
 
             % compute rotationally invariant signal if needed
             [data, mask] = this.prepare_dwi_data(data,mask,extraData,0);

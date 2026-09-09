@@ -47,4 +47,4 @@ extraData                   = [];
 extraData.bval              = bval;
 extraData.bvec              = bvec;
 
-out   = dwi_smt.estimate(dwi, mask, fitting,extraData);
+out   = dwi_smt.estimate(dwi, mask, extraData, fitting);

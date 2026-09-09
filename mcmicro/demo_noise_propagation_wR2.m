@@ -54,14 +54,14 @@ rng(seed); gpurng(seed);
 fitting             = [];
 fitting.solver      = 'askadam';
 fitting             = objGPU.check_set_default(fitting);
-out                 = objGPU.estimate(y, mask, fitting);
+out                 = objGPU.estimate(y, mask, [], fitting);
 
 %% make some plots
 rng(seed); gpurng(seed);
 
 % get initial starting point based on likelihood method for scatter plots
 fitting.iteration   = 0;
-pars0               = objGPU.estimate(y, mask, fitting); 
+pars0               = objGPU.estimate(y, mask, [], fitting);
 
 % get FWD signal based on fitted result
 shat = objGPU.FWD(out.final);

@@ -133,10 +133,10 @@ classdef gpuSANDI < handle
 
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out] = estimate(this, data, mask, fitting, extradata,  pars0)
+        function  [out] = estimate(this, data, mask, extradata, fitting, pars0)
         % Perform NEXI model parameter estimation based on askAdam
         % Input data are expected in multi-dimensional image
-        % 
+        %
         % Input
         % -----------
         % dwi       : 4D DWI, [x,y,z,dwi]
@@ -148,16 +148,19 @@ classdef gpuSANDI < handle
         %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
         % fitting   : fitting algorithm parameters (see fit function)
         % pars0     : (Optional) initial starting points for model parameters
-        % 
+        %
         % Output
         % -----------
         % out       : output structure contains all estimation results
-        % 
-            
+        %
+
             % display basic info
             this.display_data_model_info;
 
-            % get all fitting algorithm parameters 
+            % if no extradata input at all (not even empty) then assume none
+            if nargin < 4; extradata = []; end
+
+            % get all fitting algorithm parameters
             fitting     = this.check_set_default(fitting);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%

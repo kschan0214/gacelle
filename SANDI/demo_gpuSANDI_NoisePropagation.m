@@ -61,14 +61,14 @@ fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood'; 
 extraData                   = [];
 
-out_adam                    = objGPU.estimate(y, mask, fitting, extraData);
+out_adam                    = objGPU.estimate(y, mask, extraData, fitting);
 
 % make some plots
 % get initial starting point based on likelihood method for scatter plots
 rng(seed); gpurng(seed);
 fitting.iteration   = 0;
 objGPU              = gpuSANDI(bval_sorted, ldelta_sorted, BDELTA_sorted, Ds);
-pars0               = objGPU.estimate(y, mask, fitting, []); 
+pars0               = objGPU.estimate(y, mask, [], fitting);
 
 % plot result
 field = fieldnames(pars);
@@ -103,7 +103,7 @@ fitting.thinning            = 10;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};
 extraData                   = [];
 
-out_mcmc   = objGPU.estimate(y, mask, fitting, extraData);
+out_mcmc   = objGPU.estimate(y, mask, extraData, fitting);
 
 % plot result
 figure;

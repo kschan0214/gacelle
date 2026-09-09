@@ -55,7 +55,7 @@ fitting.solver              = 'askadam';
 fitting                     = dwi_smt.check_set_default(fitting);
 fitting.start               = 'likelihood'; 
 
-out_askadam   = dwi_smt.estimate(dwi, mask, fitting,extraData);
+out_askadam   = dwi_smt.estimate(dwi, mask, extraData, fitting);
 
 %% Demo #2: mcmc.m estimation
 % reset class object
@@ -73,4 +73,4 @@ fitting.thinning            = 10;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};
 
 % askadam estimation
-out_ensemble = dwi_smt.estimate(dwi, mask, fitting,extraData);
+out_ensemble = dwi_smt.estimate(dwi, mask, extraData, fitting);
