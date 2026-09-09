@@ -6,7 +6,7 @@ Release note
 v1.1
 ----
 
-Release date: 9 September 2026
+Release date: 9 September 2026 (`GitHub release <https://github.com/kschan0214/gacelle/releases/tag/v1.1>`_)
 
 Full diff since v1.0: `v1.0...v1.1 <https://github.com/kschan0214/gacelle/compare/v1.0...v1.1>`_.
 
@@ -58,6 +58,6 @@ Documentation
 v1.0
 ----
 
-Release date: 16 November 2025
+Release date: 16 November 2025 (`GitHub release <https://github.com/kschan0214/gacelle/releases/tag/v1.0>`_)
 
 Initial tagged release.
