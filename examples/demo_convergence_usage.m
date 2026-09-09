@@ -1,9 +1,42 @@
+%% demo_convergence_usage.m
+%
+% Demonstrates askadam.m's v1.1 convergence options (see
+% docs/advanced/askadam_convergence.rst) by fitting the same tiny
+% synthetic NEXI dataset under 6 different convergence configurations -
+% the default linear-slope convergence model, EMA smoothing, outlier-
+% robust convergence (on its own and combined with EMA), step-norm
+% convergence, and all of the above combined - and comparing:
+%   1. how many iterations each config took and its final loss (printed
+%      summary table);
+%   2. how well each recovered the ground-truth parameters (scatter of
+%      fitted vs. GT, one row per parameter, one column per config,
+%      including the unfitted starting point for reference);
+%   3. each config's per-sample residual loss;
+%   4. each config's per-parameter RMSE against ground truth (bar chart;
+%      the unfitted starting point is deliberately excluded here since
+%      its RMSE would dwarf every fitted config and make the comparison
+%      between them unreadable).
+%
+% All 6 configs are fitted to IDENTICAL noisy data (same rng seed reset
+% before every call) and start from the same 'likelihood'-based initial
+% guess, so any difference between them is purely due to the convergence
+% option(s) each one changes relative to fitting_base.
+%
+% Kwok-Shing Chan
+% kchan2@mgh.harvard.edu
+%
+% Date created: 12 June 2026
+% Date modified:
+%
 addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 
 %% ========================================================
 % Simulate data
 % ========================================================
+% A single-protocol (15-measurement, 3-shell) synthetic NEXI dataset,
+% following the same recipe as NEXI/demo_gpuNEXI_NoisePropagation.m -
+% see that script for the full ground-truth-generation/noise details.
 seed    = 23439; rng(seed); gpurng(seed);
 Nsample = 1e3;
 SNR     = 20;
@@ -38,6 +71,11 @@ mask    = ones(size(y,1:3)) > 0;
 %% ========================================================
 % Base fitting settings (shared across all configurations)
 % ========================================================
+% Every config below starts from a COPY of fitting_base and only adds/
+% overrides the convergence-specific field(s) it's testing - everything
+% else (solver, learning rate, loss function, starting-point method, ...)
+% stays fixed so the comparison isolates the effect of convergence
+% settings alone.
 fitting_base                    = objGPU.check_set_default([]);
 fitting_base.solver             = 'askadam';
 fitting_base.iteration          = 4000;
@@ -77,6 +115,17 @@ out_ema                     = objGPU.estimate(y, mask, [], fitting);
 % Tests whether outlier-aware convergence and gradient
 % downweighting changes results vs. baseline
 % ========================================================
+% fitting.robustConvergence and the fitting.outlier* fields below
+% together control per-voxel outlier detection/downweighting during
+% convergence checking (see docs/advanced/askadam_convergence.rst for
+% the full description of each):
+%   .outlierWeight          - downweight applied to flagged voxels
+%   .weightUpdateInterval   - iterations between outlier-weight updates
+%   .outlierCheckWindow     - iterations averaged over when checking
+%   .outlierMinFlagDuration - min iterations a voxel must stay flagged
+%   .outlier{Voxel,Pop}Thres      - steady-state flagging thresholds
+%   .outlierInit{Thres,PopThres}  - (usually looser) early-iteration
+%                                    thresholds, before the fit settles
 fprintf('\n=== Config 3: Robust convergence (linear) ===\n');
 rng(seed); gpurng(seed);
 fitting                         = fitting_base;
@@ -95,6 +144,7 @@ out_robust                      = objGPU.estimate(y, mask, [], fitting);
 %% ========================================================
 % Config 4: Robust convergence + EMA (full mode 2)
 % Tests the combined effect of both new features
+% (fitting.outlier* fields as described under Config 3 above)
 % ========================================================
 fprintf('\n=== Config 4: Robust convergence + EMA ===\n');
 rng(seed); gpurng(seed);
@@ -117,6 +167,11 @@ out_robust_ema                  = objGPU.estimate(y, mask, [], fitting);
 % Tests whether step norm catches stagnation not caught
 % by loss-based signal alone
 % ========================================================
+% fitting.convergenceStepTol: converged once the relative change in
+% parameter values between iterations drops below this for
+% fitting.patienceStep consecutive checks - independent of the loss-based
+% criteria (fitting.convergenceModel/robustConvergence above), and can
+% trigger stopping even if the loss-based signal hasn't.
 fprintf('\n=== Config 5: Step norm convergence signal ===\n');
 rng(seed); gpurng(seed);
 fitting                         = fitting_base;
@@ -128,6 +183,7 @@ out_step                        = objGPU.estimate(y, mask, [], fitting);
 %% ========================================================
 % Config 6: All signals combined
 % Tests the full v1.1 feature set together
+% (EMA + robust convergence [Config 3/4] + step norm [Config 5])
 % ========================================================
 fprintf('\n=== Config 6: All signals combined ===\n');
 rng(seed); gpurng(seed);
@@ -150,6 +206,10 @@ out_all                         = objGPU.estimate(y, mask, [], fitting);
 %% ========================================================
 % Reference: starting point (0 iterations)
 % ========================================================
+% fitting.iteration = 0 makes estimate() return the 'likelihood'
+% starting-point estimate itself (no askadam updates applied) - used
+% below as the "Start" column/baseline in the scatter and per-sample-loss
+% plots, to show how much each config's fit actually improved on it.
 rng(seed); gpurng(seed);
 fitting_ref             = fitting_base;
 fitting_ref.iteration   = 0;
@@ -170,7 +230,11 @@ end
 
 %% ========================================================
 % Plot: scatter plots of fitted vs GT for each config
-% Compare all configs against baseline (config 1)
+% Grid of fitted (y) vs. ground-truth (x) scatter plots: one row per
+% model parameter (fa, Da, De, ra, p2, plus the derived exchange time
+% 'tex'), one column per config (including the unfitted "Start" point
+% for reference). Points on the black identity line (refline(1)) are
+% recovered exactly.
 % ========================================================
 field = fieldnames(pars);
 Nfield = numel(field) + 1;  % +1 for tex
@@ -204,6 +268,10 @@ end
 
 %% ========================================================
 % Plot: per-sample loss comparison across configs
+% out.final.resloss is each config's final per-sample loss - overlaid
+% here (one marker style/colour per config, "Start" included) to see
+% whether any config leaves a systematically worse-fitting subpopulation
+% of samples than the others.
 % ========================================================
 figure('Name', 'Per-sample residual loss — all configs');
 tiledlayout(1, 1);
@@ -220,6 +288,11 @@ legend; xlabel('Sample'); ylabel('Loss'); title('Per-sample residual loss');
 
 %% ========================================================
 % Plot: RMSE per parameter across configs
+% One bar chart per parameter (including derived 'tex'), one bar per
+% fitted config - the unfitted "Start" baseline is deliberately excluded
+% here (its RMSE would dwarf every fitted config's and make the
+% comparison between them unreadable); see the scatter plots above for
+% Start-vs-fitted comparisons instead.
 % ========================================================
 figure('Name', 'RMSE per parameter — all configs');
 tiledlayout(1, Nfield, 'TileSpacing', 'compact');
