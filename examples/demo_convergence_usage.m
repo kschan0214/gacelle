@@ -241,6 +241,6 @@ for f = 1:numel(all_field)
         rmse_vals(k) = sqrt(mean((fitted(:) - GT_vals.(all_field{f})(:)).^2));
     end
     bar(rmse_vals);
-    set(gca, 'XTickLabel', config_labels(2:end), 'XTickLabelRotation', 30);
+    set(gca, 'XTick', 1:numel(rmse_vals), 'XTickLabel', config_labels(2:end), 'XTickLabelRotation', 30);
     ylabel('RMSE'); title(all_field{f});
 end
