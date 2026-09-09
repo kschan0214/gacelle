@@ -214,7 +214,7 @@ plot(pars0.final.resloss, 'x', 'Color', colors(1,:), 'DisplayName', 'Start');
 markers = {'o','+','s','d','^','v'};
 for k = 1:numel(outs)
     plot(outs{k}.final.resloss, markers{k}, 'Color', colors(k+1,:), ...
-        'MarkerFaceAlpha', 0.4, 'DisplayName', config_labels{k+1});
+        'DisplayName', config_labels{k+1});
 end
 legend; xlabel('Sample'); ylabel('Loss'); title('Per-sample residual loss');
 
