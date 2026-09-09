@@ -16,6 +16,19 @@ else
 
     if ~exist(gre_invivo_dir,'dir'); mkdir(gre_invivo_dir); end
 
+    % MATLAB's own file functions (exist/mkdir above) resolve a leading
+    % '~' to the home directory, but gre_invivo_dir is still literally
+    % stored as e.g. '~/Downloads/...'. Passed as-is into the bash -C
+    % "..." argument below (double-quoted), that literal '~' is NOT
+    % shell-expanded - tar would try to cd into a directory named '~'
+    % that doesn't exist, fail immediately, and kill curl's write end of
+    % the pipe ("Failed writing body"). Resolve it to an absolute path
+    % here instead.
+    gre_invivo_dir_abs = gre_invivo_dir;
+    if strncmp(gre_invivo_dir_abs, '~', 1)
+        gre_invivo_dir_abs = fullfile(getenv('HOME'), gre_invivo_dir_abs(2:end));
+    end
+
     % The archive on Zenodo (10.5281/zenodo.22666992, ~750 MB) is
     % GACELLE's full data-sharing collection (dsc/), which bundles
     % several unrelated datasets. Only dsc/example_dataset_mcrmwi/bids
@@ -33,7 +46,7 @@ else
     zenodo_url = 'https://zenodo.org/records/22666992/files/gacelle_dsc_20260908.tar.gz?download=1';
     cmd_txt    = sprintf(['bash -c ''set -o pipefail; LD_LIBRARY_PATH="" curl -fL "%s" | ' ...
                            'tar xz -C "%s" --strip-components=2 dsc/example_dataset_mcrmwi/bids'''], ...
-                           zenodo_url, gre_invivo_dir);
+                           zenodo_url, gre_invivo_dir_abs);
     status = system(cmd_txt);
     if status ~= 0
         error('check_gre_invivo_demo_data:downloadFailed', ...
