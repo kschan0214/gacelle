@@ -1,3 +1,4 @@
 *.asv
 docs/_build
 *.DS_Store
+docs/tmp
