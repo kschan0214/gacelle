@@ -13,21 +13,30 @@ every MATLAB install. Two tiers:
   specifically designed to catch that class of bug.
 - **`SmokeFit_*Test.m`** (Tier 2, GPU required) - one per model
   (`R2starMapping`, `mcmicro`, `NEXI`, `AxCaliberSMT`, `GREMWI`,
-  `JointR1R2starMapping`, `SANDI`). Each forward-simulates a *tiny*
-  synthetic dataset (a handful of voxels) with known ground truth, fits
-  it with `fitting.solver = 'askadam'` at a drastically reduced iteration
-  count, and checks the fit runs without error and produces finite
-  (non-NaN/Inf) output. This is **not** a scientific-accuracy test - a
-  handful of voxels/iterations can't reproduce the real
+  `JointR1R2starMapping`, `SANDI`, `MCRMWI`). Each forward-simulates a
+  *tiny* synthetic dataset (a handful of voxels) with known ground truth,
+  fits it with `fitting.solver = 'askadam'` at a drastically reduced
+  iteration count, and checks the fit runs without error and produces
+  finite (non-NaN/Inf) output. This is **not** a scientific-accuracy test
+  - a handful of voxels/iterations can't reproduce the real
   `demo_*NoisePropagation*.m` scripts' validation - it only checks "did
-  this still run and produce sane output."
+  this still run and produce sane output." `SmokeFit_MCRMWITest.m` is the
+  heaviest of these - it loads the bundled pretrained EPG-X MLP weights
+  (`MCRMWI/EPGXgen_net/*.mat`) to forward-simulate ground truth, same as
+  the real demo does.
 
-Not covered yet: `gpuMCRMWI` (heaviest setup - EPG-X ANN + DIMWI +
-complex data; a real reduction of it is a good follow-up once this
-pattern is established), `gpumcTFI` and `gpuPDF` (no `NoisePropagation`
-demo to base a test on; both need a synthetic brain-like complex GRE
-volume with a dipole-convolved ground truth field rather than a flat
-voxel array).
+Not covered yet: `gpumcTFI` and `gpuPDF` - neither has a
+`NoisePropagation` demo to base a test on, and both need a synthetic
+brain-like complex GRE volume with a dipole-convolved ground-truth field
+rather than a flat voxel array. SEPIA's own test suite
+(`sepia/test/phantom/generate_synthetic_phantom.m`) already builds
+exactly this kind of phantom (a few spherical susceptibility sources in
+an ellipsoid brain mask, dipole-kernel-convolved to a local field, plus a
+smooth background field and complex-noise multi-echo signal simulation)
+for its background-field-removal and QSM dipole-inversion tests - reusing
+that design (not the code directly, since it writes NIfTI files for
+SEPIA's I/O rather than in-memory arrays) is the natural next step for
+these two.
 
 ## Running
 
