@@ -90,3 +90,5 @@ Please report any bugs on the [Issue page](https://github.com/kschan0214/gacelle
 
 If you have a more general question regarding the usage of GACELLE, please make use of the [Discussion board](https://github.com/kschan0214/gacelle/discussions).
 
+Planning to modify the toolbox yourself? See [CONTRIBUTING.md](CONTRIBUTING.md).
+
