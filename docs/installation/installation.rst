@@ -7,7 +7,19 @@ Installation
 
 The latest update can be found on `GitHub <https://github.com/kschan0214/gacelle>`_.
 
-You need to add the directory of the package to your Matlab's PATH
+You need to add the directory of the package to your Matlab's PATH. As of
+v1.1, the recommended way is to call the bundled ``addpath_gacelle``
+function, which adds GACELLE and its subfolders to the path while
+excluding ``docs/``, ``sandbox/``, ``deprecated/`` and ``mpl_training/``
+(unlike a plain ``genpath``, which would add those too):
+
+.. code-block::
+
+    addpath('/path/to/gacelle/');
+    addpath_gacelle();
+
+If you need the raw, unfiltered behaviour instead, the old approach still
+works:
 
 ``addpath(genpath('/path/to/gacelle/'))``
 

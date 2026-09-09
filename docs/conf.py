@@ -7,9 +7,9 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'GACELLE documentation'
-copyright = '2024, Kwok-Shing Chan'
+copyright = '2024-2026, Kwok-Shing Chan'
 author = 'Kwok-Shing Chan'
-release = '0.1.0'
+release = '1.1'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
