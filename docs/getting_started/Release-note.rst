@@ -8,7 +8,7 @@ v1.1
 
 Release date: 9 September 2026
 
-Full diff since v1.0: `v1.0...v1.1 <https://github.com/kschan0214/gacelle/compare/v1.0...v1.1>`_ (link resolves once the ``v1.1`` tag is pushed).
+Full diff since v1.0: `v1.0...v1.1 <https://github.com/kschan0214/gacelle/compare/v1.0...v1.1>`_.
 
 New QSM module
 ^^^^^^^^^^^^^^^
