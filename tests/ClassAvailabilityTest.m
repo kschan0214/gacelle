@@ -75,5 +75,14 @@ classdef ClassAvailabilityTest < matlab.unittest.TestCase
             testCase.verifyTrue(~any(contains(gacellePaths, 'mpl_training')), ...
                 'No path containing "mpl_training" should be added by addpath_gacelle().');
         end
+
+        function testGACELLEVersionCallable(testCase)
+            % Regression-proof the docs' claim that utils.GACELLE_version()
+            % is a real, callable helper (it used to be a same-named but
+            % unrelated standalone script, not a method of utils).
+            v = utils.GACELLE_version();
+            testCase.verifyClass(v, 'char');
+            testCase.verifyNotEmpty(v);
+        end
     end
 end

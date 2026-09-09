@@ -22,6 +22,14 @@ classdef utils < handle
 
     methods(Static)
 
+        function v = GACELLE_version()
+        % Return (and print) the installed GACELLE toolbox version.
+        %
+        %   v = utils.GACELLE_version();
+            v = 'v1.1';
+            fprintf('GACELLE version: %s\n', v);
+        end
+
         function s = struct2gpusingle(s)
         % Recursively convert all numeric arrays in a struct to gpuArray single.
             fn = fieldnames(s);
