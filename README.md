@@ -66,6 +66,12 @@ GACELLE provides two types of solvers to handle parameter estimation prolem:
   tutorial, an "Understanding the output" page, and reference pages for
   the new QSM classes plus R2starMapping/mcmicro/SANDI.
 
+## Example data
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22666992.svg)](https://doi.org/10.5281/zenodo.22666992)
+
+An example MCR-MWI (multi-compartment relaxometry myelin water imaging) dataset is available on Zenodo: [10.5281/zenodo.22666992](https://doi.org/10.5281/zenodo.22666992).
+
 ## Terms of use
 Please check [the license file](https://github.com/kschan0214/gacelle/blob/master/LICENSE) for more information. 
 
