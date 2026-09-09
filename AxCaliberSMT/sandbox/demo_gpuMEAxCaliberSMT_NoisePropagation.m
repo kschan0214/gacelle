@@ -66,7 +66,7 @@ fitting                     = objGPU.check_set_default(fitting);
 fitting.start               = 'likelihood';
 extraData                   = [];
 
-out   = objGPU.estimate(s, mask, extraData, fitting);
+out   = objGPU.estimate(s, mask, fitting, extraData);
 
 % plot result
 figure;
@@ -83,7 +83,12 @@ end
 
 %% MCMC estimation
 % reset class object for MCMC
-objGPU                      = gpuMEAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, D0, Da_fixed, DeL_fixed, Dcsf);
+tissueProperties            = [];
+tissueProperties.D0         = D0;
+tissueProperties.Da         = Da_fixed;
+tissueProperties.DeL        = DeL_fixed;
+tissueProperties.Dcsf       = Dcsf;
+objGPU                      = gpuMEAxCaliberSMT(bval_sorted, ldelta_sorted, BDELTA_sorted, te_sorted, tissueProperties, model);
 
 fitting                     = [];
 fitting.solver              = 'mcmc';
@@ -97,7 +102,7 @@ fitting.thinning            = 10;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};
 extraData                   = [];
 
-out   = objGPU.estimate(s, mask, extraData, fitting);
+out   = objGPU.estimate(s, mask, fitting, extraData);
 
 % plot result
 figure;

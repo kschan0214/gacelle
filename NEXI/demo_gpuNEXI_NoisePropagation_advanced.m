@@ -1,4 +1,3 @@
-
 %% demo_gpuNEXI_NoisePropagation_advanced.m
 %
 % This demo provides several examples on the ulitisation of gpuNEXI.m 
@@ -10,12 +9,11 @@
 % Date created: 5 August 2026 
 % Date modified: 
 %
-addpath(genpath('../../dwi/C2_protocoldesign'));
 clear
 
 %% Simulation setting
 SNR     = 50;
-Ngdir   = 32;
+Ngdir   = 32; % 16, 32 or 64
 Nsample = 1e3;
 
 bval_unique = [2.3 3.5 4.8 6.5 11.5 17.5];
@@ -26,12 +24,9 @@ Nshell          = [4, 5, 6];
 bval            = [bval_unique(1:Nshell(1)) ...       % D=13 ms
                    bval_unique(1:Nshell(2)) ...       % D=21 ms
                    bval_unique(1:Nshell(3))].';       % D=30 ms
-method = 'matlab';          % 'mrtrix' or 'matlab': MRtrix is much faster 
-
-pd = protocoldesign();
 % Create b-table
 tic;
-bvec = pd.dirgen(Ngdir,method);
+bvec = readmatrix(sprintf('../utils/btable/bvec_%ddir.csv',Ngdir));
 
 %% Generate signal based on narrow pulse solution (NEXI)
 Delta = [DELTA_big(1)*ones(Nshell(1),1); DELTA_big(2)*ones(Nshell(2),1); DELTA_big(3)*ones(Nshell(3),1);];
@@ -40,7 +35,9 @@ Nav   = Ngdir*ones(numel(bval),1);
 
 N = Nsample;
 
-NEXIobj = NEXIrotinv(bval, Delta);
+rotinv  = rotational_invariant;
+objGPU  = gpuNEXI(bval, Delta);
+
 intervals = [0.1 0.9  ;   % fa: intra-neurite volume fraction
                 1.5 3   ;   % Da: intra-neurite axial diffusivity
                 0.5 1.5   ;   % De/Da: ratio of Da to De
@@ -61,10 +58,10 @@ S_SH_NEXI   = zeros(numel(bval), Ngdir, N);
 theta       = acos(bvec(:,3));
 parfor k = 1:N
     kappa       = pars(5,k);    %4.73;
-    ang         = NEXIobj.WatsonAng(kappa)/pi*180;
-    pl_NEXI     = NEXIobj.WatsonSH(kappa,lmax);
-    F           = NEXIobj.NEXIsh(pars(1,k),pars(2,k),pars(3,k),pars(4,k),lmax);
-    Si          = NEXIobj.SHconv(F, pl_NEXI, theta);
+    ang         = rotinv.WatsonAng(kappa)/pi*180;
+    pl_NEXI     = rotinv.WatsonSH(kappa,lmax);
+    F           = objGPU.NEXIsh(pars(1,k),pars(2,k),pars(3,k),pars(4,k),lmax);
+    Si          = rotinv.SHconv(F, pl_NEXI, theta);
     S_SH_NEXI(:,:,k) = squeeze(Si);
 end
 
@@ -81,7 +78,7 @@ bvec_all = bvec; bvec_all(end+1:end+Ngdir/16,:) = 0; bvec_all = repmat(bvec_all,
 DELTA_all = repmat(Delta(:).',Ngdir+Ngdir/16,1); DELTA_all = DELTA_all(:);
 delta_all = repmat(delta(:).',Ngdir+Ngdir/16,1); delta_all = delta_all(:);
 
-pl = NEXI.WatsonSHexact(pars(5,:));
+pl = rotinv.WatsonSHexact(pars(5,:));
  
 GT.fa = pars(1,:);
 GT.Da = pars(2,:);
@@ -105,11 +102,6 @@ extraData.ldelta    = delta_all.';
 extraData.BDELTA    = DELTA_all.';
 
 out = objGPU.estimate(S_SH_NEXI_n, mask, extraData, fitting);
-
-% obj = DWIutility();
-% s = obj.get_Sl_all(S_SH_NEXI_n,extraData.bval,extraData.bvec,extraData.ldelta,extraData.BDELTA,2);
-% shat = permute(objGPU.FWD(GT,2),[2 3 4 1]);
-% out = objGPU.estimate(shat, mask, extraData, fitting);
 
 %% plot result
 figure;

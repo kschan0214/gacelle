@@ -1,4 +1,3 @@
-
 %% demo_gpuGREMWI_noisePropagation.m
 %
 % This demo provides several examples on the ulitisation of gpuGREMWI.m 

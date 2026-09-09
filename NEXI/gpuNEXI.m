@@ -1083,6 +1083,42 @@ classdef gpuNEXI < handle
 
         end
 
+        function F = NEXIsh(this, fa, Da, De, ra, lmax)
+            Nb = numel(this.b);
+            Nl = ceil((lmax+1)/2);
+            F = zeros(Nl,Nb);
+            for i = 1:Nl
+                li = (i-1)*2;
+                F(i,:) = this.IntegralLegendreNEXI(li, fa, Da, De, ra) * sqrt((2*li+1)*pi);
+            end
+        end
+
+        function I = IntegralLegendreNEXI(this, n, fa, Da, De, ra)
+            Da = this.b*Da;
+            De = this.b*De;
+            ra = ra*this.Delta;
+            re = ra*fa/(1-fa);
+            if mod(n,2) == 1    % n is odd
+                I = 0;
+            else                % n is even
+                I = 0;
+                for k = 0:floor(n/2)
+                    I = I + (-1)^k * nchoosek(n,k) * nchoosek(2*n-2*k,n) * ...
+                        this.IntegralPolyNEXI(n-2*k, fa, Da, De, ra, re);
+                end
+                I = I / 2^n;
+            end
+        end
+
+        function I = IntegralPolyNEXI(this, n, fa, Da, De, ra, re)
+            if mod(n,2) == 1
+                I = 0;
+            else
+                f = @(x) x.^n .* this.M(x, fa, Da, De, ra, re);
+                I = integral(@(x)f(x),-1, 1, 'AbsTol', 1e-14, 'ArrayValued', true);
+            end
+        end
+
     end
 
     methods(Static)

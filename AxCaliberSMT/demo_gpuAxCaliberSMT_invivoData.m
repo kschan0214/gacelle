@@ -16,7 +16,8 @@ addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' packa
 clear;
 
 %% I/O: Load data
-check_dwi_invivo_demo_data; % check if the demo data exists
+dwi_invivo_dir = fullfile('~/Downloads','ds006181'); % this is where the data locates, feel free to update this path
+check_dwi_invivo_demo_data; % check if the demo data exists, if not then download it to dwi_invivo_dir
 
 preproc_dir = fullfile(dwi_invivo_dir,'derivatives','preprocessed_dwi');
 
@@ -64,7 +65,7 @@ fitting.solver              = 'askadam';
 fitting                     = dwi_smt.check_set_default(fitting);
 fitting.start               = 'likelihood';
 fitting.regmap              = {'a','f'};        % apply TV regularisation on 2 maps
-fitting.lambda              = {0.0001, 0.0001};
+fitting.lambda              = {0.00001, 0.0001};
 fitting.TVmode              = '3D';
 fitting.voxelSize           = [2,2,2];
 
@@ -78,10 +79,12 @@ fitting                     = [];
 fitting.solver              = 'mcmc';
 fitting                     = dwi_smt.check_set_default(fitting);
 fitting.start               = 'likelihood';
-fitting.iteration           = 1e6;
-fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.iteration           = 5e5;
+fitting.thinning            = 50;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};
 
+% reset class object for mcmc
+dwi_smt     = gpuAxCaliberSMT(bval,ldelta,BDELTA, D0, Da_fixed, DeL_fixed, Dcsf);
 % reproducibility
 seed = 892396; rng(seed); gpurng(seed);
 % askadam estimation
@@ -96,9 +99,11 @@ fitting.algorithm           = 'ensemble';
 fitting.Nwalker             = 30;
 fitting.StepSize            = 2;
 fitting.iteration           = 3e4;
-fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.thinning            = 50;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};
 
+% reset class object for mcmc
+dwi_smt     = gpuAxCaliberSMT(bval,ldelta,BDELTA, D0, Da_fixed, DeL_fixed, Dcsf);
 % reproducibility
 seed = 892396; rng(seed); gpurng(seed);
 % askadam estimation

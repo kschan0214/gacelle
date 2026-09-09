@@ -2,9 +2,8 @@ classdef gpuMEAxCaliberSMT < handle
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
 % Date created: 29 September 2025
-% Date modified: 
-
-% TODO: sort b and te and input full DWI
+% Date modified: 13 August 2026
+% Date modified: 4 September 2026
 
     properties (GetAccess = public, SetAccess = protected)
     % ===== MODEL PARAMETER CONTRACT =====
@@ -15,6 +14,13 @@ classdef gpuMEAxCaliberSMT < handle
     % R2e       : Extra-neurite R2 [1/s]
     % k2a       : rate of axon radius induced T2 [um/s]
     % R2a       : Intrinsic neurite R2 [1/s]
+    % S0        : per-voxel signal amplitude at the first echo/b=0
+    %             (fitting.isFitS0-conditional; see updateProperty/FWD).
+    %             Only meaningful when prepare_dwi_data's per-voxel
+    %             dwi./dwi(:,:,:,1) normalisation is SKIPPED (also
+    %             fitting.isFitS0-conditional) -- fitting both S0 AND
+    %             per-voxel-normalising the data would make S0 fit a
+    %             degenerate constant ~1 for every voxel.
     % noise     : noise
     %
     % modelParams{k} <-> ub(k) <-> lb(k) <-> startPoint(k) <-> step(k)
@@ -26,11 +32,11 @@ classdef gpuMEAxCaliberSMT < handle
     % updateProperty() can strip it by name without hardcoding an index,
     % and fit() (~line 521) can locate it via this.modelParams{end}. Any
     % future solver-conditional parameter should likewise go last.
-        modelParams     = {'f'; 'fcsf';'DeR';  'r';'R2e';'k2a';'R2a';'noise'};
-        ub              = [  1;      1;  1.7;    5;   50;    4;   20;   0.1];
-        lb              = [  0;      0;    0;1e-10;    1;    0;    5;  0.01];
-        startPoint      = [0.6;   0.05;    1;    1;   30;  2.4;    8; 0.005];
-        step            = [0.05;   0.1; 0.48;  0.8;  3.5; 0.29; 1.07; 0.005];
+        modelParams     = {'f'; 'fcsf';'DeR';  'r';'R2e';'k2a';'R2a';  'S0';'noise'};
+        ub              = [  1;      1;  1.7;    5;   50;    4;   20;    10;   0.1];
+        lb              = [  0;      0;    0;1e-10;    1;    0;    5;     0;  0.01];
+        startPoint      = [0.6;   0.05;    1;  0.5;   30;  2.4;    8;     1; 0.005];
+        step            = [0.05;   0.1; 0.48;  0.8;  3.5; 0.29; 1.07;   0.1; 0.005];
     end
 
     properties
@@ -112,7 +118,8 @@ classdef gpuMEAxCaliberSMT < handle
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu)
         %
             % handle full b-value vector and Big delta vector
-            [bval_sorted,ldetla_sorted,BDELTA_sorted,te_sorted] = DWIutility.unique_shell_keepb0(b,delta,Delta,te,true);
+            % [bval_sorted,ldetla_sorted,BDELTA_sorted,te_sorted] = DWIutility.unique_shell_keepb0(b,delta,Delta,te,true);
+            [bval_sorted,ldetla_sorted,BDELTA_sorted,te_sorted] = DWIutility.unique_shell_keepb0(b,delta,Delta,te,false);
 
             % sequence parameters
             % diffusion
@@ -135,17 +142,25 @@ classdef gpuMEAxCaliberSMT < handle
             
             % user defined
             % diffusion
-            if isfield(tissueProperties,'D0');      this.D0     = (single( D0 ));       end
-            if isfield(tissueProperties,'Da');      this.Da     = (single( Da ));       end
-            if isfield(tissueProperties,'DeL');     this.DeL    = (single( DeL ));      end
-            if isfield(tissueProperties,'Dcsf');    this.Dcsf   = (single( Dcsf ));     end
+            if isfield(tissueProperties,'D0');      this.D0     = single(tissueProperties.D0);       end
+            if isfield(tissueProperties,'Da');      this.Da     = single(tissueProperties.Da);       end
+            if isfield(tissueProperties,'DeL');     this.DeL    = single(tissueProperties.DeL);      end
+            if isfield(tissueProperties,'Dcsf');    this.Dcsf   = single(tissueProperties.Dcsf);     end
             % relaxation
-            if isfield(tissueProperties,'R2csf');   this.R2csf  = (single( R2csf ));    end
-            if isfield(tissueProperties,'R2c');     this.R2c    = (single( R2c ));      end
-            if isfield(tissueProperties,'rho2');    this.rho2   = (single( rho2 ));     end
+            if isfield(tissueProperties,'R2csf');   this.R2csf  = single(tissueProperties.R2csf);    end
+            if isfield(tissueProperties,'R2c');     this.R2c    = single(tissueProperties.R2c);      end
+            if isfield(tissueProperties,'rho2');    this.rho2   = single(tissueProperties.rho2);     end
 
-            if ~isempty(model);                     this.model  = model;                end  
+            if ~isempty(model);                     this.model  = model;                end
 
+            this.ub(ismember(this.modelParams,'DeR')) = single(this.DeL);
+
+            % fall back to ordinary AxCaliberSMT
+            if isscalar(unique(te_sorted))
+                this.R2csf = 0;
+                this.R2c = 0;
+                this.rho2 = 0;
+            end
             this.Scsf   = ( single(exp(-this.b*this.Dcsf).*exp(-this.te*this.R2csf)) );
 
         end
@@ -200,6 +215,18 @@ classdef gpuMEAxCaliberSMT < handle
                 this.startPoint(idx)        = [];
             end
 
+            % whether fitting a per-voxel amplitude S0 (see FWD/
+            % prepare_dwi_data) -- default false, i.e. the pre-existing
+            % per-voxel dwi./dwi(:,:,:,1) normalisation stays in effect
+            % and S0 is implicitly 1
+            if ~fitting.isFitS0
+                idx = find(ismember(this.modelParams,'S0'));
+                this.modelParams(idx)       = [];
+                this.lb(idx)                = [];
+                this.ub(idx)                = [];
+                this.startPoint(idx)        = [];
+            end
+
         end
     
         % display some info about the input data and model parameters
@@ -215,7 +242,7 @@ classdef gpuMEAxCaliberSMT < handle
             fprintf('b-shells (ms/um2)              : [%s] \n',num2str(this.b.',' %.2f'));
             fprintf('Gradient pulse duration (ms)   : [%s] \n',num2str(this.delta.',' %i'));
             fprintf('Diffusion time (ms)            : [%s] \n\n',num2str(this.Delta.',' %i'));
-            if ~unique(this.te) == 0
+            if ~(unique(this.te) == 0)
                 fprintf('TE (ms)                        : [%s] \n',num2str(this.te.'*1e3,' %.2f'));
             end
             disp('----------------')
@@ -227,7 +254,7 @@ classdef gpuMEAxCaliberSMT < handle
             disp(['Diffusivity intra-cellular axial (um2/ms)    : ' num2str(this.Da,'%.2f')]);
             disp(['Diffusivity extra-cellular axial (um2/ms)    : ' num2str(this.DeL,'%.2f')]);
             disp(['Diffusivity CSF (um2/ms)                     : ' num2str(this.Dcsf,'%.2f')]);
-            if ~unique(this.te) == 0
+            if ~(unique(this.te) == 0)
                 disp(['Intrinsic intra-axonal T2 (ms)               : ' num2str(1/this.R2c*1e3,'%.2f')]);
                 disp(['Surface-to-volume ratio constant (ms)        : ' num2str(this.rho2,'%.2f')]);
             end
@@ -270,7 +297,7 @@ classdef gpuMEAxCaliberSMT < handle
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             lmax        = 0;    % only spherical mean
-            [data,mask] = this.prepare_dwi_data(data,mask,extraData,lmax);
+            [data,mask,scaleFactor] = this.prepare_dwi_data(data,mask,extraData,lmax,fitting);
 
             % convert datatype to single or logical
             data    = single(data);
@@ -311,7 +338,29 @@ classdef gpuMEAxCaliberSMT < handle
                 % restore 'out' structure from segment
                 out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
             end
-            out.mask = mask;
+            out.mask        = mask;
+            out.scaleFactor = scaleFactor;   % global reference-signal scalar from prepare_dwi_data
+
+            % fitting.isFitS0=true fits S0 against the GLOBALLY-scaled
+            % data (dwi/scaleFactor, per prepare_dwi_data's Step 0 --
+            % per-voxel normalisation is skipped in this mode, see
+            % FWD/prepare_dwi_data), so the fitted S0 is only meaningful
+            % in that scaled unit system. Rescale it back to the
+            % original input units here, exactly once, on the final
+            % (already segment-restored) output -- mirrors
+            % gpuAxonalT2model's own scaleFactor rescaling of its fitted
+            % S0 in estimate(). Solver-agnostic: askadam's output nests
+            % results under out.final/out.min, mcmc's under
+            % out.mean/out.mode -- rescale S0 in ANY top-level substruct
+            % that has one, rather than hardcoding either solver's field
+            % names.
+            outFields = fieldnames(out);
+            for kf = 1:numel(outFields)
+                fname = outFields{kf};
+                if isstruct(out.(fname)) && isfield(out.(fname),'S0')
+                    out.(fname).S0 = out.(fname).S0 * scaleFactor;
+                end
+            end
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
@@ -346,6 +395,32 @@ classdef gpuMEAxCaliberSMT < handle
         %   .lmax               : Order of rotational invariant, 0|2, default = 0
         %   .lossFunction       : loss for data fidelity term, 'L1'|'L2'|'MSE', default = 'L1'
         %   .display            : online display the fitting process on figure, true|false, defualt = false
+        %   .start              : starting point strategy for the optimiser --
+        %                         'default'|'likelihood' (see determine_x0), a
+        %                         struct for per-parameter/per-voxel overrides
+        %                         (see determine_x0), a plain numeric vector,
+        %                         or 'multistart' (askadam solver only): sweep
+        %                         .sweepN log-spaced candidate starting values
+        %                         for .sweepParam (default 'r') between
+        %                         .sweepMin/.sweepMax (default
+        %                         max(this.lb(idx),0.1) / this.ub(idx)/2),
+        %                         keep each voxel's lowest-resloss candidate as
+        %                         a per-voxel seed, then run ONE consolidating
+        %                         joint fit seeded with that map -- fixes
+        %                         askadam's finite-iteration-budget
+        %                         underestimation of large r at low neurite
+        %                         fraction (see fit_multistart_sweep and
+        %                         NS0_20260902/noise_propagation_0a/0b/0c)
+        %   .lambdaR2aPrior     : weight for a penalty pulling the fitted
+        %                         (per-voxel) R2a back toward the class-default
+        %                         prior this.R2c (askadam solver only), default
+        %                         = 0 (off). Norm matches .lossFunction (L1/
+        %                         L2/MSE/Huber) -- see run_askadam/reg_R2aPrior.
+        %                         R2a is meant to represent one tissue
+        %                         constant but askadam fits it as an ordinary
+        %                         per-voxel free parameter with no
+        %                         architectural constraint to stay uniform;
+        %                         this adds stability without hard-clamping it.
         % pars0     : structure variable of starting points of fitting (optional)
         % 
         % Output
@@ -389,36 +464,199 @@ classdef gpuMEAxCaliberSMT < handle
             lmax    = 0;
             w       = this.compute_optimisation_weights(mask,fitting.lossFunction,lmax); % This is a customised funtion
 
-            % 2.2 estimate prior if needed
-            if isempty(pars0);  pars0 = this.determine_x0(data,mask,fitting); end
+            % 2.2/2.3 estimate prior if needed + optimisation main
+            if isempty(pars0) && ischar(fitting.start) && strcmpi(fitting.start,'multistart')
+                % multi-start sweep + per-voxel-best consolidating fit --
+                % see fit_multistart_sweep for the full strategy
+                out = this.fit_multistart_sweep(data, mask, w, fitting);
+            else
+                if isempty(pars0);  pars0 = this.determine_x0(data,mask,fitting); end
 
-            % 2.3 optimisation main
-            switch fitting.solver
-                case 'askadam'
-                    out         = askadam().optimisation( data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
-                case 'mcmc'
-                    fitting.xStepSize = this.step;
-                    
-                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+                switch fitting.solver
+                    case 'askadam'
+                        out         = this.run_askadam(data, mask, w, pars0, fitting);
+                    case 'mcmc'
+                        fitting.xStepSize = this.step;
+
+                        out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+                end
             end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
             disp('The estimation is completed.');
-            
+
             % clear GPU
             reset(gpuDevice)
 
+        end
+
+        % Wraps askadam().optimisation, adding the optional R2a-prior
+        % regularisation (fitting.lambdaR2aPrior, see reg_R2aPrior) via
+        % askadam's custom-regularisation-handle mechanism when
+        % requested; falls back to askadam's own default (TV)
+        % regularisation path otherwise, exactly as every caller did
+        % before this method existed. Only applies to the askadam
+        % solver (mirrors how the TV path is also askadam-specific --
+        % mcmc.m has its own separate implementation). Centralising this
+        % here (rather than duplicating the branch at every call site)
+        % means the regulariser applies uniformly regardless of which
+        % starting-point strategy is used (fit()'s own call, and both
+        % of fit_multistart_sweep's calls, all funnel through this).
+        function out = run_askadam(this, data, mask, w, pars0, fitting)
+
+            if isfield(fitting,'lambdaR2aPrior') && fitting.lambdaR2aPrior > 0
+                if any(strcmp(fitting.modelParams,'R2a'))
+                    userfuncCell = {@this.FWD, @this.reg_R2aPrior};
+                    modelInput   = {fitting.solver};
+                    regulInput   = {fitting.lambdaR2aPrior, fitting.lossFunction};   % norm matches the data-fidelity loss (see reg_R2aPrior)
+                    out = askadam().optimisation(data, mask, w, pars0, fitting, userfuncCell, {modelInput, regulInput});
+                    return
+                else
+                    warning('gpuMEAxCaliberSMT:lambdaR2aPriorIgnored', ...
+                        'fitting.lambdaR2aPrior>0 but R2a is not an active fitted parameter for this call (isFitR2a=false or single-TE) -- ignored.');
+                end
+            end
+            out = askadam().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+        end
+
+        % Penalty pulling the fitted (per-voxel) R2a back toward the
+        % class-default prior this.R2c, weighted by lambda. The NORM
+        % matches fitting.lossFunction (same switch as askadam.
+        % model_gradient's own data-fidelity term), so the
+        % regularisation is consistent with whatever loss the data-
+        % fidelity term itself uses -- L1: lambda*mean(|R2a-R2c|);
+        % L2/MSE: lambda*mean((R2a-R2c)^2); Huber: lambda*mean(huber_
+        % delta1(R2a-R2c)). Used via askadam's custom-regularisation-
+        % function hook (see run_askadam) -- R2a is meant to represent
+        % one tissue constant, but askadam fits it as an ordinary
+        % per-voxel free parameter with no architectural constraint to
+        % stay uniform; this penalty adds stability without hard-
+        % clamping it.
+        function loss_prior = reg_R2aPrior(this, parameters, lambda, lossFunction)
+            if ~isfield(parameters,'R2a')
+                loss_prior = 0;   % R2a not an active fitted parameter this call
+                return
+            end
+            d = parameters.R2a(:) - this.R2c;
+            switch lower(lossFunction)
+                case 'l1'
+                    loss_prior = lambda * mean(abs(d),'all');
+                case {'l2','mse'}
+                    loss_prior = lambda * mean(d.^2,'all');
+                case 'huber'
+                    % huberDelta=1, matching the deep learning toolbox huber() default
+                    % (named to avoid colliding with this.delta, the diffusion
+                    % gradient pulse duration property)
+                    huberDelta = 1;
+                    absd       = abs(d);
+                    loss_prior = lambda * mean( (absd<=huberDelta).*(0.5*d.^2) + (absd>huberDelta).*(huberDelta*(absd-0.5*huberDelta)), 'all');
+                otherwise
+                    loss_prior = lambda * mean(abs(d),'all');   % fallback: L1
+            end
+        end
+
+        % Multi-start "sweep then consolidate" strategy for
+        % fitting.start='multistart' (see fit()'s header and
+        % NS0_20260902/noise_propagation_0a/0b/0c for the full derivation):
+        % askadam's finite iteration budget means a single fixed starting
+        % point barely moves a parameter with a weak loss gradient (e.g. r
+        % at low neurite fraction), systematically biasing it toward its
+        % start. Runs fitting.sweepN log-spaced candidate starting values
+        % for fitting.sweepParam, keeps each voxel's lowest-out.final.
+        % resloss candidate as a per-voxel seed map (via determine_x0's
+        % existing isstruct(fitting.start) branch), then runs ONE
+        % consolidating joint fit seeded with that map -- so any globally-
+        % shared fitted parameter (e.g. R2a) still ends up estimated once,
+        % self-consistently, across the whole dataset, unlike returning the
+        % mixed per-voxel-best result directly.
+        %
+        % Only supported for fitting.solver='askadam': relies on a
+        % per-voxel out.final.resloss to rank candidates per voxel, plus a
+        % single shared askadam batch loss for the consolidating fit.
+        function out = fit_multistart_sweep(this, data, mask, w, fitting)
+
+            if ~strcmpi(fitting.solver,'askadam')
+                error('gpuMEAxCaliberSMT:fit_multistart_sweep', ...
+                    '''multistart'' is only supported for fitting.solver=''askadam''.');
+            end
+
+            pname = fitting.sweepParam;
+            idx   = find(strcmp(this.modelParams,pname),1);
+            if isempty(idx)
+                error('gpuMEAxCaliberSMT:fit_multistart_sweep', ...
+                    'fitting.sweepParam ''%s'' is not an active model parameter for this fit (this.modelParams: [%s]).', ...
+                    pname, cell2str(this.modelParams));
+            end
+
+            if isfield(fitting,'sweepMin') && ~isempty(fitting.sweepMin)
+                sweepMin = fitting.sweepMin;
+            else
+                sweepMin = max(this.lb(idx), 0.1);
+            end
+            if isfield(fitting,'sweepMax') && ~isempty(fitting.sweepMax)
+                sweepMax = fitting.sweepMax;
+            else
+                sweepMax = this.ub(idx) / 2;
+            end
+            nCand = fitting.sweepN;
+
+            r_start = logspace(log10(sweepMin), log10(sweepMax), nCand);
+            dims    = size(mask,1:3);
+
+            resloss_bank = zeros([dims, nCand]);
+            val_bank     = zeros([dims, nCand]);
+            loss_bank    = nan(1, nCand);
+
+            fprintf('Multi-start sweep: %d candidates for ''%s'' in [%.3g, %.3g]\n', nCand, pname, sweepMin, sweepMax);
+            for k = 1:nCand
+                fitting_k        = fitting;
+                fitting_k.start  = struct(pname, r_start(k));
+                pars0_k          = this.determine_x0(data, mask, fitting_k);
+                out_k            = this.run_askadam(data, mask, w, pars0_k, fitting_k);
+
+                resloss_bank(:,:,:,k) = out_k.final.resloss;
+                val_bank(:,:,:,k)     = out_k.final.(pname);
+                loss_bank(k)          = out_k.final.loss;
+            end
+
+            % per-voxel argmin over resloss -> per-voxel seed map for the
+            % swept parameter
+            [sx,sy,sz,~] = size(resloss_bank);
+            [X,Y,Z]      = ndgrid(1:sx,1:sy,1:sz);
+            [~,bestIdx]  = min(resloss_bank,[],4);
+            linIdx       = sub2ind([sx,sy,sz,nCand],X,Y,Z,bestIdx);
+            seedMap      = val_bank(linIdx);
+
+            % consolidating fit: single joint fit seeded per-voxel with
+            % seedMap, so any globally-shared parameter (e.g. R2a) is
+            % estimated once and self-consistently across the whole dataset
+            fitting_final       = fitting;
+            fitting_final.start = struct(pname, seedMap);
+            pars0_final         = this.determine_x0(data, mask, fitting_final);
+            out                 = this.run_askadam(data, mask, w, pars0_final, fitting_final);
+
+            % lightweight diagnostics, so callers can inspect the sweep
+            % without re-implementing it
+            out.multistart.sweepParam = pname;
+            out.multistart.r_start    = r_start;
+            out.multistart.loss       = loss_bank;
         end
 
         %% Data preparation
 
         % compute rotationally invariant DWI signal if necessary
         % TODO
-        function [dwi,mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
-            
+        function [dwi,mask,scaleFactor] = prepare_dwi_data(this,dwi,mask,extradata,lmax,fitting)
+
+            if nargin < 6 || isempty(fitting) || ~isfield(fitting,'isFitS0')
+                isFitS0 = false;   % preserve prior behaviour for any caller that doesn't pass fitting
+            else
+                isFitS0 = fitting.isFitS0;
+            end
+
             % full DWI data then compute rotaionally invariant signal
-            if size(dwi,4)/(lmax/2+1) > numel(this.b) 
+            if size(dwi,4)/(lmax/2+1) > numel(this.b)
                 % compute spherical mean signal
                 fprintf('Computing rotationally invariant signal...')
 
@@ -431,8 +669,7 @@ classdef gpuMEAxCaliberSMT < handle
                 elseif isscalar(extradata.te)
                     extradata.te = ones(size(extradata.bval)) * extradata.te;
                 end
-                DWIutilityObj   = DWIutility();
-                [dwi]           = DWIutilityObj.get_Sl_all_no_normalise(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,extradata.te,lmax);
+                [dwi]           = DWIutility().get_Sl_all_no_normalise(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,extradata.te,lmax);
 
                 fprintf('done.\n');
 
@@ -442,25 +679,87 @@ classdef gpuMEAxCaliberSMT < handle
                     size(dwi,4), numel(this.b)*(lmax/2+1));
             end
 
+            % --- Step 0: global-scalar reference-signal normalisation ---
+            % Bring the WHOLE dataset onto an O(1) reference-signal scale
+            % via ONE scalar for the entire dataset (as opposed to the
+            % PER-VOXEL normalisation below, which the forward model's own
+            % unit convention requires and which this step does NOT
+            % replace). Unlike per-voxel normalisation, a single global
+            % scalar preserves relative brightness BETWEEN voxels, which
+            % the background-voxel check below needs -- checking a
+            % per-voxel-normalised b=0 value (identically 1 by
+            % construction) can never detect a near-zero-signal voxel.
+            %
+            % Single-echo (or several b=0 shells at the same TE): the
+            % reference is just the (mean, if >1) b=0 signal itself.
+            % Multi-echo: the b=0 shells are ALREADY T2/T2*-decayed by
+            % their own TE, so the reference is instead the b=0 signal
+            % EXTRAPOLATED back to TE=0 via a per-voxel log-linear fit
+            % across the b=0 shells' TEs (see local_S0_TE0_lsq).
+            Nshells    = numel(this.b);
+            dwi_Sl0_g  = dwi(:,:,:,1:Nshells);   % Sl0 block, pre-per-voxel-normalisation
+            % this.b's b=0 entries are floored to 1e-10 by the constructor
+            % ("make sure b is not zero"), never exactly 0 -- use a
+            % tolerance well below the smallest real acquired b-value
+            b0idx      = find(this.b(1:Nshells) < 1e-6);
+            if isempty(b0idx)
+                error('GACELLE:noB0shell', 'No b=0 shell found in this.b; cannot compute a reference signal.');
+            end
+            te0 = this.te(b0idx);
+
+            if numel(unique(te0)) <= 1
+                % single-echo (or several b=0 replicates at one TE)
+                S0map = mean(dwi_Sl0_g(:,:,:,b0idx), 4);
+            else
+                % multi-echo: extrapolate to TE=0
+                [~,S0map] = this.local_S0_TE0_lsq(dwi_Sl0_g(:,:,:,b0idx), te0, mask);
+            end
+
+            scaleFactor = median(S0map(mask>0), 'omitmissing');
+            if ~isfinite(scaleFactor) || scaleFactor <= 0
+                error('GACELLE:badScaleFactor', ...
+                    'Computed global reference signal is non-positive/non-finite (%.4g) -- check input data/mask.', scaleFactor);
+            end
+            dwi = dwi ./ scaleFactor;
+
+            % background check uses the GLOBALLY- (not yet per-voxel-)
+            % normalised b=0 signal, captured before it is corrupted to
+            % an unconditional 1 by the per-voxel step below
+            dwi_Sl0_bg = dwi(:,:,:,1:Nshells);
+
+            % normalised by the first volume -- SKIPPED when
+            % fitting.isFitS0=true: S0 is then a free per-voxel fitted
+            % amplitude, and this step would destroy the very amplitude
+            % information it needs to recover (see FWD/property block).
+            % The impossible/incoherent checks below use a LOCAL
+            % per-voxel-normalised copy (dwi_Sl0_rn) regardless of
+            % isFitS0, so they stay meaningful either way.
+            if ~isFitS0
+                dwi = dwi ./ dwi(:,:,:,1);
+            end
+
             % --- Step 2: exclude biophysically impossible signal ---
             % |Sl0| > 1 + tolerance is impossible after normalisation by b=0
             % works for both magnitude and real-valued data
-            Nshells         = numel(this.b);
             dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
-            mask_impossible = any(abs(dwi_Sl0) > 1 + this.thres_impossible, 4);
+            dwi_Sl0_rn      = dwi_Sl0 ./ dwi_Sl0(:,:,:,1);   % per-voxel-normalised, regardless of isFitS0
+            mask_impossible = any(abs(dwi_Sl0_rn) > 1 + this.thres_impossible, 4);
             mask_valid      = ~mask_impossible;
 
             % --- Step 3: exclude near-zero signal (background voxels) ---
             % Sl0 of lowest b-value shell should be well above zero for tissue
             % very small value indicates background noise with no diffusion signal
-            mask_background = dwi_Sl0(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+            mask_background = dwi_Sl0_bg(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
             mask_valid      = mask_valid & ~mask_background;
 
             % --- Step 4: exclude incoherent signal (random noise pattern) ---
             % correlate each voxel's Sl0 signal with the median tissue template
             % median is more robust to outliers than mean
             % low correlation indicates random noise rather than coherent diffusion decay
-            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0, mask_valid);
+            % (correlation is invariant to any per-voxel scale, so
+            % dwi_Sl0_rn vs dwi_Sl0 makes no difference here -- used for
+            % consistency with the impossible check above)
+            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0_rn, mask_valid);
             if size(dwi_2D, 2) > 0
                 signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
                 signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
@@ -501,9 +800,6 @@ classdef gpuMEAxCaliberSMT < handle
                 mask = mask_valid;
             end
 
-            % normalised by the first volume
-            dwi = dwi ./ dwi(:,:,:,1);
-            
         end
 
         % compute weights for optimisation
@@ -547,7 +843,12 @@ classdef gpuMEAxCaliberSMT < handle
                     case 'likelihood'
                         % using maximum likelihood method to estimate starting points
                         x0 = this.estimate_prior(y,mask,[]);
-                        % R2a and k2a are global constants
+                        % R2a and k2a are global constants (only as a STARTING
+                        % point here -- askadam does not architecturally keep
+                        % them uniform during optimisation; fitting.
+                        % lambdaR2aPrior can softly pull R2a back toward this
+                        % same this.R2c prior throughout fitting, see
+                        % run_askadam/reg_R2aPrior)
                         if any(ismember(this.modelParams,'R2a')); x0.R2a = this.R2c;    end
                         if any(ismember(this.modelParams,'k2a')); x0.k2a = this.rho2;   end
     
@@ -560,6 +861,81 @@ classdef gpuMEAxCaliberSMT < handle
                         if any(ismember(this.modelParams,'k2a')); x0.k2a = this.rho2;   end
 
                 end
+            elseif isstruct(fitting.start)
+                % PER-PARAMETER, OPTIONALLY PER-VOXEL user-defined
+                % starting point, addressed by NAME: fitting.start.(name)
+                %
+                % NOTE: this branch is also what fit_multistart_sweep()
+                % relies on for fitting.start='multistart' (handled one
+                % level up, in fit(), BEFORE determine_x0 is ever called
+                % with 'multistart' itself -- determine_x0 always sees a
+                % concrete struct/char/numeric start, never the
+                % 'multistart' keyword). See fit()'s header and
+                % fit_multistart_sweep for that strategy.
+                % may be a scalar (broadcast to every voxel) or a full
+                % array matching mask's spatial size (a DIFFERENT
+                % starting value per voxel). Any model parameter NOT
+                % named here falls back to this model's own DEFAULT
+                % starting value, exactly as the 'default' branch above.
+                %
+                % Named-by-field (not a positional vector/cell) because
+                % this.modelParams' length and order depend on which
+                % parameters are actually configured to be fit for THIS
+                % call (fitting.isFitR2a/isFitk2a/isFitCSF, the solver,
+                % the loss function, ...) -- e.g. k2a and a 'noise'
+                % nuisance term drop out entirely for some
+                % configurations. A caller snapshotting this.startPoint/
+                % modelParams from OUTSIDE, before those flags are
+                % applied, cannot reliably predict that count/order, so
+                % a positional array is fragile; naming just the
+                % parameter(s) actually being customised (e.g. only 'r')
+                % sidesteps that entirely -- everything else is left to
+                % this method's own default-starting-point logic.
+                %
+                % This lets a caller seed one parameter (e.g. r) near
+                % each voxel's own likely value -- from a cheap per-voxel
+                % heuristic, say -- while every other parameter still
+                % starts from one shared scalar, all within a SINGLE
+                % joint fit (so any globally-shared parameter, e.g. R2a
+                % below, is estimated ONCE and consistently for the
+                % whole dataset, unlike running several separate fits
+                % with different scalar starts and picking the best
+                % result per voxel afterwards, which would leave
+                % different voxels implicitly relying on different
+                % fitted R2a values).
+                %
+                % Purely an ADDITIONAL accepted type for fitting.start --
+                % existing callers passing a plain numeric vector (or
+                % 'default'/'likelihood') are unaffected, and this does
+                % not call utils.initialise_x0 for the NAMED overrides
+                % (only for the default base, exactly as the 'default'
+                % branch above does), so that shared utility is
+                % otherwise untouched.
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+                userFields = fieldnames(fitting.start);
+                appliedFields = {};
+                for kf = 1:numel(userFields)
+                    pname = userFields{kf};
+                    if ~any(strcmp(this.modelParams,pname))
+                        continue   % not an active parameter for this call -- ignore rather than error, since modelParams can vary by fitting config
+                    end
+                    v = fitting.start.(pname);
+                    if isscalar(v)
+                        x0.(pname) = ones(dims,'single') * v;
+                    else
+                        if ~isequal(size(v,1:3),dims)
+                            error('fitting.start.%s must be scalar or match mask''s spatial size [%s]; got [%s].', ...
+                                pname, num2str(dims), num2str(size(v,1:3)));
+                        end
+                        x0.(pname) = single(v);
+                    end
+                    appliedFields{end+1} = pname; %#ok<AGROW>
+                end
+                fprintf('Using default starting points for [%s], with per-parameter overrides for [%s]\n', ...
+                    cell2str(this.modelParams), cell2str(appliedFields));
+                % R2a and k2a are global constants
+                if any(ismember(this.modelParams,'R2a')); x0.R2a = this.R2c;    end
+                if any(ismember(this.modelParams,'k2a')); x0.k2a = this.rho2;   end
             else
                 % user defined starting point
                 x0 = fitting.start(:);
@@ -819,17 +1195,86 @@ classdef gpuMEAxCaliberSMT < handle
                 s = (1-fcsf).*(f.*Sa + (1-f).*Se) + fcsf.*this.Scsf;
             end
 
-            % normalised to 1st echo, b=0
-            s = s ./ s(1,:,:,:,:);
-                
-            % make sure s cannot be greater than 1
-            s = min(s,1);
-                
+            if isfield(pars,'S0')
+                % S0 explicitly modelled (fitting.isFitS0=true): do NOT
+                % force-normalise s to 1 at the reference measurement --
+                % that would erase the compartment mixture's own
+                % relaxation-weighted value AT that point (which
+                % genuinely depends on f/fcsf/R2a/R2e/k2a/r, not just a
+                % trivial constant), forcing S0 to absorb BOTH the true
+                % amplitude AND that erased physics into one degenerate,
+                % systematically-biased scale (confirmed empirically:
+                % S0 came out as a near-perfect but wrong affine function
+                % of the ground truth, unrelated to r's own convergence).
+                % The raw compartment mixture is still bounded in [0,1]
+                % (each sub-signal decays from 1, and the compartment
+                % weights sum to 1), so clip at 1 as before, THEN scale
+                % by S0.
+                s = min(s,1);
+                s = s .* pars.S0;
+            else
+                % normalised to 1st echo, b=0 (matches
+                % prepare_dwi_data's per-voxel dwi./dwi(:,:,:,1)
+                % convention when S0 is NOT fitted)
+                s = s ./ s(1,:,:,:,:);
+
+                % make sure s cannot be greater than 1
+                s = min(s,1);
+            end
+
         end
 
     end
 
     methods(Static)
+
+        % Voxelwise closed-form mono-exponential decay fit, used ONLY to
+        % extrapolate the b=0 signal back to TE=0 for prepare_dwi_data's
+        % global-scalar reference-signal step: log(|img|) is linear in te
+        % with slope -R2 and intercept log(S0), so a per-voxel linear
+        % least-squares fit (x\y) over all TEs at once recovers R2 and S0
+        % directly, without any nonlinear solver. Intentionally a
+        % self-contained duplicate of gpuAxonalT2model.R2_lsq (same math,
+        % same clamping) rather than a cross-class call, so this class
+        % has no dependency on gpuAxonalT2model.
+        %
+        % Input
+        % -----------
+        % img       : 4D multi-echo magnitude image, [x,y,z,te]
+        % te        : 1D echo times, same length as img's 4th dimension
+        % mask      : 3D signal mask, [x,y,z]
+        %
+        % Output
+        % -----------
+        % r2        : 3D R2 map [1/te's time unit], masked
+        % m0        : 3D extrapolated S0 (signal at te=0) map, masked
+        function [r2,m0] = local_S0_TE0_lsq(img,te,mask)
+
+            img = double(img);
+            te  = double(te);
+
+            % set range of R2 and T2
+            minT2s      = min(te)/20;
+            maxT2s      = max(te)*20;
+            ranger2     = [1/maxT2s, 1/minT2s];
+
+            [nx,ny,nz,nt] = size(img);
+
+            x       = ones(nt,2);
+            x(:,2)  = -te(:);
+            y       = permute(log(abs(img)),[4 1 2 3]);
+
+            y       = reshape(y,[size(y,1) numel(y)/size(y,1)]);
+            b       = x\y;
+            r2      = reshape( b(2,:),nx,ny,nz) .* mask;
+            m0      = exp(reshape( b(1,:),nx,ny,nz)) .* mask;
+
+            r2(r2>max(ranger2)) = max(ranger2);
+            r2(r2<min(ranger2)) = min(ranger2);
+
+            m0(m0<0) = 0;
+
+        end
 
         %% Utility
         %%%%%%%%%% Compartmental signal
@@ -861,8 +1306,9 @@ classdef gpuMEAxCaliberSMT < handle
 
             if nargin < 6; solver = []; end
 
+            epsilon = 1e-6;
             if strcmpi(solver,'mcmc') 
-                Dr  = min(Dr,Da-gpuMEAxCaliberSMTmcmc.epsilon);
+                Dr  = min(Dr,Da-epsilon);
                 S   = arrayfun(@diffusion_relaxation_SMT_zeppelin,b,te,Da,Dr,R2e);
 
             else
@@ -883,7 +1329,7 @@ classdef gpuMEAxCaliberSMT < handle
         end
 
         % unrestricted stick
-        function S = diffusion_relaxation_SMT_stick_unrestricted(b,te,Da, R2a, k2a)
+        function S = diffusion_relaxation_SMT_stick_unrestricted(b,te,r,Da, R2a, k2a)
 
             S = sqrt(pi./(4*(b.*Da ))) .* erf(sqrt(b.*Da )) .* exp(-te.*( R2a + k2a./r));
 
@@ -968,6 +1414,15 @@ classdef gpuMEAxCaliberSMT < handle
             if ~isfield(fitting,'isFitCSF');    fitting2.isFitCSF   = true;             end
             if ~isfield(fitting,'isFitR2a');    fitting2.isFitR2a   = false;            end
             if ~isfield(fitting,'isFitk2a');    fitting2.isFitk2a   = false;            end
+            if ~isfield(fitting,'isFitS0');     fitting2.isFitS0    = false;            end
+            if ~isfield(fitting,'lambdaR2aPrior'); fitting2.lambdaR2aPrior = 0;         end   % 0 = off (see run_askadam/reg_R2aPrior); norm matches fitting.lossFunction
+
+            % fitting.start='multistart' options (see fit_multistart_sweep).
+            % sweepMin/sweepMax are NOT defaulted here (this is a Static
+            % method with no access to `this.lb`/`this.ub`) --
+            % fit_multistart_sweep resolves those itself when unset.
+            if ~isfield(fitting,'sweepParam');  fitting2.sweepParam = 'r';       end
+            if ~isfield(fitting,'sweepN');      fitting2.sweepN     = 4;         end
 
         end
     

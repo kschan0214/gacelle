@@ -9,11 +9,12 @@
 % Date created: 24 June 2026 
 %
 %% add paths
-addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
+addpath('../../gacelle/');addpath_gacelle;
 clear;
 
 %% I/O: Load data
-check_gre_invivo_demo_data; % check if the demo data exists
+gre_invivo_dir = fullfile('~/Downloads','ds006181'); % this is where the data locates, feel free to update this path
+check_gre_invivo_demo_data; % check if the demo data exists, if not then download it to gre_invivo_dir
 
 subj_label = 'sub-003';
 sess_label = 'ses-mri01';
@@ -39,7 +40,7 @@ sepia_header    = [];
 unwrappedPhase  = [];
 totalField      = [];
 fa              = zeros(1,length(flip_angle));
-for kfa = 1%:length(flip_angle)
+for kfa = 1%:length(flip_angle) % get one multi-echo data only
     counter = counter + 1;
     
     FAcurr          = sprintf('%d', flip_angle(kfa));
@@ -85,19 +86,3 @@ fitting.solver      = 'mcmc';
 fitting             = objGPU.check_set_default(fitting);
 
 out_mh              = objGPU.estimate(img, mask, fitting);
-
-% %% MCMC
-% % Magnitude fitting
-% % setup algorithm parameters
-% fitting                     = [];
-% fitting.solver              = 'mcmc';
-% fitting                     = objGPU.check_set_default(fitting);
-% fitting.algorithm           = 'ensemble';
-% fitting.iteration           = 1e4;
-% fitting.thinning            = 10;        % Sample every 20 iteration
-% fitting.metric              = {'median','iqr'};
-% fitting.burnin              = 0.1;       % 10% burn-in
-% fitting.Nwalker             = 30;
-% 
-% obj         = gpuJointR1R2starMapping(te,tr,fa);
-% [out_mcmc]  = obj.estimate(img, mask, extradata, fitting);

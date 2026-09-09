@@ -1,9 +1,20 @@
+%% demo_gpuGREMWI_invivo.m
+%
+% This demo provides several examples on the ulitisation of gpuGREMWI.m 
+% for parameter estimation on in vivo data
+% 
+% Kwok-Shing Chan 
+% kchan2@mgh.harvard.edu
+%
+% Date created: 7 August 2026 
+%
 %% add paths
 addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 
 %% I/O: Load data
-check_gre_invivo_demo_data; % check if the demo data exists
+gre_invivo_dir = fullfile('~/Downloads','ds006181'); % this is where the data locates, feel free to update this path
+check_gre_invivo_demo_data; % check if the demo data exists, if not then download it to gre_invivo_dir
 
 subj_label = 'sub-003';
 sess_label = 'ses-mri01';
@@ -83,6 +94,7 @@ fitting.solver              = 'askadam';
 fitting                     = objGPU.check_set_default(fitting,img);
 fitting.start               = 'prior';   
 fitting.initialLearnRate    = 0.01;
+fitting.decayRate           = 0.001;
 fitting.convergenceValue    = 1e-5;
 fitting.weightPower         = 0.5;
 
@@ -106,6 +118,7 @@ fitting.solver              = 'askadam';
 fitting                     = objGPU.check_set_default(fitting,img);
 fitting.start               = 'prior';   
 fitting.initialLearnRate    = 0.01;
+fitting.decayRate           = 0.001;
 fitting.convergenceValue    = 1e-5;
 fitting.weightPower         = 0.5;
 
@@ -129,8 +142,6 @@ objGPU                      = gpuGREMWI(te,fixed_params);
 fitting.solver              = 'mcmc';
 fitting                     = objGPU.check_set_default(fitting,img);
 fitting.algorithm           = 'mh';
-% fitting.Nwalker             = 20;
-% fitting.StepSize            = 2;
 fitting.iteration           = 1e6;
 fitting.thinning            = 100;        % Sample every 10 iteration
 fitting.metric              = {'median','iqr'};

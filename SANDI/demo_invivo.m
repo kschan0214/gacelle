@@ -13,7 +13,8 @@ addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
 clear;
 
 %% I/O: Load data
-check_dwi_invivo_demo_data; % check if the demo data exists
+dwi_invivo_dir = fullfile('~/Downloads','ds006181'); % this is where the data locates, feel free to update this path
+check_dwi_invivo_demo_data; % check if the demo data exists, if not then download it to dwi_invivo_dir
 
 preproc_dir = fullfile(dwi_invivo_dir,'derivatives','preprocessed_dwi');
 
@@ -69,7 +70,7 @@ fitting.algorithm           = 'ensemble';
 fitting.Nwalker             = 30;
 fitting.StepSize            = 2;
 fitting.iteration           = 3e4;
-fitting.thinning            = 10;        % Sample every 10 iteration
+fitting.thinning            = 10;        % Sample every 10 iteration, may need further tuning
 fitting.metric              = {'median','iqr'};
 
 % askadam estimation

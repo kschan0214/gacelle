@@ -215,5 +215,23 @@ classdef rotational_invariant < handle
             end
         end
         
+        function [ang, p2] = WatsonAng(kappa, varargin)
+            p2 = 1/4*(3./sqrt(kappa)./dawson(sqrt(kappa)) -2 -3./kappa);
+            p2 = p2(:);
+            ang = acos( sqrt( (2*p2+1)/3 ) );
+            if nargin > 1
+                if strcmpi(varargin{1},'degree')
+                    ang = ang/pi*180;
+                end
+            end
+        end
+
+        function pl = WatsonSHexact(k)
+            k = k(:).';
+            p2 = 1/4*(3./sqrt(k)./dawson(sqrt(k)) -2 -3./k);
+            p4 = 1/32./k.^2.*(105 + 12*k.*(5+k) + 5*sqrt(k).*(2*k-21)./dawson(sqrt(k)));
+            pl = [ones(1,numel(k)); p2; p4];
+        end
+        
     end
 end

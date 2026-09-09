@@ -13,7 +13,8 @@ addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' packa
 clear;
 
 %% I/O: Load data
-check_dwi_invivo_demo_data; % check if the demo data exists
+dwi_invivo_dir = fullfile('~/Downloads','ds006181'); % this is where the data locates, feel free to update this path
+check_dwi_invivo_demo_data; % check if the demo data exists, if not then download it to dwi_invivo_dir
 
 preproc_dir = fullfile(dwi_invivo_dir,'derivatives','preprocessed_dwi');
 

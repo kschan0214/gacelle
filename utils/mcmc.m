@@ -478,7 +478,7 @@ classdef mcmc < handle
             xPosterior_global = zeros(NGlobal, 1, Nwalker, Ns, fitting.repetition,'single');
 
             % --- initialise walkers -------------------------------------------------
-            [xCurr_ND,~] = this.struct2array_wglobal(x0,fitting.modelParams);
+            [xCurr_ND,xCurr_global] = this.struct2array_wglobal(x0,fitting.modelParams);
             % local: tight cloud around starting point
             xCurr_ND     = xCurr_ND + (ub-lb)*fitting.startRange.*randn(size(ub));
             xCurr_ND     = min(max(xCurr_ND,lb),ub);
@@ -486,7 +486,8 @@ classdef mcmc < handle
             % cannot manufacture spread a collapsed cloud lacks, and the global
             % posterior is typically very tight (informed by all voxels), so a small
             % cloud can get stuck. Over-dispersion contracts correctly; collapse does not.
-            xCurr_global = lb_global + (ub_global-lb_global).*rand(size(ub_global));
+            % xCurr_global = lb_global + (ub_global-lb_global).*rand(size(ub_global));
+            xCurr_global = xCurr_global + (ub_global-lb_global)*fitting.startRange.*rand(size(ub_global));
             x0 = this.array2struct_wglobal(xCurr_ND,xCurr_global,fitting.modelParams,isGlobal);
 
             logP0 = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0,varargin{:})-y).^2, 1 ), x0.noise, Nm);
@@ -607,8 +608,8 @@ classdef mcmc < handle
                     xg_act = xCurr_global(:,:,active);
                     zz_g   = ((StepSize-1)*rand(1,1,na,'like',xCurr_global) + 1).^2 / StepSize;
                     gProp  = xCurr_global(:,:,pidx) + (xg_act - xCurr_global(:,:,pidx)).*zz_g;
-                    oob_g  = max(or(gProp<lb_global, gProp>ub_global),[],1);
-                    gProp  = min(max(gProp,lb_global),ub_global);
+                    oob_g  = max(or(gProp<lb_global(:,:,active), gProp>ub_global(:,:,active)),[],1);
+                    gProp  = min(max(gProp,lb_global(:,:,active)),ub_global(:,:,active));
                     % eval at (current local active, new global active) -- locals fixed this block
                     s_glob = this.array2struct_wglobal(xCurr_ND(:,:,active), gProp, fitting.modelParams, isGlobal);
                     logP_g = arrayfun(@logP_Gaussian, sum( weights(:,:,active).*(modelFWD(s_glob,varargin{:})-y).^2, 1 ), s_glob.noise, Nm);

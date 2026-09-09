@@ -1,5 +1,3 @@
-
-
 %% demo_gpuMCRMWI_noisePropagation.m
 %
 % This demo provides several examples on the ulitisation of gpuMCRMWI.m 
@@ -97,8 +95,8 @@ extraData.ff        = ones([size(M0_GT,1:3)]); %extraData.ff = extraData.ff ./ s
 extraData.theta     = zeros([size(M0_GT,1:3)]);
 extraData.b1        = ones([size(M0_GT,1:3)]);
 
-dlnet_magn = load('/autofs/space/linen_001/users/kwokshing/tools/askadam/MCRMWI/EPGXgen_net/MCRMWI_MLP_EPGX_RFphase50_T1M234_magn.mat');
-dlnet_phase = load('/autofs/space/linen_001/users/kwokshing/tools/askadam/MCRMWI/EPGXgen_net/MCRMWI_MLP_EPGX_RFphase50_T1M234_phase.mat');
+dlnet_magn = load('EPGXgen_net/MCRMWI_MLP_EPGX_RFphase50_T1M234_magn.mat');
+dlnet_phase = load('EPGXgen_net/MCRMWI_MLP_EPGX_RFphase50_T1M234_phase.mat');
 dlnet_phase.dlnet.alpha = 0.01;
 dlnet_magn.dlnet.alpha = 0.01;
 

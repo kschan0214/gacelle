@@ -678,6 +678,7 @@ classdef utils < handle
                     fitting_probe.iteration     = 100;      % run 100 iterations to make sure the CUDA memory pool warm-up
                     fitting_probe.repetition    = 1;
                     fitting_probe.start         = 'default';
+                    fitting_probe.isDisplay     = false;
                     % fitting_probe still carries segmentOverlap/NSegmentUser, but
                     % this is harmless: modelObj.fit() never reads those fields,
                     % only find_optimal_segment_3D (this function) does, and fit()

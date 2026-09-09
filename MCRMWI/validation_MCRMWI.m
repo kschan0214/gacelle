@@ -5,6 +5,7 @@ te = linspace(0,50e-3,15);
 tr = 55e-3;
 fa = [5,10,20,30,40,50,70];
 b1 = 1;
+B0_dir = [0;0;1];
 
 Amw = 0.15;
 Aiw = 0.6;
@@ -91,5 +92,5 @@ extraData.ff = ones(size(Amw));
 s_dl = objGPU.FWD(pars,fitting,extraData,ann_epgx_phase.dlnet,ann_epgx_magn.dlnet);
 s_dl = reshape(s_dl,[numel(te),numel(fa),2]);
 % s_dl = gather(extractdata( s_dl(:,:,1) + 1i*s_dl(:,:,2) ));
-s_dl = gather(( s_dl(:,:,1) + 1i*s_dl(:,:,2) ));
+s_dl = gather(( s_dl(:,:,1) + 1i*s_dl(:,:,2) ))
 

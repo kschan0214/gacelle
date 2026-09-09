@@ -9,7 +9,7 @@
 % Date created: 5 August 2026 
 % Date modified: 
 %
-addpath(genpath('../../gacelle')); % this is the path to 'gacelle' package
+addpath('../../gacelle'); addpath_gacelle; % this is the path to 'gacelle' package
 clear;
 %% Simulate data
 

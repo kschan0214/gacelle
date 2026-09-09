@@ -107,12 +107,12 @@ classdef gpuAxCaliberSMT < handle
             this.Delta  = single(BDELTA_sorted(:)) ;
 
             this.g      = single(sqrt(this.b(:)./this.delta(:).^2./(this.Delta(:)-this.delta(:)/3))) ;
-            this.D0     = single(D0) ;
-            this.Da     = single(Da) ;
+            if nargin > 3 && ~isempty(D0);      this.D0     = single(D0) ; end
+            if nargin > 4 && ~isempty(Da);      this.Da     = single(Da) ; end
+            if nargin > 5 && ~isempty(DeL);     this.DeL    = single(DeL) ; end
+            if nargin > 6 && ~isempty(Dcsf);    this.Dcsf   = single(Dcsf) ; end
 
-            this.DeL    = single(DeL);
-            this.Dcsf   = single(Dcsf);
-            this.Scsf   = single( exp(-this.b(:)*Dcsf)) ;
+            this.Scsf   = single( exp(-this.b(:)*this.Dcsf)) ;
 
             if nargin > 7
                 this.Nav = single(varargin{1}) ;
@@ -121,7 +121,7 @@ classdef gpuAxCaliberSMT < handle
             end
             this.Nav = this.Nav(:) ;
 
-            this.ub(4) = single(DeL);
+            this.ub(4) = single(this.DeL);
         end
     
         % update properties according to lmax
@@ -492,9 +492,8 @@ classdef gpuAxCaliberSMT < handle
                 end
             else
                 % user defined starting point
-                x0 = fitting.start(:);
                 fprintf('Using user-defined starting points for all voxels at [%s]: [%s]\n',cell2str(this.modelParams),replace(num2str(x0(:).',' %.2f'),' ',','));
-                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+                x0 = utils.initialise_x0(dims,this.modelParams,fitting.start);
 
             end
 
