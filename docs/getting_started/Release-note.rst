@@ -16,7 +16,7 @@ New QSM module
 
 Unified solver architecture
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-* Every model class now exposes a single ``fitting.solver = 'askadam' | 'mcmc'`` option and one ``estimate(...)`` entry point, replacing the previous pattern of separate ``gpu<Model>`` / ``gpu<Model>mcmc`` classes per solver (e.g. ``gpuNEXI`` + ``gpuNEXImcmc``, ``gpuJointR1R2starMapping`` + ``gpuJointR1R2starMappingmcmc``, ``gpuAxCaliberSMT`` + ``gpuAxCaliberSMTmcmc``, ``gpuMEAxCaliberSMT`` + ``gpuMEAxCaliberSMTmcmc`` are each now a single class). The old solver-specific classes have been removed from the main model folders (old implementations kept only under each model's ``sandbox/deprecated/`` for reference).
+* Every model class now exposes a single ``fitting.solver = 'askadam' | 'mcmc'`` option and one ``estimate(...)`` entry point, replacing the previous pattern of separate ``gpu<Model>`` / ``gpu<Model>mcmc`` classes per solver (e.g. ``gpuNEXI`` + ``gpuNEXImcmc``, ``gpuJointR1R2starMapping`` + ``gpuJointR1R2starMappingmcmc``, ``gpuAxCaliberSMT`` + ``gpuAxCaliberSMTmcmc`` are each now a single class). The old solver-specific classes have been removed from the main model folders (old implementations kept only under each model's ``sandbox/deprecated/`` for reference). ``gpuMEAxCaliberSMT`` and ``gpuNEXIrice`` remain experimental and live under their model's ``sandbox/`` rather than being part of this release's supported model set.
 * All demo/example scripts across every model were updated and re-validated against the new interface.
 
 Automatic GPU memory management
