@@ -78,5 +78,5 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from y,
     :language: matlab
     :lines: 72-83
 
-The full example script can be found in `here <../../examples/Example_monoexponential_estimate_mcmc_MH.m>`_.
+The full example script can be found in `here <../../examples/Example_monoexponential_estimate_mcmc_ensemble.m>`_.
     

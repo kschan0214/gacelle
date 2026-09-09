@@ -1,12 +1,12 @@
-% Example_monoexponential_FWD_askadam_3D_Strategy2.m
+% Example_monoexponential_estimate_askadam_3D_Strategy2.m
 %
-% Example: monoexponential decay fitting on a 4D data
-% using askadam. Generates GT S0/R2* maps, simulates noisy signal at SNR=100,
-% fits with askadam, and plots GT vs. start vs. fitted results.
-% In contrast to Strategy 1, this is more computationally efficient
+% Example: monoexponential decay fitting on 3D S0/R2* maps using askadam's
+% "Strategy 2" forward function (see
+% Example_monoexponential_FWD_askadam_3D_Strategy2.m and
+% docs/tutorial/askadam_basicND_tutorial.rst). Same setup as the Strategy
+% 1 companion script, but more memory/computationally efficient.
 %
-% Kwok-Shing Chan
-% Date create: 5 August 2026
+% Kwok-Shing Chan, kchan2@mgh.harvard.edu, 5 August 2026
 %
 addpath('../../gacelle/');addpath_gacelle;
 clear
@@ -55,7 +55,7 @@ fitting.iteration           = 10000;
 fitting.initialLearnRate    = 0.01;
 fitting.decayRate           = 0.001;
 fitting.lossFunction        = 'l1';
-fitting.isOptimiseMemory    = false; 
+fitting.isOptimiseMemory    = true;
 
 % define your forward model
 modelFWD = @Example_monoexponential_FWD_askadam_3D_Strategy2;

@@ -3,15 +3,15 @@
 % Minimal, direct use of MH solve in mcmc.m on vectorised (GACELLE
 % dimension, 'G-D') input: a two-parameter monoexponential decay (S0, R2*) is
 % simulated for Nsample independent voxels, Gaussian noise is added at a
-% fixed SNR, and the parameters are recovered by calling askadam directly
-% against a user-supplied forward function, without going through any of
-% GACELLE's built-in model classes (e.g. gpuNEXI, gpuAxCaliberSMT). Useful as
-% a template for fitting a custom forward model outside the model-class
-% framework. Recovered values are plotted against ground truth and the
-% random starting points.
+% fixed SNR, and the parameters are recovered by calling
+% mcmc.metropolis_hastings directly against a user-supplied forward
+% function, without going through any of GACELLE's built-in model
+% classes (e.g. gpuNEXI, gpuAxCaliberSMT). Useful as a template for
+% fitting a custom forward model outside the model-class framework.
+% Recovered posterior means are plotted against ground truth.
 %
-% Kwok-Shing Chan
-% Date create: 5 August 2026
+% Kwok-Shing Chan, kchan2@mgh.harvard.edu
+% Date created: 5 August 2026
 %
 %% add path
 addpath('../../gacelle/');addpath_gacelle;

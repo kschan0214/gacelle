@@ -39,7 +39,7 @@ We can then simulate the 4D measurements using this function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 13-39
+    :lines: 15-41
 
 Now **y** is our 'realistic' noisy data for the estimation.
 
@@ -47,7 +47,7 @@ This time we also have a spherical non-zero mask to demonstrate the usage of a m
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 26
+    :lines: 28
 
 To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**, 
 
@@ -55,43 +55,43 @@ To estimate :math:`S0` and :math:`R_{2}^{*}` from **y**,
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 42-44
+    :lines: 44-46
 
 2. Set up the model parameters and fitting boundary
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 48-51
+    :lines: 50-53
 
 3. Set up optimisation setting. Note that we need to set `fitting.isOptimiseMemory` to 'false' such that the signal mask does not apply to the fitting parameters `S0` and `R2star` to keep these array as their original data size (i.e., 3D in this example)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 52-57
+    :lines: 54-59
 
 4. Define the forward function
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 59-60
+    :lines: 61-62
 
 5. Define fitting weights (optional)
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 62-63
+    :lines: 64-65
 
 6. Start the optimisation
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 65
+    :lines: 67
 
 7. Plot the estimation results
 
 .. literalinclude:: ../../examples/Example_monoexponential_estimate_askadam_3D_Strategy1.m
     :language: matlab
-    :lines: 67-80
+    :lines: 69-82
 
 .. figure:: _images/strategy1_image.png
    :align: center

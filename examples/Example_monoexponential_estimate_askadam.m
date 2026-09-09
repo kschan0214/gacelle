@@ -10,8 +10,8 @@
 % framework. Recovered values are plotted against ground truth and the
 % random starting points.
 %
-% Kwok-Shing Chan
-% Date create: 5 August 2026
+% Kwok-Shing Chan, kchan2@mgh.harvard.edu
+% Date created: 5 August 2026
 %
 %% add path
 addpath('../../gacelle/');addpath_gacelle;
