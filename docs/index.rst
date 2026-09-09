@@ -44,6 +44,15 @@ Table of Contents
 
 .. toctree::
    :maxdepth: 1
+   :caption: Advanced
+   :name: sec-advanced
+
+   advanced/automatic_memory_management
+   advanced/askadam_convergence
+   advanced/askadam_parameter_transform
+
+.. toctree::
+   :maxdepth: 1
    :caption: Supported models
    :name: sec-supportedmodel
 
@@ -57,15 +66,6 @@ Table of Contents
    supported_models/R2starMapping
    supported_models/PDF
    supported_models/mcTFI
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Advanced
-   :name: sec-advanced
-
-   advanced/automatic_memory_management
-   advanced/askadam_convergence
-   advanced/askadam_parameter_transform
 
 .. toctree::
    :maxdepth: 1
