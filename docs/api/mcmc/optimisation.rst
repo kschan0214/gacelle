@@ -31,11 +31,11 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting                   | structure contains fitting algorithm parameters                                                              |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.model_params      | 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};                            |
+| fitting.modelParams      | 1xM cell variable,    name of the model parameters, e.g. {'S0','R2star','noise'};                            |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.lb                | 1xM numeric variable, fitting lower bound, same order as field 'model_params', e.g. [0.5, 0, 0.001];         |
+| fitting.lb                | 1xM numeric variable, fitting lower bound, same order as field 'modelParams', e.g. [0.5, 0, 0.001];         |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.ub                | 1xM numeric variable, fitting upper bound, same order as field 'model_params', e.g. [2, 1, 0.1];             |
+| fitting.ub                | 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];             |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.algorithm         | MCMC algorithm, 'MH' (Metropolis-Hastings)|'GW' (Affline-invariant ensemble)                                 |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
@@ -47,7 +47,7 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.burnin            | iterations to be discarded at the beginning, if >1, the exact number will be used; else iteration*burnin     |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.xStepSize         | step size of model parameter in MCMC proposal, same size and order as 'model_params' ('MH' only)             |
+| fitting.xStepSize         | step size of model parameter in MCMC proposal, same size and order as 'modelParams' ('MH' only)             |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.StepSize          | step size for 'GW' in MCMC proposal ('GW' only)                                                              |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
@@ -67,12 +67,37 @@ I/O overview
 +-----------------------------------+--------------------------------------------------------------------------------------------------------------+
 | out.posterior                     | structure contains MCMC posterior samples                                                                    |
 +-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.posterior.(model_params{k})   | Model parameter MCMC posterior samples, masked and unshaped for memory preservation                          |
+| out.posterior.(modelParams{k})   | Model parameter MCMC posterior samples, masked and unshaped for memory preservation                          |
 +-----------------------------------+--------------------------------------------------------------------------------------------------------------+
-| out.{metric}.(model_params{k})    | Posterior statistics chosen in fitting.metric                                                                |
+| out.{metric}.(modelParams{k})    | Posterior statistics chosen in fitting.metric                                                                |
 +-----------------------------------+--------------------------------------------------------------------------------------------------------------+
 
 .. note::
-    'noise' is always required in fitting.model_params.
+    'noise' is always required in fitting.modelParams.
+
+Memory management
+-------------------
+
+.. list-table::
+   :widths: 25 15 60
+   :header-rows: 1
+
+   * - Option
+     - Default
+     - Description
+   * - ``fitting.autoMemManage``
+     - ``true``
+     - See :doc:`../advanced/automatic_memory_management` - segments the input into density-balanced, halo-padded chunks fitted sequentially when the full volume would not fit in available VRAM. Applies to ``mcmc.m`` the same way it does to ``askadam.m``.
+   * - ``fitting.segmentOverlap``
+     -
+     - See :doc:`../advanced/automatic_memory_management`
+   * - ``fitting.NSegmentUser``
+     -
+     - See :doc:`../advanced/automatic_memory_management`
+
+.. note::
+    ``fitting.algorithm = 'GW'`` additionally supports
+    ``fitting.Ensembleupdate`` (fixed-anchor/"redblack" walker updates) -
+    see :ref:`api-mcmc-goodman_weare`.
 
 See also :ref:`gettingstarted-mcmc_basic_tutorial`.
