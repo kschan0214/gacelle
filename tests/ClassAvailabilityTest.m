@@ -60,19 +60,25 @@ classdef ClassAvailabilityTest < matlab.unittest.TestCase
         function testAddpathGacelleExcludesNonReleasePaths(testCase)
             % Regression-proof addpath_gacelle's own exclusion logic:
             % docs/, sandbox/, deprecated/ and mpl_training/ folders
-            % should never end up on the path.
+            % should never be among the paths it decides to add.
+            %
+            % Deliberately checks addpath_gacelle's OWN return value
+            % rather than the live MATLAB path: a test runner (e.g. CI
+            % harnesses that do their own blanket addpath(genpath('.')))
+            % may already have unrelated paths on the search path before
+            % this test runs, which would make a live-path check fail for
+            % reasons that have nothing to do with addpath_gacelle itself.
             testsDir    = fileparts(mfilename('fullpath'));
             projectRoot = fileparts(testsDir);
-            onPath      = strsplit(path, pathsep);
-            gacellePaths = onPath(startsWith(onPath, projectRoot));
+            added       = addpath_gacelle(projectRoot);
 
-            testCase.verifyTrue(~any(contains(gacellePaths, [filesep 'docs'])), ...
+            testCase.verifyTrue(~any(contains(added, [filesep 'docs'])), ...
                 'No path under docs/ should be added by addpath_gacelle().');
-            testCase.verifyTrue(~any(contains(gacellePaths, 'sandbox')), ...
+            testCase.verifyTrue(~any(contains(added, 'sandbox')), ...
                 'No path containing "sandbox" should be added by addpath_gacelle().');
-            testCase.verifyTrue(~any(contains(gacellePaths, 'deprecated')), ...
+            testCase.verifyTrue(~any(contains(added, 'deprecated')), ...
                 'No path containing "deprecated" should be added by addpath_gacelle().');
-            testCase.verifyTrue(~any(contains(gacellePaths, 'mpl_training')), ...
+            testCase.verifyTrue(~any(contains(added, 'mpl_training')), ...
                 'No path containing "mpl_training" should be added by addpath_gacelle().');
         end
 

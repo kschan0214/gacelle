@@ -1,9 +1,15 @@
-function addpath_gacelle(rootDir)
+function addedPaths = addpath_gacelle(rootDir)
 % ADDPATH_GACELLE Add GACELLE and its subfolders to path, excluding
 % docs/ and any folder matching *sandbox*.
 %
 %   addpath_gacelle(rootDir)
 %   addpath_gacelle()  % assumes current file's folder is rootDir
+%   addedPaths = addpath_gacelle(...)  % also returns what was added, so
+%                                       % the exclusion logic can be
+%                                       % tested without depending on
+%                                       % whatever else is already on the
+%                                       % MATLAB path (see
+%                                       % tests/ClassAvailabilityTest.m)
 %
 % Kwok-Shing Chan @ MGH
 % kchan2@mgh.harvard.edu
@@ -16,7 +22,7 @@ end
 allPaths = strsplit(genpath(rootDir), pathsep);
 allPaths(cellfun(@isempty, allPaths)) = [];
 
-excludePattern = ["docs", "sandbox", "deprecated"];
+excludePattern = ["docs", "sandbox", "deprecated", "mpl_training"];
 
 keepMask = true(size(allPaths));
 for k = 1:numel(allPaths)
@@ -35,6 +41,7 @@ for k = 1:numel(allPaths)
     end
 end
 
-addpath(allPaths{keepMask});
+addedPaths = allPaths(keepMask);
+addpath(addedPaths{:});
 
 end
