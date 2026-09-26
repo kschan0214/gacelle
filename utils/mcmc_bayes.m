@@ -21,12 +21,35 @@ classdef mcmc_bayes < mcmc
 %   .adaptInterval      : 50            # iterations between two adaptation steps
 %   .adaptTarget        : []            target acceptance rate, [] -> 0.234 (joint) | 0.44 (componentwise)
 %   .overdisp           : 0             relative over-dispersion of the start point for repetition > 1
-%   .prior              : []            (Phase 3+, not implemented yet)
+%   .prior              : []            structure with the fields
+%       .hierarchical   : []            hierarchical Normal prior N(u | mu, Sigma) on the transformed
+%                                       parameters (Phase 3), a structure (struct() or true for all
+%                                       defaults) with the fields
+%           .hyperprior     : 'niw'         'niw' | 'jeffreys_half'
+%           .m0             : []            NIW mean, [] -> mean of the starting u over voxels
+%           .kappa0         : 1e-3          NIW mean precision factor
+%           .nu0            : []            NIW degrees of freedom, [] -> d + 2
+%           .Psi0           : []            NIW scale matrix, [] -> max(nu0-d-1,1) * diag(v0), see below
+%           .fixed          : false         true: skip the Gibbs block and use .mu/.Sigma
+%           .mu, .Sigma     : []            fixed hyperparameters (required with fixed = true)
+%           .params         : []            cellstr, parameters under the hierarchy (they form u),
+%                                           [] -> all sampled parameters except 'noise'
+%           .subsetFraction : 1             fraction of voxels for stage 1 (estimate_hyper_subset only)
+%           .maxGPUMemory   : []            bytes available for the coupled free-hyperparameter run,
+%                                           [] -> gpuDevice().AvailableMemory
+%       .mrf            : []            MRF prior (Phase 4, not implemented yet)
 %
-% Test-only option (not part of the user interface)
+% Test-only options (not part of the user interface)
 %   .forceNewPath       : false         run the new sampling loop even if all new options are at their
 %                                       legacy defaults. Used to compare the neutral new path against
 %                                       the legacy mcmc in tests/validation/mcmc_bayes.
+%   .fixedParams        : []            structure of scalar values, e.g. struct('noise',0.02): these
+%                                       parameters are removed from the sampled set and their value is
+%                                       injected before each FWDfunc/likelihood call (as S0Param = 1 is);
+%                                       they are not in the output. Used for 'known noise' in T3.1.
+%   .checkCache         : false         after every sweep, recompute the log-likelihood, log-prior and
+%                                       log-Jacobian of the current state from scratch and record the
+%                                       largest difference to the cached values (diagnostics.cacheCheck)
 %
 % Phase 1 (sampler infrastructure) design notes
 % ---------------------------------------------
@@ -82,8 +105,11 @@ classdef mcmc_bayes < mcmc
 %   Noise model as in legacy logP_Gaussian: y_i ~ N(S0*g_i, sigma^2/w_i), i.e.
 %       p(y|theta,S0,sigma^2) = (2 pi sigma^2)^(-m/2) exp(-Q/(2 sigma^2)),  Q = (y-S0 g)'W(y-S0 g)
 %   (up to the theta-independent factor prod(w_i)^(1/2), which legacy drops too).
-%   m is the number of measurements (rows of y), as in legacy logP_Gaussian,
-%   also for measurements with w_i = 0. Gamma integral used throughout:
+%   A measurement with w_i = 0 has infinite variance: it carries no information
+%   and contributes no factor sigma^(-1). So m is the number of measurements with
+%   NON-ZERO weight, per voxel (m_v = #{i : w_iv ~= 0}), in all marginal
+%   likelihoods, the InvGamma shapes and the post-hoc draws below. (The legacy
+%   'gaussian' path, logP_Gaussian, keeps m = # rows of y.) Gamma integral used throughout:
 %       int_0^inf (s2)^(-a-1) exp(-b/s2) ds2 = Gamma(a) b^(-a)            (a,b > 0)
 %
 % 'marginal_noise' (no amplitude; g is the full model), p(sigma^2) ∝ 1/sigma^2:
@@ -146,9 +172,73 @@ classdef mcmc_bayes < mcmc
 %     out.posterior/mean/... look like the legacy output. out.settings.nuisance
 %     records that they are post-hoc conditional draws.
 %
+% Phase 3 (hierarchical Normal prior, K = 1)
+% ------------------------------------------
+% Target. With u_i the [d,1] vector of the hierarchical parameters of voxel i
+%   (prior.hierarchical.params, in transformed space), n the number of voxels:
+%       p(u_1..n, mu, Sigma | y) ∝ prod_i L(y_i | x(u_i)) N(u_i | mu, Sigma) * p(mu, Sigma)
+%   The Normal prior is a density in u: the hierarchical parameters get NO
+%   log-Jacobian and NO bound rejection (a truncated Normal would make the
+%   Gibbs conditionals below inexact). Allowed transforms for them:
+%       'sigmoid' (finite lb < ub), 'log' with lb = 0 and ub = Inf,
+%       'linear' with lb = -Inf and ub = Inf   (else error mcmc_bayes:hierarchicalTransform).
+%   Sampled parameters outside the hierarchy (e.g. 'noise' under 'gaussian')
+%   keep the Phase 1 treatment (flat native box prior, Jacobian, rejection).
+%
+% Per-voxel MH. The cached per-voxel log-prior lp_i = -(u_i-mu)' Sigma^-1 (u_i-mu)/2
+%   (kept separately from the log-likelihood cache) enters the acceptance ratio
+%   of joint and componentwise updates; it is recomputed for all voxels after
+%   every hyperparameter update. Adaptation is unchanged (burn-in only).
+%
+% Gibbs block (after every MH sweep, free mode). ubar = sum_i u_i / n and
+%   S = sum_i (u_i - ubar)(u_i - ubar)' are accumulated on the GPU in double;
+%   the d x d draws are done on the host (double, rng stream).
+%   'niw' : NIW(m0, kappa0, Psi0, nu0) hyperprior,
+%       p(mu,Sigma) = N(mu | m0, Sigma/kappa0) IW(Sigma | Psi0, nu0). Conjugate update:
+%       kappa_n = kappa0 + n,  nu_n = nu0 + n,  m_n = (kappa0 m0 + n ubar)/kappa_n,
+%       Psi_n   = Psi0 + S + (kappa0 n/kappa_n)(ubar - m0)(ubar - m0)',
+%       Sigma | u ~ IW(Psi_n, nu_n),  mu | Sigma,u ~ N(m_n, Sigma/kappa_n)   (exact joint draw).
+%   'jeffreys_half' : p(mu) flat, p(Sigma) ∝ |Sigma|^(-1/2) (Spinner et al. 2021),
+%       two exact full conditionals, each drawn at the current value of the other:
+%       Sigma | u,mu ~ IW(S_mu, n - d),  S_mu = sum_i (u_i-mu)(u_i-mu)' = S + n (ubar-mu)(ubar-mu)'
+%         (from |Sigma|^(-(n+1)/2) exp(-tr(Sigma^-1 S_mu)/2); needs n > 2d - 1),
+%       mu | Sigma,u   ~ N(ubar, Sigma/n).
+%       (The reference draws mu from N(ubar, cov(u)/n), which is not a conditional.)
+%   IW(Psi, nu) (density ∝ |Sigma|^(-(nu+d+1)/2) exp(-tr(Psi Sigma^-1)/2), mean
+%   Psi/(nu-d-1)) is drawn with the Bartlett decomposition (no Statistics toolbox):
+%       Psi = U'U (chol), A lower triangular, A_jj = sqrt(2 G_j), G_j ~ Gamma((nu-j+1)/2) (randg),
+%       A_jk ~ N(0,1) (j > k); then Sigma^-1 = U^-1 A A' U^-T ~ W(Psi^-1, nu), i.e.
+%       Sigma = T'T with T = A \ U.
+%   Defaults (NIW, proper for any n, needed for SBC): kappa0 = 1e-3; m0 = [] -> mean of
+%   the starting u; nu0 = [] -> d + 2 (smallest integer with a finite prior mean of Sigma);
+%   Psi0 = [] -> max(nu0-d-1,1) * diag(v0), so that E[Sigma] = diag(v0) for nu0 = d+2, with
+%   v0_p = max(var_i(u_start,p), (10 s_p)^2) and s_p the median initial u-space proposal
+%   scale of parameter p (xStepSize/|dx/du| at the start; a unit-aware floor for when all
+%   voxels start at the same point). These data-dependent defaults are a weak, empirical
+%   choice; pass m0/Psi0/nu0 explicitly for a fully specified hyperprior (e.g. SBC).
+%   Initial hyperparameters of every repetition: mu = mean_i u_i, Sigma = diag(max(var_i u_i, (10 s_p)^2)).
+%
+% Fixed mode (fixed = true, user mu/Sigma): no Gibbs block; voxels are
+%   conditionally independent. estimate_hyper_subset runs the free mode on a
+%   random voxel subset (subsetFraction) and returns posterior-mean mu, Sigma
+%   and a fitting structure for fixed mode (stage 1 of the two-stage scheme).
+%
+% Memory. The free mode couples all voxels, so it cannot be split into
+%   segments. Before sampling, the GPU memory is estimated as
+%   2 x 4 bytes x Nv x (8 Nm + 24 Nvar + 16) (heuristic, factor 2 for forward-model
+%   temporaries); if it exceeds the available memory, mcmc_bayes errors
+%   (mcmc_bayes:hierarchicalMemory) and suggests fixed + subset mode.
+%
+% Output (hierarchical): out.hyper with .params, .transform (u in terms of x),
+%   .posterior.mu [d,Ns,Nrep] and .posterior.Sigma [d,d,Ns,Nrep] (free mode, thinned
+%   like the voxel samples), .mean/.median of mu and Sigma (u space), .ess and
+%   (repetition > 1) .rhat of every mu and Sigma entry; out.settings.prior holds
+%   the resolved hyperprior.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
+% Date modified: 26 September 2026 (Phase 3: hierarchical Normal prior; m counts non-zero weights only)
 %
 
     methods
@@ -168,11 +258,10 @@ classdef mcmc_bayes < mcmc
                 return
             end
 
-            % Phase 3+ options are not available yet
-            notImplemented = intersect(nonDefault, {'prior'}, 'stable');
-            if ~isempty(notImplemented)
+            % Phase 4 options (MRF prior) are not available yet
+            if ismember('prior', nonDefault) && isstruct(fitting.prior) && isfield(fitting.prior,'mrf') && ~isempty(fitting.prior.mrf)
                 error('mcmc_bayes:notImplemented', ...
-                    'mcmc_bayes: non-default option(s) not implemented yet: %s', strjoin(notImplemented, ', '));
+                    'mcmc_bayes: non-default option(s) not implemented yet: prior.mrf');
             end
 
             fitting = this.check_set_default_bayes(fitting);
@@ -183,8 +272,17 @@ classdef mcmc_bayes < mcmc
                     'mcmc_bayes: the new sampling path supports fitting.algorithm = ''MH'' only (got ''%s'').', fitting.algorithm);
             end
 
-            % likelihood and sampled/marginalised parameter sets (validated before any GPU work)
-            [~, lik] = this.setup_likelihood(fitting);
+            % likelihood, sampled/marginalised parameter sets and prior (validated before any GPU work)
+            [fittingS, lik] = this.setup_likelihood(fitting);
+            hier = this.setup_hierarchical(fittingS);
+            methodS  = this.parse_transform(fittingS.parameterTransform, numel(fittingS.modelParams));
+            isHierS  = false(1, numel(fittingS.modelParams)); isHierS(hier.idx) = true;
+            this.check_transform_bounds(methodS(~isHierS), fittingS.lb(~isHierS), fittingS.ub(~isHierS), fittingS.modelParams(~isHierS));
+            if hier.on && hier.subsetFraction < 1
+                error('mcmc_bayes:subsetFraction', ...
+                    ['mcmc_bayes: prior.hierarchical.subsetFraction < 1 is used by estimate_hyper_subset (stage 1) only; ' ...
+                     'call mcmc_bayes().estimate_hyper_subset(...) and then optimisation with the returned fixed-mode fitting.']);
+            end
 
             % Step 0: display basic messages
             this.display_basic_algorithm_parameters(fitting);
@@ -206,6 +304,73 @@ classdef mcmc_bayes < mcmc
 
         end
 
+        function [muHat, SigmaHat, fittingFixed, outSub, idxSub] = estimate_hyper_subset(this, data, mask, weights, pars0, fitting, FWDfunc, varargin)
+        % Stage 1 of the two-stage scheme: run the free-hyperparameter sampler
+        % on a random subset of the masked voxels and return the posterior
+        % means of mu and Sigma, for use in fixed mode on the whole volume.
+        %
+        % Input
+        % -----
+        % Same as optimisation. fitting.prior.hierarchical must be set (not
+        % fixed); .subsetFraction in (0,1] is the fraction of masked voxels
+        % used (at least min(Nmask, 10) voxels). The subset is drawn with the
+        % global rng (randperm). Limitation: FWDfunc's varargin is passed
+        % unchanged, so it must not contain voxel-dimensioned inputs.
+        %
+        % Output
+        % ------
+        % muHat         : [d,1] posterior mean of mu (u space)
+        % SigmaHat      : [d,d] posterior mean of Sigma (u space)
+        % fittingFixed  : fitting with prior.hierarchical.fixed = true, .mu = muHat,
+        %                 .Sigma = SigmaHat, .subsetFraction = 1 (stage 2 input)
+        % outSub        : mcmc_bayes output of the subset run (image dims [Nsub,1,1])
+        % idxSub        : linear indices (into mask) of the subset voxels
+        %
+            if ~isstruct(fitting) || ~isfield(fitting,'prior') || ~isstruct(fitting.prior) || ...
+                    ~isfield(fitting.prior,'hierarchical') || isempty(fitting.prior.hierarchical) || ...
+                    (islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes.estimate_hyper_subset: fitting.prior.hierarchical is required.');
+            end
+            h = fitting.prior.hierarchical;
+            if islogical(h); h = struct(); end
+            if isfield(h,'fixed') && ~isempty(h.fixed) && h.fixed
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes.estimate_hyper_subset: prior.hierarchical.fixed must be false (stage 1 estimates mu and Sigma).');
+            end
+            frac = 1;
+            if isfield(h,'subsetFraction') && ~isempty(h.subsetFraction); frac = h.subsetFraction; end
+            if ~(isscalar(frac) && frac > 0 && frac <= 1)
+                error('mcmc_bayes:subsetFraction', 'mcmc_bayes: prior.hierarchical.subsetFraction must be in (0,1].');
+            end
+
+            % random voxel subset
+            mask_idx = find(mask>0);
+            N        = numel(mask_idx);
+            k        = min(N, max(ceil(frac*N), min(N,10)));
+            idxSub   = mask_idx(sort(randperm(N, k)));
+
+            % subset data as [k,1,1,...] images (or [Nm,k] if data is given as a matrix, as in mcmc)
+            maskSub = true(k,1);
+            data    = this.subset_voxels(data, mask, idxSub);
+            if ~isempty(weights); weights = this.subset_voxels(weights, mask, idxSub); end
+            fn = fieldnames(pars0);
+            for kf = 1:numel(fn)
+                v = pars0.(fn{kf});
+                if ~isscalar(v); pars0.(fn{kf}) = reshape(v(idxSub), k, 1); end
+            end
+
+            f1 = fitting;
+            h.fixed = false; h.subsetFraction = 1;
+            f1.prior.hierarchical = h;
+            outSub = this.optimisation(data, maskSub, weights, pars0, f1, FWDfunc, varargin{:});
+
+            muHat    = outSub.hyper.mean.mu;
+            SigmaHat = outSub.hyper.mean.Sigma;
+
+            fittingFixed = fitting;
+            h.fixed = true; h.mu = muHat; h.Sigma = SigmaHat; h.subsetFraction = 1;
+            fittingFixed.prior.hierarchical = h;
+        end
+
         function [xPosterior, diagnostics] = metropolis_hastings_bayes(this,y,x0,weights,fitting,geom,FWDfunc,varargin)
         % Input
         % ------
@@ -214,7 +379,7 @@ classdef mcmc_bayes < mcmc
         % weights   : weighting for non-linear least square fitting, same dimension as y
         % fitting   : Structure variable containing all fitting algorithm setting, see mcmc.metropolis_hastings
         %             and the class header for the new options
-        % geom      : structure, mask geometry (.mask_idx, .dims), unused in Phase 1
+        % geom      : structure, mask geometry (.mask_idx, .dims), unused before Phase 4
         % FWDfunc   : function handle for forward signal model
         % varargin  : other input required for @FWDfunc
         %
@@ -224,15 +389,21 @@ classdef mcmc_bayes < mcmc
         % diagnostics   : structure
         %   .acceptance     : post-burn-in acceptance rate, [Nvoxel, Nblock, Nrepetition], Nblock = 1 (joint) or Nvar (componentwise)
         %   .stepSize       : final u-space proposal scale, [Nvoxel, Nvar, Nrepetition]
+        %   .hyper          : hierarchical prior samples/settings ([] without hierarchical prior)
         %   .settings       : resolved sampler settings and RNG states
         %
             fitting = this.check_set_default_bayes(fitting);
             if isempty(weights); weights = ones(size(y), 'like', y); end
 
             % likelihood; from here on fitting.modelParams/lb/ub/xStepSize/parameterTransform
-            % hold the SAMPLED parameters only (noise and S0Param removed under marginal likelihoods)
+            % hold the SAMPLED parameters only (noise and S0Param removed under marginal
+            % likelihoods, test-only fixedParams removed)
             [fitting, lik]  = this.setup_likelihood(fitting);
             isMarginal      = lik.isMarginal;
+            % hierarchical prior on the sampled parameters
+            hier            = this.setup_hierarchical(fitting);
+            isHier          = hier.on;
+            isGibbs         = isHier && ~hier.fixed;
 
             % record RNG states before any random number is drawn
             rngState    = rng;
@@ -245,18 +416,42 @@ classdef mcmc_bayes < mcmc
             Nburnin     = this.get_number_burnin(fitting);
             % Ns: # samples in posterior distribution
             Ns          = numel(Nburnin+1:fitting.thinning:fitting.iteration);
-            if isMarginal && Nm < 1 + lik.shapeOffset
-                error('mcmc_bayes:tooFewMeasurements', 'mcmc_bayes: likelihood ''%s'' needs at least %d measurements.', lik.name, 1 + lik.shapeOffset);
+
+            % marginal likelihoods: m = # measurements with non-zero weight, per voxel
+            if isMarginal
+                mNZ = sum(double(gather(weights)) ~= 0, 1);
+                if min(mNZ) < 1 + lik.shapeOffset
+                    error('mcmc_bayes:tooFewMeasurements', ...
+                        'mcmc_bayes: likelihood ''%s'' needs at least %d measurements with non-zero weight per voxel (%d voxel(s) have fewer).', ...
+                        lik.name, 1 + lik.shapeOffset, nnz(mNZ < 1 + lik.shapeOffset));
+                end
+                % scalar when all voxels have the same m (the common case)
+                if all(mNZ == mNZ(1)); mNZ = mNZ(1); end
+            end
+
+            % free hyperparameters couple all voxels into this call: memory guard
+            if isGibbs
+                this.check_hierarchical_memory(Nm, Nv, Nvar, hier);
+                if strcmp(hier.hyperprior,'jeffreys_half') && Nv <= 2*hier.d - 1
+                    error('mcmc_bayes:hierarchicalTooFewVoxels', ...
+                        'mcmc_bayes: hyperprior ''jeffreys_half'' needs more than 2d-1 = %d voxels (got %d).', 2*hier.d-1, Nv);
+                end
             end
 
             % transforms
             method      = this.parse_transform(fitting.parameterTransform, Nvar);
-            this.check_transform_bounds(method, fitting.lb, fitting.ub, fitting.modelParams);
+            isHierRow   = false(1,Nvar); if isHier; isHierRow(hier.idx) = true; end
+            % bounds of the hierarchical parameters are checked in setup_hierarchical
+            this.check_transform_bounds(method(~isHierRow), fitting.lb(~isHierRow), fitting.ub(~isHierRow), fitting.modelParams(~isHierRow));
             isLinear    = strcmp(method,'linear');
-            hasJac      = ~all(isLinear);                           % false -> neutral path, skip all Jacobian terms
-            isRejectRow = gpuArray(~strcmp(method(:),'sigmoid'));   % rows whose box is enforced by rejection
+            hasJac      = ~all(isLinear);                           % false -> x == u, neutral path, skip all Jacobian terms
+            useJac      = ~isLinear & ~isHierRow;                   % rows whose log-Jacobian enters the target
+            dropJac     = any(~isLinear & isHierRow);               % hierarchical rows: log-Jacobian set to 0
+            jacRow      = gpuArray(single(useJac(:)));
+            isRejectH   = ~strcmp(method,'sigmoid') & ~isHierRow;   % rows whose box is enforced by rejection
+            isRejectRow = gpuArray(isRejectH(:));
             code        = gpuArray(single(this.transform_code(method)));  % [Nvar,1] for the fused GPU kernel
-            allReject   = ~any(strcmp(method,'sigmoid'));           % true -> same bound check as legacy
+            allReject   = all(isRejectH);                           % true -> same bound check as legacy
 
             % update scheme and adaptation
             isComponent = strcmpi(fitting.updateScheme,'componentwise');
@@ -277,14 +472,23 @@ classdef mcmc_bayes < mcmc
             % setup boundary variables, [Nvar,1], broadcast over voxels
             lb      = gpuArray( single(fitting.lb(:)));
             ub      = gpuArray( single(fitting.ub(:)));
-            % u-space bounds of the eps-clamped box (for overdisp and step-size cap)
+            % u-space bounds of the eps-clamped box (for overdisp and step-size cap);
+            % hierarchical 'log'/'linear' rows are unbounded in u
             uLo     = this.transform_forward(lb, method, lb, ub);
             uHi     = this.transform_forward(ub, method, lb, ub);
+            isUnbounded = isHierRow & ~strcmp(method,'sigmoid');
+            if any(isUnbounded); uLo(isUnbounded) = -Inf; uHi(isUnbounded) = Inf; end
             uWidth  = uHi - uLo;
             % initialize array to store all the samples
             xPosterior  = zeros(Nvar, Nv, Ns, fitting.repetition,'single');
             acceptance  = zeros(Nv, Nblock, fitting.repetition,'single');
             stepSize    = zeros(Nv, Nvar, fitting.repetition,'single');
+
+            % test-only fixed parameters, [1,Nv] each
+            userFixed = struct();
+            ufNames   = fieldnames(lik.userFixed);
+            for k = 1:numel(ufNames); userFixed.(ufNames{k}) = lik.userFixed.(ufNames{k}) .* ones(1, Nv, 'like', y); end
+            hasUserFixed = ~isempty(ufNames);
 
             % log-likelihood of a native-space parameter array [Nvar,Nv]
             if isMarginal
@@ -292,11 +496,14 @@ classdef mcmc_bayes < mcmc
                 % the second output is the cached sufficient statistics of the state
                 fixedVal    = ones(1, Nv, 'like', y);
                 rssFloor    = max(10*eps('single')^2 .* sum(weights.*y.^2, 1), realmin('single'));
+                if isscalar(mNZ); mArg = mNZ; else; mArg = gpuArray(single(mNZ)); end
                 loglik      = @(x) mcmc_bayes.loglik_marginal( ...
-                                FWDfunc(mcmc_bayes.inject_fixed(this.array2struct(x,fitting.modelParams), lik.fixedParams, fixedVal), varargin{:}), ...
-                                y, weights, lik.name, rssFloor);
+                                FWDfunc(mcmc_bayes.inject_values(mcmc_bayes.inject_fixed(this.array2struct(x,fitting.modelParams), lik.fixedParams, fixedVal), userFixed), varargin{:}), ...
+                                y, weights, lik.name, rssFloor, mArg);
                 Nstat       = lik.Nstat;
                 statsPost   = zeros(Nstat, Nv, Ns, fitting.repetition, 'single');
+            elseif hasUserFixed
+                loglik      = @(x) mcmc_bayes.loglik_gaussian(mcmc_bayes.inject_values(this.array2struct(x,fitting.modelParams), userFixed), y, weights, Nm, FWDfunc, varargin{:});
             else
                 loglik      = @(x) mcmc_bayes.loglik_gaussian(this.array2struct(x,fitting.modelParams), y, weights, Nm, FWDfunc, varargin{:});
             end
@@ -305,6 +512,38 @@ classdef mcmc_bayes < mcmc
             xStart  = this.struct2array(x0,fitting.modelParams);      % extract parameter structure to numeric array for faster computation
             xStart  = max(xStart,lb); xStart = min(xStart,ub);         % set boundary
             uStart  = this.transform_forward(xStart, method, lb, ub);
+
+            % initial u-space proposal scale at the start point (used for overdisp of
+            % unbounded rows and for the hierarchical variance floor)
+            if isHier || any(isUnbounded)
+                sigmaStart = repmat(xStepsize, 1, Nv);
+                if hasJac
+                    logJs = this.transform_logjac(uStart, method, lb, ub);
+                    sigmaStart(~isLinear,:) = min( sigmaStart(~isLinear,:) ./ exp(logJs(~isLinear,:)), uWidth(~isLinear) );
+                end
+            end
+            % over-dispersion scale: the u-width, or 100 x the initial step for unbounded rows
+            if any(isUnbounded) && fitting.overdisp > 0
+                Wod = repmat(uWidth, 1, Nv);
+                Wod(isUnbounded,:) = 100 .* sigmaStart(isUnbounded,:);
+            else
+                Wod = uWidth;
+            end
+
+            % hierarchical prior: resolve the hyperprior defaults and allocate the hyper samples
+            if isHier
+                hIdx    = hier.idx;
+                d       = hier.d;
+                floorVar = (10 .* median(double(gather(sigmaStart(hIdx,:))), 2)).^2;   % [d,1]
+                hp      = this.resolve_hyperprior(hier, double(gather(uStart(hIdx,:))), floorVar);
+                if isGibbs
+                    muPost      = zeros(d, Ns, fitting.repetition);
+                    SigmaPost   = zeros(d, d, Ns, fitting.repetition);
+                end
+            end
+            if fitting.checkCache
+                cacheErr = struct('loglik', 0, 'logprior', 0, 'logjac', 0, 'Ncheck', 0);
+            end
 
             disp('-------------------------');
             disp('MCMC optimisation process');
@@ -317,7 +556,7 @@ classdef mcmc_bayes < mcmc
             % reset start point, over-dispersed in u space for ii > 1
             uCurr = uStart;
             if ii > 1 && fitting.overdisp > 0
-                uCurr = uCurr + fitting.overdisp .* uWidth .* randn(size(uCurr),'like',uCurr);
+                uCurr = uCurr + fitting.overdisp .* Wod .* randn(size(uCurr),'like',uCurr);
                 uCurr = max(uCurr,uLo); uCurr = min(uCurr,uHi);
             end
             if hasJac || ii > 1
@@ -327,7 +566,25 @@ classdef mcmc_bayes < mcmc
                 xCurr = xStart;
             end
             if isMarginal; [logLCurr, statsCurr] = loglik(xCurr); else; logLCurr = loglik(xCurr); end
-            if hasJac; logJCurr = this.transform_logjac(uCurr, method, lb, ub); end
+            if hasJac
+                logJCurr = this.transform_logjac(uCurr, method, lb, ub);
+                if dropJac; logJCurr = logJCurr .* jacRow; end
+            end
+
+            % hyperparameters and cached per-voxel log-prior
+            if isHier
+                if isGibbs
+                    % initial hyperparameters: moments of the current u (variance floored)
+                    uH0     = double(gather(uCurr(hIdx,:)));
+                    mu      = mean(uH0, 2);
+                    Sigma   = diag(max(var(uH0, 0, 2), floorVar));
+                else
+                    mu      = hier.mu;
+                    Sigma   = hier.Sigma;
+                end
+                [muG, PG]   = this.prior_to_gpu(mu, Sigma);
+                lpCurr      = this.logprior_normal(uCurr(hIdx,:), muG, PG);
+            end
 
             % initial proposal scale in u space: xStepSize / |dx/du| at the start point
             sigma = repmat(xStepsize, 1, Nv);
@@ -351,6 +608,7 @@ classdef mcmc_bayes < mcmc
                     if hasJac
                         % fused inverse transform and log-Jacobian (one GPU kernel)
                         [xProposed, logJProposed] = this.transform_inverse_logjac_fused(uProposed, code, lb, ub);
+                        if dropJac; logJProposed = logJProposed .* jacRow; end
                     else
                         xProposed = uProposed;
                     end
@@ -363,15 +621,19 @@ classdef mcmc_bayes < mcmc
                     xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
 
                     % 2. Metropolis sampling
-                    % 2.1 proposal probability (+ log-Jacobian of the transform)
+                    % 2.1 proposal probability (+ log-Jacobian of the transform, + hierarchical log-prior)
                     if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
+                    if isHier; lpProposed = this.logprior_normal(uProposed(hIdx,:), muG, PG); end
                     % 2.2 accept with probability min(1, exp(logRatio)); NaN is rejected
                     if hasJac
                         logRatio            = logLProposed - logLCurr + sum(logJProposed - logJCurr, 1);
+                        if isHier; logRatio = logRatio + (lpProposed - lpCurr); end
                         isAccepted          = exp(logRatio) > rand(1,Nv,'like',logLProposed);
-                    elseif isMarginal
+                    elseif isMarginal || isHier
                         % degenerate states have logL = -Inf; -Inf - (-Inf) = NaN is rejected
-                        isAccepted          = exp(logLProposed - logLCurr) > rand(1,Nv,'like',logLProposed);
+                        logRatio            = logLProposed - logLCurr;
+                        if isHier; logRatio = logRatio + (lpProposed - lpCurr); end
+                        isAccepted          = exp(logRatio) > rand(1,Nv,'like',logLProposed);
                     else
                         % neutral path: same expression as mcmc.metropolis_hastings (the GPU evaluates
                         % fused elementwise expressions slightly differently, so keep it verbatim)
@@ -384,6 +646,7 @@ classdef mcmc_bayes < mcmc
                     logLCurr(isAccepted)    = logLProposed(isAccepted);
                     uCurr(:,isAccepted)     = uProposed(:,isAccepted);
                     if isMarginal; statsCurr(:,isAccepted) = statsProposed(:,isAccepted); end
+                    if isHier; lpCurr(isAccepted) = lpProposed(isAccepted); end
                     % neutral path (all linear): x == u, only u is tracked in the joint loop
                     if hasJac
                         xCurr(:,isAccepted)     = xProposed(:,isAccepted);
@@ -405,23 +668,55 @@ classdef mcmc_bayes < mcmc
                         xProposed_p     = max(xProposed_p,lb(kp)); xProposed_p = min(xProposed_p,ub(kp));
                         xProposed       = xCurr; xProposed(kp,:) = xProposed_p;
 
-                        % 2. Metropolis sampling, cached loglik is the current state
+                        % 2. Metropolis sampling, cached loglik (and log-prior) is the current state
                         if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
                         logRatio        = logLProposed - logLCurr;
-                        if ~isLinear(kp); logRatio = logRatio + logJProposed_p - logJCurr(kp,:); end
+                        if useJac(kp); logRatio = logRatio + logJProposed_p - logJCurr(kp,:); end
+                        if isHierRow(kp)
+                            uProposedH          = uCurr(hIdx,:);
+                            uProposedH(hIdx==kp,:) = uProposed_p;
+                            lpProposed          = this.logprior_normal(uProposedH, muG, PG);
+                            logRatio            = logRatio + (lpProposed - lpCurr);
+                        end
                         isAccepted_p                = exp(logRatio) > rand(1,Nv,'like',logLProposed);
                         isAccepted_p(isOutofbound)  = 0;
                         % 3. update parameter kp and the cache before the next parameter
                         logLCurr(isAccepted_p)      = logLProposed(isAccepted_p);
                         if isMarginal; statsCurr(:,isAccepted_p) = statsProposed(:,isAccepted_p); end
+                        if isHierRow(kp); lpCurr(isAccepted_p) = lpProposed(isAccepted_p); end
                         uCurr(kp,isAccepted_p)      = uProposed_p(isAccepted_p);
                         xCurr(kp,isAccepted_p)      = xProposed_p(isAccepted_p);
-                        if ~isLinear(kp); logJCurr(kp,isAccepted_p) = logJProposed_p(isAccepted_p); end
+                        if useJac(kp); logJCurr(kp,isAccepted_p) = logJProposed_p(isAccepted_p); end
                         isAccepted(kp,:)            = isAccepted_p;
                     end
                 end
 
-                % 3. acceptance bookkeeping and adaptation (burn-in only, frozen afterwards)
+                % 3. Gibbs block: exact conditional draws of (mu, Sigma), then refresh the log-prior cache
+                if isGibbs
+                    [ubar, S]   = this.hyper_suffstats(uCurr(hIdx,:));
+                    [mu, Sigma] = this.gibbs_hyper(ubar, S, Nv, mu, Sigma, hp);
+                    [muG, PG]   = this.prior_to_gpu(mu, Sigma);
+                    lpCurr      = this.logprior_normal(uCurr(hIdx,:), muG, PG);
+                end
+
+                % test only: compare the caches with a fresh computation of the current state
+                if fitting.checkCache
+                    if hasJac; xNow = xCurr; else; xNow = uCurr; end
+                    if isMarginal; [lFresh, sFresh] = loglik(xNow); else; lFresh = loglik(xNow); end
+                    cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(lFresh, logLCurr));
+                    if isMarginal; cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(sFresh, statsCurr)); end
+                    if isHier
+                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_normal(uCurr(hIdx,:), muG, PG), lpCurr));
+                    end
+                    if hasJac
+                        jFresh = this.transform_logjac(uCurr, method, lb, ub);
+                        if dropJac; jFresh = jFresh .* jacRow; end
+                        cacheErr.logjac = max(cacheErr.logjac, this.max_abs_diff(jFresh, logJCurr));
+                    end
+                    cacheErr.Ncheck = cacheErr.Ncheck + 1;
+                end
+
+                % 4. acceptance bookkeeping and adaptation (burn-in only, frozen afterwards)
                 if k <= Nburnin
                     if isAdapt
                         accWin = accWin + isAccepted;
@@ -438,13 +733,14 @@ classdef mcmc_bayes < mcmc
                     accPost = accPost + isAccepted;
                 end
 
-                % 4. Maintain the independence between iterations
-                % 4.1 discard the first burnin*100% iterations
-                % 4.2 keep an iteration every N iterations
+                % 5. Maintain the independence between iterations
+                % 5.1 discard the first burnin*100% iterations
+                % 5.2 keep an iteration every N iterations
                 if ( k > Nburnin ) && mod(k-Nburnin+1, fitting.thinning) == 0
                     counter = counter+1;
                     if hasJac; xPosterior(:,:,counter,ii) = gather(xCurr); else; xPosterior(:,:,counter,ii) = gather(uCurr); end
                     if isMarginal; statsPost(:,:,counter,ii) = gather(statsCurr); end
+                    if isGibbs; muPost(:,counter,ii) = mu; SigmaPost(:,:,counter,ii) = Sigma; end
                 end
 
                 % display message at 1000 iteration and every 10000 iteration
@@ -466,7 +762,7 @@ classdef mcmc_bayes < mcmc
             % nuisance recovery: exact conditional draws of sigma (and S0) for every retained sample,
             % from the cached statistics (no extra forward evaluation); output in full modelParams order
             if isMarginal
-                xPosterior = this.recover_nuisance(xPosterior, statsPost, lik, Nm);
+                xPosterior = this.recover_nuisance(xPosterior, statsPost, lik, mNZ);
             end
 
             % diagnostics and resolved settings
@@ -475,6 +771,24 @@ classdef mcmc_bayes < mcmc
             diagnostics.stepSize    = stepSize;
             diagnostics.sampledParams   = fitting.modelParams(:).';
             diagnostics.recoveredParams = lik.recoveredParams;
+            if fitting.checkCache; diagnostics.cacheCheck = cacheErr; end
+            if isHier
+                hyper = struct('params', {hier.params}, ...
+                               'transform', {this.transform_description(method(hIdx), fitting.lb(hIdx), fitting.ub(hIdx))}, ...
+                               'hyperprior', hier.hyperprior, 'fixed', hier.fixed);
+                if isGibbs
+                    hyper.muPost    = muPost;
+                    hyper.SigmaPost = SigmaPost;
+                else
+                    hyper.mu        = hier.mu;
+                    hyper.Sigma     = hier.Sigma;
+                end
+                diagnostics.hyper = hyper;
+                priorSettings = this.prior_settings(hier, hp);
+            else
+                diagnostics.hyper = [];
+                priorSettings = [];
+            end
             diagnostics.settings    = struct( ...
                 'parameterTransform',   {method}, ...
                 'updateScheme',         lower(fitting.updateScheme), ...
@@ -485,14 +799,16 @@ classdef mcmc_bayes < mcmc
                 'Nadapt',               Nadapt*isAdapt, ...
                 'Nburnin',              Nburnin, ...
                 'overdisp',             fitting.overdisp, ...
-                'overdispRule',         'u0 + overdisp*(T(ub)-T(lb)).*randn for repetition > 1', ...
+                'overdispRule',         'u0 + overdisp*W.*randn for repetition > 1, W = T(ub)-T(lb), or 100 x initial u-step if unbounded', ...
                 'stepSizeInit',         'xStepSize ./ |dx/du| at the start point (u space)', ...
                 'forceNewPath',         logical(fitting.forceNewPath), ...
                 'likelihood',           lik.name, ...
                 'S0Param',              lik.S0Param, ...
                 'sampledParams',        {fitting.modelParams(:).'}, ...
                 'droppedParams',        {lik.droppedParams}, ...
+                'fixedParams',          lik.userFixed, ...
                 'nuisance',             lik.nuisance, ...
+                'prior',                priorSettings, ...
                 'rngState',             rngState, ...
                 'gpuRngState',          gpuRngState, ...
                 'geom',                 geom);
@@ -528,7 +844,8 @@ classdef mcmc_bayes < mcmc
                          'adaptInterval',       50;
                          'adaptTarget',         [];
                          'overdisp',            0;
-                         'prior',               []};
+                         'prior',               [];
+                         'fixedParams',         []};
 
             for k = 1:size(defaults,1)
                 name = defaults{k,1};
@@ -573,6 +890,8 @@ classdef mcmc_bayes < mcmc
             if ~isfield(fitting,'overdisp');            fitting2.overdisp           = 0;             end
             if ~isfield(fitting,'prior');               fitting2.prior              = [];            end
             if ~isfield(fitting,'forceNewPath');        fitting2.forceNewPath       = false;         end
+            if ~isfield(fitting,'fixedParams');         fitting2.fixedParams        = [];            end
+            if ~isfield(fitting,'checkCache');          fitting2.checkCache         = false;         end
 
             if ~any(strcmpi(fitting2.updateScheme,{'joint','componentwise'}))
                 error('mcmc_bayes:invalidUpdateScheme', ...
@@ -599,6 +918,17 @@ classdef mcmc_bayes < mcmc
             disp(['Over-dispersion   : ', num2str(fitting.overdisp)]);
             disp(['Likelihood        : ', char(fitting.likelihood)]);
             if ~isempty(fitting.S0Param); disp(['S0 parameter      : ', char(fitting.S0Param), ' (marginalised)']); end
+            if isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical') && ~isempty(fitting.prior.hierarchical) && ...
+                    ~(islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
+                h = fitting.prior.hierarchical;
+                if isstruct(h) && isfield(h,'fixed') && ~isempty(h.fixed) && h.fixed
+                    disp( 'Prior             : hierarchical Normal on u, fixed mu/Sigma');
+                elseif isstruct(h) && isfield(h,'hyperprior') && ~isempty(h.hyperprior)
+                    disp(['Prior             : hierarchical Normal on u, hyperprior ', char(h.hyperprior)]);
+                else
+                    disp( 'Prior             : hierarchical Normal on u, hyperprior niw');
+                end
+            end
         end
 
         % Gaussian log-likelihood, same computation as mcmc.metropolis_hastings
@@ -623,6 +953,8 @@ classdef mcmc_bayes < mcmc
         %   .S0Param        : amplitude parameter name ('' if none)
         %   .droppedParams  : parameters removed from the sampled set
         %   .fixedParams    : fields injected (value 1) before each FWDfunc call
+        %   .userFixed      : structure, test-only fitting.fixedParams (removed from the sampled
+        %                     set and from the output, value injected before each likelihood call)
         %   .recoveredParams: fields restored by post-hoc conditional draws
         %   .shapeOffset    : InvGamma shape is (m - shapeOffset)/2
         %   .Nstat          : # cached statistics per voxel ([R] or [RSS; Shat; g'Wg])
@@ -677,26 +1009,49 @@ classdef mcmc_bayes < mcmc
 
             isMarginal  = ~strcmp(name, 'gaussian');
             isDrop      = isMarginal & (isNoise | isS0);
-            if all(isDrop)
-                error('mcmc_bayes:noSampledParams', 'mcmc_bayes: no parameter left to sample after removing %s.', strjoin(params(isDrop), ', '));
+
+            % test-only fixed parameters (removed from the sampled set, value injected)
+            userFixed   = struct();
+            if isfield(fitting,'fixedParams') && ~isempty(fitting.fixedParams)
+                userFixed = fitting.fixedParams;
+                if ~isstruct(userFixed) || ~isscalar(userFixed)
+                    error('mcmc_bayes:fixedParams', 'mcmc_bayes: fitting.fixedParams must be a scalar structure of scalar values.');
+                end
+                fnF = fieldnames(userFixed);
+                for k = 1:numel(fnF)
+                    v = userFixed.(fnF{k});
+                    if ~any(strcmp(params, fnF{k})) || any(strcmp(params(isDrop), fnF{k}))
+                        error('mcmc_bayes:fixedParams', 'mcmc_bayes: fitting.fixedParams.%s is not a sampled model parameter.', fnF{k});
+                    end
+                    if ~(isnumeric(v) && isscalar(v) && isfinite(v))
+                        error('mcmc_bayes:fixedParams', 'mcmc_bayes: fitting.fixedParams.%s must be a finite scalar.', fnF{k});
+                    end
+                end
+            end
+            isUserFixed = ismember(params, fieldnames(userFixed));
+            isSampled   = ~isDrop & ~isUserFixed;
+            if ~any(isSampled)
+                error('mcmc_bayes:noSampledParams', 'mcmc_bayes: no parameter left to sample after removing %s.', strjoin(params(~isSampled), ', '));
             end
 
             % sampled subset
             fittingS                = fitting;
-            fittingS.modelParams    = reshape(params(~isDrop), [], 1);
-            fittingS.lb             = reshape(fitting.lb(~isDrop), [], 1);
-            fittingS.ub             = reshape(fitting.ub(~isDrop), [], 1);
-            fittingS.xStepSize      = reshape(fitting.xStepSize(~isDrop), [], 1);
+            fittingS.modelParams    = reshape(params(isSampled), [], 1);
+            fittingS.lb             = reshape(fitting.lb(isSampled), [], 1);
+            fittingS.ub             = reshape(fitting.ub(isSampled), [], 1);
+            fittingS.xStepSize      = reshape(fitting.xStepSize(isSampled), [], 1);
             if isfield(fitting,'parameterTransform') && (iscell(fitting.parameterTransform) || (isstring(fitting.parameterTransform) && ~isscalar(fitting.parameterTransform)))
                 if numel(fitting.parameterTransform) ~= Nfull
                     error('mcmc_bayes:invalidTransform', ...
                         'mcmc_bayes: per-parameter parameterTransform must have one entry per modelParams (%d, including any marginalised parameter).', Nfull);
                 end
-                fittingS.parameterTransform = fitting.parameterTransform(~isDrop);
+                fittingS.parameterTransform = fitting.parameterTransform(isSampled);
             end
 
-            % output parameter list: full modelParams order, 'noise' appended if the model has none
-            outParams = params; outLb = fitting.lb(:).'; outUb = fitting.ub(:).';
+            % output parameter list: full modelParams order (without test-only fixed
+            % parameters), 'noise' appended if the model has none
+            outParams = params(~isUserFixed); outLb = fitting.lb(~isUserFixed); outUb = fitting.ub(~isUserFixed);
+            outLb = outLb(:).'; outUb = outUb(:).';
             if isMarginal && ~any(isNoise)
                 outParams{end+1} = 'noise'; outLb(end+1) = 0; outUb(end+1) = Inf;
             end
@@ -709,6 +1064,7 @@ classdef mcmc_bayes < mcmc
             lik.isMarginal      = isMarginal;
             lik.S0Param         = S0Param;
             lik.droppedParams   = params(isDrop);
+            lik.userFixed       = userFixed;
             lik.fittingOut      = fittingOut;
             lik.shapeOffset     = double(strcmp(name, 'marginal_S0noise_flat'));
             switch name
@@ -750,8 +1106,16 @@ classdef mcmc_bayes < mcmc
             end
         end
 
+        % copy all fields of vals into a parameter structure
+        function x_struct = inject_values(x_struct, vals)
+            fn = fieldnames(vals);
+            for k = 1:numel(fn)
+                x_struct.(fn{k}) = vals.(fn{k});
+            end
+        end
+
         % marginal log-likelihood (theta-dependent part) and cached statistics
-        function [logL, stats] = loglik_marginal(g, y, weights, name, rssFloor)
+        function [logL, stats] = loglik_marginal(g, y, weights, name, rssFloor, m)
         % Input
         % -----
         % g         : forward model without amplitude, [Nm, Nv]
@@ -759,12 +1123,15 @@ classdef mcmc_bayes < mcmc
         % weights   : weights (W diagonal), [Nm, Nv]
         % name      : 'marginal_noise' | 'marginal_S0noise' | 'marginal_S0noise_flat'
         % rssFloor  : [1,Nv] (or scalar), R/RSS at or below this value is rejected
+        % m         : (optional) # measurements with non-zero weight, scalar or [1,Nv];
+        %             default sum(weights ~= 0, 1)
         % Output
         % ------
         % logL      : [1, Nv], -Inf for degenerate states
         % stats     : [1, Nv] R ('marginal_noise') or [3, Nv] [RSS; Shat; g'Wg]
         %
-            Nm      = size(y,1);
+            if nargin < 6 || isempty(m); m = sum(weights ~= 0, 1); end
+            Nm      = m;
             gFloor  = double(realmin('single'))/double(eps('single'));    % double, so CPU double inputs stay double
             switch name
                 case 'marginal_noise'
@@ -788,12 +1155,13 @@ classdef mcmc_bayes < mcmc
 
         % logL = -a*log(R) - cG*log(gWg), -Inf for degenerate states: one fused
         % kernel on the GPU (marginal_kernel), the same maths vectorised on the CPU
+        % (a = m/2 or (m-1)/2, scalar or [1,Nv])
         function logL = marginal_apply(R, gWg, a, cG, rssFloor, gFloor)
             if isa(R, 'gpuArray')
                 logL = arrayfun(@marginal_kernel, R, gWg, a, cG, rssFloor, gFloor);
             else
                 ok      = (R > rssFloor) & (gWg > gFloor) & (gWg < Inf);
-                logL    = -a*log(max(R, rssFloor)) - cG*log(min(max(gWg, gFloor), 1/gFloor));
+                logL    = -a.*log(max(R, rssFloor)) - cG.*log(min(max(gWg, gFloor), 1/gFloor));
                 logL    = logL .* ones(size(ok), 'like', logL);
                 logL(~ok) = -Inf;
             end
@@ -806,7 +1174,7 @@ classdef mcmc_bayes < mcmc
         % xPosterior: structure, sampled parameters, each [Nv, Ns, Nrep]
         % statsPost : cached statistics at the retained samples, [Nstat, Nv, Ns, Nrep]
         % lik       : see setup_likelihood
-        % Nm        : # measurements
+        % Nm        : # measurements with non-zero weight, scalar or [1,Nv]
         % Output
         % ------
         % xPosterior: structure with the recovered fields added ('noise' = sigma, S0Param),
@@ -814,6 +1182,10 @@ classdef mcmc_bayes < mcmc
         %
             a       = (Nm - lik.shapeOffset)/2;             % InvGamma shape
             sz      = size(statsPost, 2:4);
+            if ~isscalar(a)
+                % per-voxel shape, expanded to the [Nv*Ns*Nrep] element order (voxel fastest)
+                a = repmat(double(a(:)).', 1, prod(sz(2:end)));
+            end
             stats   = reshape(statsPost, size(statsPost,1), []);
             Nel     = size(stats, 2);
             noise   = zeros(1, Nel, 'single');
@@ -824,7 +1196,11 @@ classdef mcmc_bayes < mcmc
                 idx     = kc:min(kc+chunk-1, Nel);
                 st      = gpuArray(stats(:, idx));
                 % sigma^2 = (R/2)/G, G ~ Gamma(a,1)
-                sigma2  = (st(1,:)./2) ./ randg(a, [1 numel(idx)], 'like', st);
+                if isscalar(a)
+                    sigma2  = (st(1,:)./2) ./ randg(a, [1 numel(idx)], 'like', st);
+                else
+                    sigma2  = (st(1,:)./2) ./ randg(gpuArray(single(a(idx))));
+                end
                 noise(idx) = gather(sqrt(sigma2));
                 if lik.Nstat == 3
                     S0(idx) = gather(st(2,:) + sqrt(sigma2./st(3,:)) .* randn(1, numel(idx), 'like', st));
@@ -842,6 +1218,357 @@ classdef mcmc_bayes < mcmc
                 if isfield(recovered, p); xOut.(p) = recovered.(p); else; xOut.(p) = xPosterior.(p); end
             end
             xPosterior = xOut;
+        end
+
+        %% hierarchical Normal prior (Phase 3), see the derivation in the class header
+        % resolve and validate fitting.prior.hierarchical for the SAMPLED parameters
+        function hier = setup_hierarchical(fitting)
+        % Input
+        % -----
+        % fitting   : fitting structure with the sampled parameter set (setup_likelihood output)
+        % Output
+        % ------
+        % hier      : structure
+        %   .on             : true if the hierarchical prior is used
+        %   .params, .idx   : hierarchical parameters and their rows in fitting.modelParams (model order)
+        %   .d              : # hierarchical parameters
+        %   .hyperprior     : 'niw' | 'jeffreys_half'
+        %   .m0, .kappa0, .Psi0, .nu0 : NIW hyperprior ([] -> resolved at the start of sampling)
+        %   .fixed, .mu, .Sigma       : fixed mode and its hyperparameters (mu [d,1], Sigma [d,d])
+        %   .subsetFraction, .maxGPUMemory
+        %
+            hier = struct('on', false, 'params', {{}}, 'idx', [], 'd', 0, 'hyperprior', '', ...
+                          'm0', [], 'kappa0', [], 'Psi0', [], 'nu0', [], 'fixed', false, 'mu', [], 'Sigma', [], ...
+                          'subsetFraction', 1, 'maxGPUMemory', []);
+            if ~isfield(fitting,'prior') || isempty(fitting.prior); return; end
+            prior = fitting.prior;
+            if ~isstruct(prior) || ~isscalar(prior)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: fitting.prior must be a structure with the field(s) hierarchical and/or mrf.');
+            end
+            bad = setdiff(fieldnames(prior), {'hierarchical','mrf'});
+            if ~isempty(bad)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior: %s (valid: hierarchical, mrf).', strjoin(bad, ', '));
+            end
+            if isfield(prior,'mrf') && ~isempty(prior.mrf)
+                error('mcmc_bayes:notImplemented', 'mcmc_bayes: non-default option(s) not implemented yet: prior.mrf');
+            end
+            if ~isfield(prior,'hierarchical') || isempty(prior.hierarchical); return; end
+            h = prior.hierarchical;
+            if islogical(h) && isscalar(h)
+                if ~h; return; end
+                h = struct();
+            end
+            if ~isstruct(h) || ~isscalar(h)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: fitting.prior.hierarchical must be a structure (or true).');
+            end
+            valid = {'hyperprior','m0','kappa0','Psi0','nu0','fixed','mu','Sigma','params','subsetFraction','maxGPUMemory'};
+            bad   = setdiff(fieldnames(h), valid);
+            if ~isempty(bad)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior.hierarchical: %s (valid: %s).', ...
+                    strjoin(bad, ', '), strjoin(valid, ', '));
+            end
+
+            % parameters under the hierarchy (default: all sampled parameters except 'noise')
+            params  = cellstr(fitting.modelParams); params = params(:).';
+            hp      = field_or_default(h, 'params', []);
+            if isempty(hp)
+                hp = params(~strcmp(params,'noise'));
+                if isempty(hp)
+                    error('mcmc_bayes:hierarchicalParams', 'mcmc_bayes: no sampled parameter left for the hierarchical prior.');
+                end
+            else
+                hp = cellstr(hp); hp = hp(:).';
+                if numel(unique(hp)) ~= numel(hp)
+                    error('mcmc_bayes:hierarchicalParams', 'mcmc_bayes: prior.hierarchical.params has duplicate entries.');
+                end
+                missing = hp(~ismember(hp, params));
+                if ~isempty(missing)
+                    error('mcmc_bayes:hierarchicalParams', ...
+                        ['mcmc_bayes: prior.hierarchical.params: %s is not a sampled parameter (sampled: %s). ' ...
+                         'Marginalised or fixed parameters cannot be under the hierarchy.'], strjoin(missing, ', '), strjoin(params, ', '));
+                end
+            end
+            idx     = sort(find(ismember(params, hp)));     % model order
+            d       = numel(idx);
+
+            % transforms and bounds allowed without bound rejection
+            if isfield(fitting,'parameterTransform') && ~isempty(fitting.parameterTransform); spec = fitting.parameterTransform; else; spec = 'linear'; end
+            method  = mcmc_bayes.parse_transform(spec, numel(params));
+            lb      = fitting.lb(:); ub = fitting.ub(:);
+            for j = idx
+                switch method{j}
+                    case 'sigmoid'; ok = isfinite(lb(j)) && isfinite(ub(j)) && ub(j) > lb(j);
+                    case 'log';     ok = lb(j) == 0 && ub(j) == Inf;
+                    otherwise;      ok = lb(j) == -Inf && ub(j) == Inf;
+                end
+                if ~ok
+                    error('mcmc_bayes:hierarchicalTransform', ...
+                        ['mcmc_bayes: hierarchical parameter %s has transform ''%s'' with bounds [%g, %g]. The Normal prior lives in u space ' ...
+                         'with no bound rejection, so the allowed combinations are ''sigmoid'' with finite lb < ub, ''log'' with lb = 0 and ' ...
+                         'ub = Inf, and ''linear'' with lb = -Inf and ub = Inf.'], params{j}, method{j}, lb(j), ub(j));
+                end
+            end
+
+            % hyperprior
+            hyperprior = lower(char(field_or_default(h, 'hyperprior', 'niw')));
+            if ~any(strcmp(hyperprior, {'niw','jeffreys_half'}))
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: prior.hierarchical.hyperprior must be ''niw'' or ''jeffreys_half'' (got ''%s'').', hyperprior);
+            end
+            kappa0  = field_or_default(h, 'kappa0', 1e-3);
+            if ~(isnumeric(kappa0) && isscalar(kappa0) && isfinite(kappa0) && kappa0 > 0)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: prior.hierarchical.kappa0 must be a positive scalar.');
+            end
+            nu0     = field_or_default(h, 'nu0', []);
+            if ~isempty(nu0) && ~(isnumeric(nu0) && isscalar(nu0) && isfinite(nu0) && nu0 > d - 1)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: prior.hierarchical.nu0 must be a scalar > d - 1 = %d.', d - 1);
+            end
+            Psi0    = field_or_default(h, 'Psi0', []);
+            if ~isempty(Psi0)
+                Psi0 = mcmc_bayes.check_spd(double(Psi0), d, 'mcmc_bayes:invalidPrior', 'prior.hierarchical.Psi0');
+            end
+            m0      = field_or_default(h, 'm0', []);
+            if ~isempty(m0)
+                if ~(isnumeric(m0) && numel(m0) == d && all(isfinite(m0)))
+                    error('mcmc_bayes:invalidPrior', 'mcmc_bayes: prior.hierarchical.m0 must be a finite vector with %d entries.', d);
+                end
+                m0 = double(m0(:));
+            end
+
+            % fixed mode
+            fixed   = logical(field_or_default(h, 'fixed', false));
+            mu      = field_or_default(h, 'mu', []);
+            Sigma   = field_or_default(h, 'Sigma', []);
+            if fixed
+                if ~(isnumeric(mu) && numel(mu) == d && all(isfinite(mu)))
+                    error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode needs prior.hierarchical.mu with %d finite entries (u space).', d);
+                end
+                mu      = double(mu(:));
+                Sigma   = mcmc_bayes.check_spd(double(Sigma), d, 'mcmc_bayes:hierarchicalFixed', 'prior.hierarchical.Sigma');
+            elseif ~isempty(mu) || ~isempty(Sigma)
+                error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: prior.hierarchical.mu/Sigma are only used with fixed = true.');
+            end
+
+            subsetFraction = field_or_default(h, 'subsetFraction', 1);
+            if ~(isnumeric(subsetFraction) && isscalar(subsetFraction) && subsetFraction > 0 && subsetFraction <= 1)
+                error('mcmc_bayes:subsetFraction', 'mcmc_bayes: prior.hierarchical.subsetFraction must be in (0,1].');
+            end
+
+            hier.on             = true;
+            hier.params         = params(idx);
+            hier.idx            = idx;
+            hier.d              = d;
+            hier.hyperprior     = hyperprior;
+            hier.m0             = m0;
+            hier.kappa0         = kappa0;
+            hier.Psi0           = Psi0;
+            hier.nu0            = nu0;
+            hier.fixed          = fixed;
+            hier.mu             = mu;
+            hier.Sigma          = Sigma;
+            hier.subsetFraction = subsetFraction;
+            hier.maxGPUMemory   = field_or_default(h, 'maxGPUMemory', []);
+        end
+
+        % symmetric positive definite d x d check (returns the symmetrised matrix)
+        function A = check_spd(A, d, id, name)
+            if ~(isnumeric(A) && isequal(size(A), [d d]) && all(isfinite(A(:))))
+                error(id, 'mcmc_bayes: %s must be a finite %d x %d matrix.', name, d, d);
+            end
+            if max(abs(A - A.'), [], 'all') > 1e-10 * max(abs(A), [], 'all')
+                error(id, 'mcmc_bayes: %s must be symmetric.', name);
+            end
+            A = (A + A.')/2;
+            [~, flag] = chol(A);
+            if flag
+                error(id, 'mcmc_bayes: %s must be positive definite.', name);
+            end
+        end
+
+        % resolve the NIW defaults from the starting u, see the class header
+        function hp = resolve_hyperprior(hier, uStartH, floorVar)
+        % uStartH   : [d, Nv] starting u of the hierarchical parameters (double)
+        % floorVar  : [d, 1] variance floor, (10 x median initial u-step)^2
+            hp          = hier;
+            d           = hier.d;
+            hp.floorVar = floorVar(:);
+            hp.rules    = struct('m0','user','nu0','user','Psi0','user');
+            if isempty(hp.m0);  hp.m0  = mean(uStartH, 2);  hp.rules.m0  = 'mean of the starting u'; end
+            if isempty(hp.nu0); hp.nu0 = d + 2;             hp.rules.nu0 = 'd + 2'; end
+            if isempty(hp.Psi0)
+                v0          = max(var(uStartH, 0, 2), hp.floorVar);
+                hp.Psi0     = max(hp.nu0 - d - 1, 1) .* diag(v0);
+                hp.rules.Psi0 = 'max(nu0-d-1,1)*diag(max(var(u_start), (10*median initial u-step)^2))';
+            end
+        end
+
+        % the hyperparameters on the GPU: mean [d,1] and precision [d,d], single
+        function [muG, PG] = prior_to_gpu(mu, Sigma)
+            d   = numel(mu);
+            R   = chol(Sigma);
+            Ri  = R \ eye(d);
+            P   = Ri * Ri.';
+            P   = (P + P.')/2;
+            muG = gpuArray(single(mu(:)));
+            PG  = gpuArray(single(P));
+        end
+
+        % per-voxel log-prior (u-dependent part), -(u-mu)' P (u-mu)/2, [1,Nv]
+        function lp = logprior_normal(uH, mu, P)
+            r  = uH - mu;
+            lp = -0.5 .* sum(r .* (P*r), 1);
+        end
+
+        % ubar [d,1] and scatter matrix S [d,d] of u [d,n] in double (on the GPU for gpuArray input), gathered
+        function [ubar, S] = hyper_suffstats(uH)
+            ud      = double(uH);
+            n       = size(ud, 2);
+            ubar    = sum(ud, 2) ./ n;
+            rc      = ud - ubar;
+            S       = rc * rc.';
+            [ubar, S] = gather(ubar, S);
+            S       = (S + S.')/2;
+        end
+
+        % one Gibbs block of the hyperparameters given ubar, S of n voxels (host, double)
+        function [mu, Sigma] = gibbs_hyper(ubar, S, n, mu, Sigma, hp)
+        % hp : resolved hyperprior (resolve_hyperprior); mu/Sigma are the current values
+            d = numel(ubar);
+            switch hp.hyperprior
+                case 'niw'
+                    % exact joint draw from the conjugate posterior
+                    [mn, kn, Psin, nun] = mcmc_bayes.niw_posterior(ubar, S, n, hp.m0, hp.kappa0, hp.Psi0, hp.nu0);
+                    Sigma   = mcmc_bayes.draw_iw_bartlett(Psin, nun);
+                    mu      = mcmc_bayes.draw_mvn(mn, Sigma ./ kn);
+                case 'jeffreys_half'
+                    % Sigma | u, mu (current mu), then mu | Sigma, u
+                    dm      = ubar - mu;
+                    Smu     = S + n .* (dm * dm.');
+                    Smu     = (Smu + Smu.')/2;
+                    Sigma   = mcmc_bayes.draw_iw_bartlett(Smu, n - d);
+                    mu      = mcmc_bayes.draw_mvn(ubar, Sigma ./ n);
+            end
+        end
+
+        % NIW posterior parameters from the sufficient statistics
+        function [mn, kn, Psin, nun] = niw_posterior(ubar, S, n, m0, kappa0, Psi0, nu0)
+        % ubar [d,1], S [d,d] = sum_i (u_i-ubar)(u_i-ubar)', n # voxels; NIW(m0, kappa0, Psi0, nu0)
+            ubar    = ubar(:); m0 = m0(:);
+            kn      = kappa0 + n;
+            nun     = nu0 + n;
+            mn      = (kappa0 .* m0 + n .* ubar) ./ kn;
+            dm      = ubar - m0;
+            Psin    = Psi0 + S + (kappa0 * n / kn) .* (dm * dm.');
+            Psin    = (Psin + Psin.')/2;
+        end
+
+        % inverse-Wishart draw by the Bartlett decomposition (host, no Statistics toolbox)
+        function Sigma = draw_iw_bartlett(Psi, nu)
+        % Sigma ~ IW(Psi, nu): density ∝ |Sigma|^(-(nu+d+1)/2) exp(-tr(Psi Sigma^-1)/2), E = Psi/(nu-d-1), nu > d-1
+            d = size(Psi, 1);
+            U = chol(Psi);                                  % Psi = U'U
+            A = zeros(d);
+            for j = 1:d
+                A(j,j) = sqrt(2 * randg((nu - j + 1)/2));   % chi^2_(nu-j+1)
+            end
+            if d > 1
+                A(tril(true(d), -1)) = randn(d*(d-1)/2, 1);
+            end
+            T       = A \ U;                                % Sigma^-1 = U^-1 A A' U^-T ~ W(Psi^-1, nu)
+            Sigma   = T.' * T;
+        end
+
+        % multivariate normal draw (host)
+        function x = draw_mvn(m, C)
+            x = m(:) + chol(C, 'lower') * randn(numel(m), 1);
+        end
+
+        % heuristic GPU memory (bytes) of one sampler call, see the class header
+        function bytes = estimate_gpu_memory(Nm, Nv, Nvar)
+            bytes = 2 * 4 * Nv * (8*Nm + 24*Nvar + 16);
+        end
+
+        % error if the coupled free-hyperparameter run does not fit on the GPU
+        function check_hierarchical_memory(Nm, Nv, Nvar, hier)
+            need = mcmc_bayes.estimate_gpu_memory(Nm, Nv, Nvar);
+            if isempty(hier.maxGPUMemory)
+                dev   = gpuDevice;
+                avail = dev.AvailableMemory;
+            else
+                avail = hier.maxGPUMemory;
+            end
+            if need > avail
+                error('mcmc_bayes:hierarchicalMemory', ...
+                    ['mcmc_bayes: the free-hyperparameter hierarchical prior couples all %d voxels into one GPU call; the estimated ' ...
+                     'memory (%.3g GB) exceeds the available %.3g GB. Use the two-stage scheme instead: ' ...
+                     '[mu,Sigma,fittingFixed] = mcmc_bayes().estimate_hyper_subset(...) with prior.hierarchical.subsetFraction < 1, ' ...
+                     'then mcmc_bayes().optimisation(..., fittingFixed, ...) (fixed mode, voxels independent, can be segmented).'], ...
+                    Nv, need/1e9, avail/1e9);
+            end
+        end
+
+        % u in terms of x for each hierarchical parameter
+        function desc = transform_description(method, lb, ub)
+            desc = cell(1, numel(method));
+            for k = 1:numel(method)
+                switch method{k}
+                    case 'sigmoid'; desc{k} = sprintf('u = log((x - %g)/(%g - x))  (x = %g + %g*sigmoid(u))', lb(k), ub(k), lb(k), ub(k)-lb(k));
+                    case 'log';     desc{k} = 'u = log(x)';
+                    otherwise;      desc{k} = 'u = x';
+                end
+            end
+        end
+
+        % resolved prior settings for out.settings.prior
+        function s = prior_settings(hier, hp)
+            s.hierarchical = struct( ...
+                'params',       {hier.params}, ...
+                'd',            hier.d, ...
+                'hyperprior',   hier.hyperprior, ...
+                'fixed',        hier.fixed, ...
+                'space',        'N(u | mu, Sigma) on the transformed parameters; no log-Jacobian and no bound rejection for these parameters');
+            if hier.fixed
+                s.hierarchical.mu       = hier.mu;
+                s.hierarchical.Sigma    = hier.Sigma;
+            else
+                switch hier.hyperprior
+                    case 'niw'
+                        s.hierarchical.m0       = hp.m0;
+                        s.hierarchical.kappa0   = hp.kappa0;
+                        s.hierarchical.Psi0     = hp.Psi0;
+                        s.hierarchical.nu0      = hp.nu0;
+                        s.hierarchical.rules    = hp.rules;
+                        s.hierarchical.gibbs    = 'after every MH sweep: Sigma|u ~ IW(Psi_n, nu_n), mu|Sigma,u ~ N(m_n, Sigma/kappa_n)';
+                    case 'jeffreys_half'
+                        s.hierarchical.gibbs    = 'after every MH sweep: Sigma|u,mu ~ IW(S_mu, n-d), then mu|Sigma,u ~ N(ubar, Sigma/n); p(mu) flat, p(Sigma) ∝ |Sigma|^(-1/2)';
+                end
+                s.hierarchical.init     = 'every repetition: mu = mean(u), Sigma = diag(max(var(u), floorVar))';
+                s.hierarchical.floorVar = hp.floorVar;
+            end
+            s.mrf = [];
+        end
+
+        % largest |a - b| over all elements (equal infinities count as 0, one-sided NaN/Inf as Inf)
+        function e = max_abs_diff(a, b)
+            a   = double(gather(a)); b = double(gather(b));
+            dif = abs(a - b);
+            same = (a == b) | (isnan(a) & isnan(b));
+            dif(same) = 0;
+            dif(isnan(dif)) = Inf;
+            e   = max([dif(:); 0]);
+        end
+
+        % subset of the masked voxels of an image (or [Nm, Nvox] matrix, as in mcmc)
+        function out = subset_voxels(data, mask, idx)
+        % idx : linear indices into mask
+            if ismatrix(data)
+                out = data(:, idx);
+                return
+            end
+            sz      = size(data);
+            nd      = find(cumprod(sz) == numel(mask), 1, 'last');     % last spatial dimension
+            out     = reshape(data, numel(mask), []);
+            out     = out(idx, :);
+            out     = reshape(out, [numel(idx) 1 1 sz(nd+1:end)]);
         end
 
         % Robbins-Monro gain of the j-th adaptation step
@@ -905,8 +1632,13 @@ classdef mcmc_bayes < mcmc
                         t       = (xc - lb(k)) ./ (ub(k) - lb(k));
                         u(k,:)  = log(t) - log1p(-t);
                     case 'log'
-                        epsB    = 1e-4 * (ub(k) - lb(k));
-                        xc      = min(max(x(k,:), lb(k)+epsB), ub(k)-epsB);
+                        if isfinite(ub(k))
+                            epsB    = 1e-4 * (ub(k) - lb(k));
+                            xc      = min(max(x(k,:), lb(k)+epsB), ub(k)-epsB);
+                        else
+                            % unbounded above (hierarchical 'log', lb = 0): only keep x > 0
+                            xc      = max(max(x(k,:), lb(k)), 1e-30);
+                        end
                         u(k,:)  = log(xc);
                 end
             end
@@ -1090,7 +1822,46 @@ classdef mcmc_bayes < mcmc
                 if Nrep > 1; out.diagnostics.rhat.(fields{kvar}) = utils.reshape_ND2image(rhatV,mask); end
             end
 
+            % test-only cache check
+            if isfield(diagnostics,'cacheCheck'); out.diagnostics.cacheCheck = diagnostics.cacheCheck; end
+
+            % hierarchical prior: hyperparameter samples and summaries (u space)
+            if isfield(diagnostics,'hyper') && ~isempty(diagnostics.hyper)
+                out.hyper = mcmc_bayes.hyper2out(diagnostics.hyper);
+            end
+
             out.settings = diagnostics.settings;
+        end
+
+        % out.hyper from the hyperparameter samples, see the class header
+        function H = hyper2out(hyper)
+            H.params        = hyper.params;
+            H.transform     = hyper.transform;
+            H.hyperprior    = hyper.hyperprior;
+            H.fixed         = hyper.fixed;
+            if hyper.fixed
+                H.mean.mu       = hyper.mu;     H.mean.Sigma    = hyper.Sigma;
+                H.median.mu     = hyper.mu;     H.median.Sigma  = hyper.Sigma;
+                return
+            end
+            mu      = hyper.muPost;                     % [d, Ns, Nrep]
+            Sigma   = hyper.SigmaPost;                  % [d, d, Ns, Nrep]
+            [d, Ns, Nrep] = size(mu, 1:3);
+            SigmaF  = reshape(Sigma, d*d, Ns, Nrep);
+            H.posterior.mu      = mu;
+            H.posterior.Sigma   = Sigma;
+            H.mean.mu           = mean(reshape(mu, d, []), 2);
+            H.mean.Sigma        = reshape(mean(reshape(SigmaF, d*d, []), 2), d, d);
+            H.median.mu         = median(reshape(mu, d, []), 2);
+            H.median.Sigma      = reshape(median(reshape(SigmaF, d*d, []), 2), d, d);
+            if Ns >= 4
+                H.ess.mu        = mcmc_bayes.ess(mu);
+                H.ess.Sigma     = reshape(mcmc_bayes.ess(SigmaF), d, d);
+                if Nrep > 1
+                    H.rhat.mu       = mcmc_bayes.rhat(mu);
+                    H.rhat.Sigma    = reshape(mcmc_bayes.rhat(SigmaF), d, d);
+                end
+            end
         end
 
     end
@@ -1127,5 +1898,14 @@ ok      = (R > rssFloor) && (gWg > gFloor) && (gWg < Inf);
 logL    = -a*log(max(R, rssFloor)) - cG*log(min(max(gWg, gFloor), 1/gFloor));
 if ~ok
     logL = logL - Inf;
+end
+end
+
+% value of an optional field, or the default if the field is absent or empty
+function v = field_or_default(s, name, def)
+if isfield(s, name) && ~isempty(s.(name))
+    v = s.(name);
+else
+    v = def;
 end
 end

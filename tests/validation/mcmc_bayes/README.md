@@ -42,7 +42,28 @@ Phase 2 scripts (marginal likelihoods; minutes each on an A40):
 - `test_T2_3_rician_bias.m`: characterisation only (no pass/fail): bias of
   the posterior mean/median under Rician vs Gaussian noise at SNR 5 and 10.
 
+Phase 3 scripts (hierarchical Normal prior on u; GPU, minutes to hours):
+
+- `test_T3_1_linear_gaussian_exact.m`: linear Gaussian toy (`lingauss_fwd.m`,
+  d = 3, known noise via the test-only `fitting.fixedParams`), fixed mu/Sigma;
+  sampler means and covariances vs the exact Gaussian posterior, joint and
+  componentwise (~3 min).
+- `test_T3_2_sbc_linear_gaussian.m`: simulation-based calibration with free
+  NIW hyperparameters on the toy, 200 replicates x 500 voxels, d = 2; chi-square
+  uniformity of ranks for mu, Sigma and random voxels, Bonferroni criterion;
+  rank-histogram PNG to `$MCMC_BAYES_OUTDIR` (~1.5 h).
+- `test_T3_3_sbc_ivim.m`: SBC on IVIM (`marginal_S0noise`, log/sigmoid/log,
+  free NIW), 100 replicates x 150 voxels; the nuisance generator matches the
+  Zellner broad limit (uniform energy SNR), see the header (~2-3 h).
+- `test_T3_4_broad_prior_regression.m`: a very broad fixed prior (Sigma = 1e6 I)
+  vs a Phase 1/2 run that is also flat in u (reparameterised log R2star),
+  Gaussian and `marginal_S0noise`; plus the flat-native run for information.
+
+`MCMC_BAYES_SBC_R` / `MCMC_BAYES_SBC_NV` override the SBC sizes for pilot runs.
+
 Shared helpers:
+
+- `lingauss_fwd.m`: linear toy forward model `s = A*[u1;...;ud]`.
 
 - `ivim_fwd.m`: minimal IVIM forward model,
   `S = S0*[F*exp(-b*Dstar) + (1-F)*exp(-b*D)]`, returning `[Nb, Nv]` in the
