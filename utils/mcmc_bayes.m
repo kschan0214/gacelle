@@ -13,14 +13,15 @@ classdef mcmc_bayes < mcmc
 %
 % New fitting options (legacy defaults)
 %   .parameterTransform : 'linear'      'linear'|'sigmoid'|'log', or a cell with one entry per modelParams
-%   .likelihood         : 'gaussian'    (Phase 2+, not implemented yet)
-%   .S0Param            : ''            (Phase 2+, not implemented yet)
+%   .likelihood         : 'gaussian'    'gaussian'|'marginal_noise'|'marginal_S0noise'|'marginal_S0noise_flat'
+%   .S0Param            : ''            name of the amplitude parameter in modelParams, required by
+%                                       (and only allowed with) 'marginal_S0noise(_flat)'
 %   .updateScheme       : 'joint'       'joint'|'componentwise'
 %   .adaptStepSize      : false         adapt proposal scale during burn-in (frozen afterwards)
 %   .adaptInterval      : 50            # iterations between two adaptation steps
 %   .adaptTarget        : []            target acceptance rate, [] -> 0.234 (joint) | 0.44 (componentwise)
 %   .overdisp           : 0             relative over-dispersion of the start point for repetition > 1
-%   .prior              : []            (Phase 2+, not implemented yet)
+%   .prior              : []            (Phase 3+, not implemented yet)
 %
 % Test-only option (not part of the user interface)
 %   .forceNewPath       : false         run the new sampling loop even if all new options are at their
@@ -74,8 +75,80 @@ classdef mcmc_bayes < mcmc
 %          monotone sequence estimator, as in Stan / Vehtari et al. (2021)
 %          but without rank normalisation
 %
+% Phase 2 (marginal likelihoods) derivation
+% -----------------------------------------
+% Per voxel: y [m x 1] measurements, W = diag(w) the fitting weights, theta
+%   the sampled (non-linear) parameters, g = g(theta) the forward model.
+%   Noise model as in legacy logP_Gaussian: y_i ~ N(S0*g_i, sigma^2/w_i), i.e.
+%       p(y|theta,S0,sigma^2) = (2 pi sigma^2)^(-m/2) exp(-Q/(2 sigma^2)),  Q = (y-S0 g)'W(y-S0 g)
+%   (up to the theta-independent factor prod(w_i)^(1/2), which legacy drops too).
+%   m is the number of measurements (rows of y), as in legacy logP_Gaussian,
+%   also for measurements with w_i = 0. Gamma integral used throughout:
+%       int_0^inf (s2)^(-a-1) exp(-b/s2) ds2 = Gamma(a) b^(-a)            (a,b > 0)
+%
+% 'marginal_noise' (no amplitude; g is the full model), p(sigma^2) ∝ 1/sigma^2:
+%       R          = r'Wr,  r = y - g
+%       L(theta)   = int (2 pi s2)^(-m/2) exp(-R/(2 s2)) s2^(-1) ds2
+%                  = pi^(-m/2) Gamma(m/2) R^(-m/2)
+%       log L      = -(m/2) log R + [log Gamma(m/2) - (m/2) log pi]         (exponent m/2 confirmed)
+%       sigma^2 | theta,y ~ InvGamma(shape m/2, scale R/2)
+%
+% 'marginal_S0noise' (amplitude S0 linear, S0Param is removed from the sampled set):
+%   With c = g'Wg, Shat = y'Wg / c and the weighted residual sum of squares
+%       RSS = (y - Shat g)'W(y - Shat g) = y'Wy - (y'Wg)^2/(g'Wg)          (>= 0),
+%   Q(S0) = RSS + c (S0 - Shat)^2.
+%   Zellner g-prior S0 | sigma^2,theta ~ N(0, k sigma^2/c) plus p(sigma^2) ∝ 1/sigma^2
+%   (Orton et al. 2014; Spinner et al. 2021 Eq. 5). Integrating S0 gives the
+%   factor (1+k)^(-1/2) with NO sigma dependence (the g-prior's sigma/sqrt(c) scale
+%   cancels the Gaussian integral's), and RSS_k = y'Wy - k/(1+k) (y'Wg)^2/c:
+%       L_k(theta) = (1+k)^(-1/2) pi^(-m/2) Gamma(m/2) RSS_k^(-m/2)
+%   Broad limit k -> inf (the (1+k)^(-1/2) factor is theta-independent):
+%       log L      = -(m/2) log RSS + [log Gamma(m/2) - (m/2) log pi]       (DEFAULT)
+%   This is the reference's (y'y - (y'g)^2/(g'g))^(-m/2) with W = I: the -m/2
+%   exponent is exactly the Zellner broad limit. Conditionals (broad limit):
+%       sigma^2 | theta,y      ~ InvGamma(shape m/2, scale RSS/2)
+%       S0 | sigma^2,theta,y   ~ N(Shat, sigma^2/c)        (on the real line, lb/ub of S0 not applied)
+%   (finite k: InvGamma(m/2, RSS_k/2) and N(k/(1+k) Shat, k/(1+k) sigma^2/c)).
+%
+% 'marginal_S0noise_flat' (alternative, implemented): flat p(S0) on the real line
+%   plus p(sigma^2) ∝ 1/sigma^2. Integrating S0 gives (2 pi s2/c)^(1/2), so
+%       L(theta)   = (2 pi)^(-(m-1)/2) Gamma((m-1)/2) 2^((m-1)/2) c^(-1/2) RSS^(-(m-1)/2)
+%       log L      = -(1/2) log(g'Wg) - ((m-1)/2) log RSS + const           (needs m >= 2)
+%       sigma^2 | theta,y      ~ InvGamma(shape (m-1)/2, scale RSS/2)
+%       S0 | sigma^2,theta,y   ~ N(Shat, sigma^2/c)
+%   It differs from the Zellner broad limit by the factor c^(-1/2) RSS^(1/2):
+%   the broad Zellner prior is p(S0|sigma^2,theta) ∝ sqrt(g'Wg)/sigma, i.e. it is
+%   not flat in S0 and depends on theta through g'Wg.
+%
+% Implementation
+%   * The model parameters are given in full (modelParams/lb/ub/xStepSize/
+%     per-parameter parameterTransform, as the model wrapper defines them).
+%     Marginal likelihoods drop 'noise', and 'marginal_S0noise(_flat)' also drops
+%     S0Param, from the sampled set internally; the output keeps the full
+%     modelParams order ('noise' is appended if the model has none).
+%   * Before each FWDfunc call, S0Param is set to 1 ([1,Nv], single gpuArray), so
+%     FWDfunc returns g without the amplitude, and 'noise' is set to a dummy 1
+%     (no FWD in the repository reads pars.noise; it is injected for safety).
+%   * One forward evaluation per iteration (joint) as before. The loop evaluates
+%     only the theta-dependent part of log L (constants in [] above dropped).
+%     RSS is computed from the residuals y - Shat*g (no y'Wy - (y'Wg)^2/c
+%     cancellation in single precision).
+%   * Degenerate states are rejected (log L = -Inf), never NaN-accepted:
+%       R or RSS <= rssFloor = max(10*eps('single')^2 * y'Wy, realmin('single')) (per voxel), or NaN;
+%       g'Wg <= realmin('single')/eps('single') (~1e-31), or not finite.
+%   * Nuisance recovery: the sampler caches [R] or [RSS; Shat; g'Wg] of the
+%     current state (updated on acceptance, no extra FWD evaluation) and
+%     stores them at every retained (thinned) iteration. After sampling, each
+%     retained sample gets an exact conditional draw:
+%       sigma^2 = (RSS/2) / G, G ~ Gamma(a,1) (randg on the GPU), a = m/2 or (m-1)/2
+%       S0      = Shat + sqrt(sigma^2/c) * z,  z ~ N(0,1)
+%     stored as posterior fields 'noise' (= sigma, not sigma^2) and S0Param, so
+%     out.posterior/mean/... look like the legacy output. out.settings.nuisance
+%     records that they are post-hoc conditional draws.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
+% Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
 %
 
     methods
@@ -95,8 +168,8 @@ classdef mcmc_bayes < mcmc
                 return
             end
 
-            % Phase 2+ options are not available yet
-            notImplemented = intersect(nonDefault, {'likelihood','S0Param','prior'}, 'stable');
+            % Phase 3+ options are not available yet
+            notImplemented = intersect(nonDefault, {'prior'}, 'stable');
             if ~isempty(notImplemented)
                 error('mcmc_bayes:notImplemented', ...
                     'mcmc_bayes: non-default option(s) not implemented yet: %s', strjoin(notImplemented, ', '));
@@ -109,6 +182,9 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:unsupportedAlgorithm', ...
                     'mcmc_bayes: the new sampling path supports fitting.algorithm = ''MH'' only (got ''%s'').', fitting.algorithm);
             end
+
+            % likelihood and sampled/marginalised parameter sets (validated before any GPU work)
+            [~, lik] = this.setup_likelihood(fitting);
 
             % Step 0: display basic messages
             this.display_basic_algorithm_parameters(fitting);
@@ -125,8 +201,8 @@ classdef mcmc_bayes < mcmc
             % MCMC
             [xPosterior, diagnostics] = this.metropolis_hastings_bayes(data, pars0, weights, fitting, geom, FWDfunc, varargin{:});
 
-            % finish up
-            out = this.res2out(xPosterior,fitting,mask,diagnostics);
+            % finish up, with the full (output) parameter list so that e.g. 'mode' finds lb/ub by name
+            out = this.res2out(xPosterior,lik.fittingOut,mask,diagnostics);
 
         end
 
@@ -153,6 +229,11 @@ classdef mcmc_bayes < mcmc
             fitting = this.check_set_default_bayes(fitting);
             if isempty(weights); weights = ones(size(y), 'like', y); end
 
+            % likelihood; from here on fitting.modelParams/lb/ub/xStepSize/parameterTransform
+            % hold the SAMPLED parameters only (noise and S0Param removed under marginal likelihoods)
+            [fitting, lik]  = this.setup_likelihood(fitting);
+            isMarginal      = lik.isMarginal;
+
             % record RNG states before any random number is drawn
             rngState    = rng;
             gpuRngState = parallel.gpu.rng;
@@ -164,13 +245,8 @@ classdef mcmc_bayes < mcmc
             Nburnin     = this.get_number_burnin(fitting);
             % Ns: # samples in posterior distribution
             Ns          = numel(Nburnin+1:fitting.thinning:fitting.iteration);
-
-            % Gaussian likelihood needs the sampled noise
-            if ~any(strcmp(fitting.modelParams,'noise'))
-                error('mcmc_bayes:noNoise', 'mcmc_bayes: likelihood ''gaussian'' requires ''noise'' in fitting.modelParams.');
-            end
-            if numel(fitting.xStepSize) ~= Nvar
-                error('mcmc_bayes:xStepSize', 'mcmc_bayes: fitting.xStepSize must have one entry per modelParams (%d).', Nvar);
+            if isMarginal && Nm < 1 + lik.shapeOffset
+                error('mcmc_bayes:tooFewMeasurements', 'mcmc_bayes: likelihood ''%s'' needs at least %d measurements.', lik.name, 1 + lik.shapeOffset);
             end
 
             % transforms
@@ -211,7 +287,19 @@ classdef mcmc_bayes < mcmc
             stepSize    = zeros(Nv, Nvar, fitting.repetition,'single');
 
             % log-likelihood of a native-space parameter array [Nvar,Nv]
-            loglik = @(x) mcmc_bayes.loglik_gaussian(this.array2struct(x,fitting.modelParams), y, weights, Nm, FWDfunc, varargin{:});
+            if isMarginal
+                % constant amplitude S0Param = 1 and dummy noise = 1 injected before FWDfunc;
+                % the second output is the cached sufficient statistics of the state
+                fixedVal    = ones(1, Nv, 'like', y);
+                rssFloor    = max(10*eps('single')^2 .* sum(weights.*y.^2, 1), realmin('single'));
+                loglik      = @(x) mcmc_bayes.loglik_marginal( ...
+                                FWDfunc(mcmc_bayes.inject_fixed(this.array2struct(x,fitting.modelParams), lik.fixedParams, fixedVal), varargin{:}), ...
+                                y, weights, lik.name, rssFloor);
+                Nstat       = lik.Nstat;
+                statsPost   = zeros(Nstat, Nv, Ns, fitting.repetition, 'single');
+            else
+                loglik      = @(x) mcmc_bayes.loglik_gaussian(this.array2struct(x,fitting.modelParams), y, weights, Nm, FWDfunc, varargin{:});
+            end
 
             % starting point in native space (same as mcmc), then in u space
             xStart  = this.struct2array(x0,fitting.modelParams);      % extract parameter structure to numeric array for faster computation
@@ -238,7 +326,7 @@ classdef mcmc_bayes < mcmc
             else
                 xCurr = xStart;
             end
-            logLCurr = loglik(xCurr);
+            if isMarginal; [logLCurr, statsCurr] = loglik(xCurr); else; logLCurr = loglik(xCurr); end
             if hasJac; logJCurr = this.transform_logjac(uCurr, method, lb, ub); end
 
             % initial proposal scale in u space: xStepSize / |dx/du| at the start point
@@ -276,11 +364,14 @@ classdef mcmc_bayes < mcmc
 
                     % 2. Metropolis sampling
                     % 2.1 proposal probability (+ log-Jacobian of the transform)
-                    logLProposed    = loglik(xProposed);
+                    if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
                     % 2.2 accept with probability min(1, exp(logRatio)); NaN is rejected
                     if hasJac
                         logRatio            = logLProposed - logLCurr + sum(logJProposed - logJCurr, 1);
                         isAccepted          = exp(logRatio) > rand(1,Nv,'like',logLProposed);
+                    elseif isMarginal
+                        % degenerate states have logL = -Inf; -Inf - (-Inf) = NaN is rejected
+                        isAccepted          = exp(logLProposed - logLCurr) > rand(1,Nv,'like',logLProposed);
                     else
                         % neutral path: same expression as mcmc.metropolis_hastings (the GPU evaluates
                         % fused elementwise expressions slightly differently, so keep it verbatim)
@@ -292,6 +383,7 @@ classdef mcmc_bayes < mcmc
                     % 2.3 update parameters if accepted
                     logLCurr(isAccepted)    = logLProposed(isAccepted);
                     uCurr(:,isAccepted)     = uProposed(:,isAccepted);
+                    if isMarginal; statsCurr(:,isAccepted) = statsProposed(:,isAccepted); end
                     % neutral path (all linear): x == u, only u is tracked in the joint loop
                     if hasJac
                         xCurr(:,isAccepted)     = xProposed(:,isAccepted);
@@ -314,13 +406,14 @@ classdef mcmc_bayes < mcmc
                         xProposed       = xCurr; xProposed(kp,:) = xProposed_p;
 
                         % 2. Metropolis sampling, cached loglik is the current state
-                        logLProposed    = loglik(xProposed);
+                        if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
                         logRatio        = logLProposed - logLCurr;
                         if ~isLinear(kp); logRatio = logRatio + logJProposed_p - logJCurr(kp,:); end
                         isAccepted_p                = exp(logRatio) > rand(1,Nv,'like',logLProposed);
                         isAccepted_p(isOutofbound)  = 0;
                         % 3. update parameter kp and the cache before the next parameter
                         logLCurr(isAccepted_p)      = logLProposed(isAccepted_p);
+                        if isMarginal; statsCurr(:,isAccepted_p) = statsProposed(:,isAccepted_p); end
                         uCurr(kp,isAccepted_p)      = uProposed_p(isAccepted_p);
                         xCurr(kp,isAccepted_p)      = xProposed_p(isAccepted_p);
                         if ~isLinear(kp); logJCurr(kp,isAccepted_p) = logJProposed_p(isAccepted_p); end
@@ -351,6 +444,7 @@ classdef mcmc_bayes < mcmc
                 if ( k > Nburnin ) && mod(k-Nburnin+1, fitting.thinning) == 0
                     counter = counter+1;
                     if hasJac; xPosterior(:,:,counter,ii) = gather(xCurr); else; xPosterior(:,:,counter,ii) = gather(uCurr); end
+                    if isMarginal; statsPost(:,:,counter,ii) = gather(statsCurr); end
                 end
 
                 % display message at 1000 iteration and every 10000 iteration
@@ -369,10 +463,18 @@ classdef mcmc_bayes < mcmc
             xPosterior = this.array2struct(xPosterior,fitting.modelParams);
             for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
 
+            % nuisance recovery: exact conditional draws of sigma (and S0) for every retained sample,
+            % from the cached statistics (no extra forward evaluation); output in full modelParams order
+            if isMarginal
+                xPosterior = this.recover_nuisance(xPosterior, statsPost, lik, Nm);
+            end
+
             % diagnostics and resolved settings
             diagnostics.acceptance  = acceptance;
             if isComponent; diagnostics.acceptanceBlocks = fitting.modelParams(:).'; else; diagnostics.acceptanceBlocks = {'joint'}; end
             diagnostics.stepSize    = stepSize;
+            diagnostics.sampledParams   = fitting.modelParams(:).';
+            diagnostics.recoveredParams = lik.recoveredParams;
             diagnostics.settings    = struct( ...
                 'parameterTransform',   {method}, ...
                 'updateScheme',         lower(fitting.updateScheme), ...
@@ -386,6 +488,11 @@ classdef mcmc_bayes < mcmc
                 'overdispRule',         'u0 + overdisp*(T(ub)-T(lb)).*randn for repetition > 1', ...
                 'stepSizeInit',         'xStepSize ./ |dx/du| at the start point (u space)', ...
                 'forceNewPath',         logical(fitting.forceNewPath), ...
+                'likelihood',           lik.name, ...
+                'S0Param',              lik.S0Param, ...
+                'sampledParams',        {fitting.modelParams(:).'}, ...
+                'droppedParams',        {lik.droppedParams}, ...
+                'nuisance',             lik.nuisance, ...
                 'rngState',             rngState, ...
                 'gpuRngState',          gpuRngState, ...
                 'geom',                 geom);
@@ -490,11 +597,251 @@ classdef mcmc_bayes < mcmc
                 disp( 'Adapt step size   : false');
             end
             disp(['Over-dispersion   : ', num2str(fitting.overdisp)]);
+            disp(['Likelihood        : ', char(fitting.likelihood)]);
+            if ~isempty(fitting.S0Param); disp(['S0 parameter      : ', char(fitting.S0Param), ' (marginalised)']); end
         end
 
         % Gaussian log-likelihood, same computation as mcmc.metropolis_hastings
         function logL = loglik_gaussian(x_struct, y, weights, Nm, FWDfunc, varargin)
             logL = arrayfun(@logP_Gaussian, sum( weights.* (FWDfunc(x_struct,varargin{:})-y).^2, 1 ), x_struct.noise, Nm);
+        end
+
+        %% marginal likelihoods (Phase 2), see the derivation in the class header
+        % resolve the likelihood and the sampled/marginalised parameter sets
+        function [fittingS, lik] = setup_likelihood(fitting)
+        % Input
+        % -----
+        % fitting   : fitting structure with the FULL modelParams/lb/ub/xStepSize
+        %             (and per-parameter parameterTransform), as the model defines them
+        % Output
+        % ------
+        % fittingS  : same as fitting, with modelParams/lb/ub/xStepSize/parameterTransform
+        %             restricted to the sampled parameters
+        % lik       : structure
+        %   .name           : canonical likelihood name
+        %   .isMarginal     : true for the marginal likelihoods
+        %   .S0Param        : amplitude parameter name ('' if none)
+        %   .droppedParams  : parameters removed from the sampled set
+        %   .fixedParams    : fields injected (value 1) before each FWDfunc call
+        %   .recoveredParams: fields restored by post-hoc conditional draws
+        %   .shapeOffset    : InvGamma shape is (m - shapeOffset)/2
+        %   .Nstat          : # cached statistics per voxel ([R] or [RSS; Shat; g'Wg])
+        %   .fittingOut     : fitting with the full output parameter list (for res2out)
+        %   .nuisance       : description for out.settings ([] for 'gaussian')
+        %
+            valid = {'gaussian','marginal_noise','marginal_S0noise','marginal_S0noise_flat'};
+            if ~isfield(fitting,'likelihood') || isempty(fitting.likelihood); fitting.likelihood = 'gaussian'; end
+            if ~isfield(fitting,'S0Param'); fitting.S0Param = ''; end
+            if ~(ischar(fitting.likelihood) || (isstring(fitting.likelihood) && isscalar(fitting.likelihood))) || ~any(strcmpi(fitting.likelihood, valid))
+                error('mcmc_bayes:invalidLikelihood', 'mcmc_bayes: fitting.likelihood must be one of: %s.', strjoin(valid, ', '));
+            end
+            name    = valid{strcmpi(fitting.likelihood, valid)};
+            S0Param = char(fitting.S0Param);
+
+            if ~isfield(fitting,'modelParams') || isempty(fitting.modelParams)
+                error('mcmc_bayes:noModelParams', 'mcmc_bayes: fitting.modelParams is required.');
+            end
+            params  = cellstr(fitting.modelParams);
+            params  = params(:).';
+            Nfull   = numel(params);
+            if ~isfield(fitting,'xStepSize') || numel(fitting.xStepSize) ~= Nfull
+                error('mcmc_bayes:xStepSize', 'mcmc_bayes: fitting.xStepSize must have one entry per modelParams (%d).', Nfull);
+            end
+            if numel(fitting.lb) ~= Nfull || numel(fitting.ub) ~= Nfull
+                error('mcmc_bayes:invalidBounds', 'mcmc_bayes: fitting.lb and fitting.ub must have one entry per modelParams (%d).', Nfull);
+            end
+
+            isNoise = strcmp(params, 'noise');
+            isS0    = false(1, Nfull);
+            switch name
+                case 'gaussian'
+                    if ~isempty(S0Param)
+                        error('mcmc_bayes:S0Param', 'mcmc_bayes: fitting.S0Param is only used with likelihood ''marginal_S0noise'' or ''marginal_S0noise_flat''.');
+                    end
+                    if ~any(isNoise)
+                        error('mcmc_bayes:noNoise', 'mcmc_bayes: likelihood ''gaussian'' requires ''noise'' in fitting.modelParams.');
+                    end
+                case 'marginal_noise'
+                    if ~isempty(S0Param)
+                        error('mcmc_bayes:S0Param', 'mcmc_bayes: fitting.S0Param is only used with likelihood ''marginal_S0noise'' or ''marginal_S0noise_flat'' (got likelihood ''marginal_noise'').');
+                    end
+                otherwise   % marginal_S0noise(_flat)
+                    if isempty(S0Param)
+                        error('mcmc_bayes:S0Param', 'mcmc_bayes: likelihood ''%s'' requires fitting.S0Param (the amplitude parameter in modelParams).', name);
+                    end
+                    isS0 = strcmp(params, S0Param);
+                    if ~any(isS0) || strcmp(S0Param,'noise')
+                        error('mcmc_bayes:S0Param', 'mcmc_bayes: fitting.S0Param ''%s'' is not a model parameter (modelParams: %s).', S0Param, strjoin(params, ', '));
+                    end
+            end
+
+            isMarginal  = ~strcmp(name, 'gaussian');
+            isDrop      = isMarginal & (isNoise | isS0);
+            if all(isDrop)
+                error('mcmc_bayes:noSampledParams', 'mcmc_bayes: no parameter left to sample after removing %s.', strjoin(params(isDrop), ', '));
+            end
+
+            % sampled subset
+            fittingS                = fitting;
+            fittingS.modelParams    = reshape(params(~isDrop), [], 1);
+            fittingS.lb             = reshape(fitting.lb(~isDrop), [], 1);
+            fittingS.ub             = reshape(fitting.ub(~isDrop), [], 1);
+            fittingS.xStepSize      = reshape(fitting.xStepSize(~isDrop), [], 1);
+            if isfield(fitting,'parameterTransform') && (iscell(fitting.parameterTransform) || (isstring(fitting.parameterTransform) && ~isscalar(fitting.parameterTransform)))
+                if numel(fitting.parameterTransform) ~= Nfull
+                    error('mcmc_bayes:invalidTransform', ...
+                        'mcmc_bayes: per-parameter parameterTransform must have one entry per modelParams (%d, including any marginalised parameter).', Nfull);
+                end
+                fittingS.parameterTransform = fitting.parameterTransform(~isDrop);
+            end
+
+            % output parameter list: full modelParams order, 'noise' appended if the model has none
+            outParams = params; outLb = fitting.lb(:).'; outUb = fitting.ub(:).';
+            if isMarginal && ~any(isNoise)
+                outParams{end+1} = 'noise'; outLb(end+1) = 0; outUb(end+1) = Inf;
+            end
+            fittingOut              = fitting;
+            fittingOut.modelParams  = reshape(outParams, [], 1);
+            fittingOut.lb           = outLb(:);
+            fittingOut.ub           = outUb(:);
+
+            lik.name            = name;
+            lik.isMarginal      = isMarginal;
+            lik.S0Param         = S0Param;
+            lik.droppedParams   = params(isDrop);
+            lik.fittingOut      = fittingOut;
+            lik.shapeOffset     = double(strcmp(name, 'marginal_S0noise_flat'));
+            switch name
+                case 'gaussian'
+                    lik.fixedParams = {}; lik.recoveredParams = {}; lik.Nstat = 0;
+                case 'marginal_noise'
+                    lik.fixedParams = {'noise'}; lik.recoveredParams = {'noise'}; lik.Nstat = 1;
+                otherwise
+                    lik.fixedParams = {S0Param, 'noise'}; lik.recoveredParams = {'noise', S0Param}; lik.Nstat = 3;
+            end
+            if isMarginal
+                switch name
+                    case 'marginal_noise'
+                        logLForm = '-(m/2) log(r''Wr), r = y - g';
+                        rule     = 'sigma^2 | u,y ~ InvGamma(m/2, R/2), R = r''Wr';
+                    case 'marginal_S0noise'
+                        logLForm = '-(m/2) log(RSS), RSS = y''Wy - (y''Wg)^2/(g''Wg)  (Zellner g-prior on S0, broad limit, + 1/sigma^2)';
+                        rule     = 'sigma^2 | u,y ~ InvGamma(m/2, RSS/2); S0 | sigma^2,u,y ~ N(y''Wg/g''Wg, sigma^2/g''Wg)';
+                    case 'marginal_S0noise_flat'
+                        logLForm = '-(1/2) log(g''Wg) - ((m-1)/2) log(RSS)  (flat S0 on R, + 1/sigma^2)';
+                        rule     = 'sigma^2 | u,y ~ InvGamma((m-1)/2, RSS/2); S0 | sigma^2,u,y ~ N(y''Wg/g''Wg, sigma^2/g''Wg)';
+                end
+                lik.nuisance = struct( ...
+                    'fields',       {lik.recoveredParams}, ...
+                    'method',       'post-hoc exact conditional draw for every retained sample (not sampled by MCMC)', ...
+                    'logLikelihood',logLForm, ...
+                    'conditionals', rule, ...
+                    'noiseIs',      'sigma (not sigma^2)', ...
+                    'statistics',   'cached at the retained iterations inside the loop (no extra forward evaluation)');
+            else
+                lik.nuisance = [];
+            end
+        end
+
+        % set the given fields of a parameter structure to a constant array
+        function x_struct = inject_fixed(x_struct, names, val)
+            for k = 1:numel(names)
+                x_struct.(names{k}) = val;
+            end
+        end
+
+        % marginal log-likelihood (theta-dependent part) and cached statistics
+        function [logL, stats] = loglik_marginal(g, y, weights, name, rssFloor)
+        % Input
+        % -----
+        % g         : forward model without amplitude, [Nm, Nv]
+        % y         : measurements, [Nm, Nv]
+        % weights   : weights (W diagonal), [Nm, Nv]
+        % name      : 'marginal_noise' | 'marginal_S0noise' | 'marginal_S0noise_flat'
+        % rssFloor  : [1,Nv] (or scalar), R/RSS at or below this value is rejected
+        % Output
+        % ------
+        % logL      : [1, Nv], -Inf for degenerate states
+        % stats     : [1, Nv] R ('marginal_noise') or [3, Nv] [RSS; Shat; g'Wg]
+        %
+            Nm      = size(y,1);
+            gFloor  = double(realmin('single'))/double(eps('single'));    % double, so CPU double inputs stay double
+            switch name
+                case 'marginal_noise'
+                    R       = sum(weights.*(y - g).^2, 1);
+                    logL    = mcmc_bayes.marginal_apply(R, 1, Nm/2, 0, rssFloor, 0);
+                    stats   = R;
+                otherwise
+                    gw      = weights.*g;
+                    gWg     = sum(gw.*g, 1);
+                    Shat    = sum(gw.*y, 1) ./ gWg;
+                    % residual form, avoids the y'Wy - (y'Wg)^2/g'Wg cancellation
+                    RSS     = sum(weights.*(y - Shat.*g).^2, 1);
+                    if strcmp(name, 'marginal_S0noise_flat')
+                        logL = mcmc_bayes.marginal_apply(RSS, gWg, (Nm-1)/2, 0.5, rssFloor, gFloor);
+                    else
+                        logL = mcmc_bayes.marginal_apply(RSS, gWg, Nm/2, 0, rssFloor, gFloor);
+                    end
+                    stats   = [RSS; Shat; gWg];
+            end
+        end
+
+        % logL = -a*log(R) - cG*log(gWg), -Inf for degenerate states: one fused
+        % kernel on the GPU (marginal_kernel), the same maths vectorised on the CPU
+        function logL = marginal_apply(R, gWg, a, cG, rssFloor, gFloor)
+            if isa(R, 'gpuArray')
+                logL = arrayfun(@marginal_kernel, R, gWg, a, cG, rssFloor, gFloor);
+            else
+                ok      = (R > rssFloor) & (gWg > gFloor) & (gWg < Inf);
+                logL    = -a*log(max(R, rssFloor)) - cG*log(min(max(gWg, gFloor), 1/gFloor));
+                logL    = logL .* ones(size(ok), 'like', logL);
+                logL(~ok) = -Inf;
+            end
+        end
+
+        % post-hoc exact conditional draws of sigma (and S0) for every retained sample
+        function xPosterior = recover_nuisance(xPosterior, statsPost, lik, Nm)
+        % Input
+        % -----
+        % xPosterior: structure, sampled parameters, each [Nv, Ns, Nrep]
+        % statsPost : cached statistics at the retained samples, [Nstat, Nv, Ns, Nrep]
+        % lik       : see setup_likelihood
+        % Nm        : # measurements
+        % Output
+        % ------
+        % xPosterior: structure with the recovered fields added ('noise' = sigma, S0Param),
+        %             fields in lik.fittingOut.modelParams order
+        %
+            a       = (Nm - lik.shapeOffset)/2;             % InvGamma shape
+            sz      = size(statsPost, 2:4);
+            stats   = reshape(statsPost, size(statsPost,1), []);
+            Nel     = size(stats, 2);
+            noise   = zeros(1, Nel, 'single');
+            if lik.Nstat == 3; S0 = zeros(1, Nel, 'single'); end
+
+            chunk = 2^24;   % elements per GPU chunk
+            for kc = 1:chunk:Nel
+                idx     = kc:min(kc+chunk-1, Nel);
+                st      = gpuArray(stats(:, idx));
+                % sigma^2 = (R/2)/G, G ~ Gamma(a,1)
+                sigma2  = (st(1,:)./2) ./ randg(a, [1 numel(idx)], 'like', st);
+                noise(idx) = gather(sqrt(sigma2));
+                if lik.Nstat == 3
+                    S0(idx) = gather(st(2,:) + sqrt(sigma2./st(3,:)) .* randn(1, numel(idx), 'like', st));
+                end
+            end
+
+            recovered.noise = reshape(noise, sz);
+            if lik.Nstat == 3; recovered.(lik.S0Param) = reshape(S0, sz); end
+
+            % full output order
+            outParams = lik.fittingOut.modelParams;
+            xOut = struct();
+            for k = 1:numel(outParams)
+                p = outParams{k};
+                if isfield(recovered, p); xOut.(p) = recovered.(p); else; xOut.(p) = xPosterior.(p); end
+            end
+            xPosterior = xOut;
         end
 
         % Robbins-Monro gain of the j-th adaptation step
@@ -698,18 +1045,33 @@ classdef mcmc_bayes < mcmc
         % attaches out.diagnostics and out.settings. The legacy call with
         % 3 inputs is passed through unchanged.
         %
+            if nargin < 4 || isempty(diagnostics)
+                out = res2out@mcmc(xPosterior,fitting,mask);
+                return
+            end
+
+            % nuisance fields recovered by post-hoc draws are not confined to [lb,ub]
+            % (e.g. S0 on the real line); widen their bounds to the sample range so
+            % that the 'mode' histogram (edges from lb/ub by modelParams index) covers them
+            if isfield(diagnostics,'recoveredParams')
+                for k = 1:numel(diagnostics.recoveredParams)
+                    p   = diagnostics.recoveredParams{k};
+                    idx = find(strcmp(fitting.modelParams, p));
+                    fitting.lb(idx) = min(fitting.lb(idx), double(min(xPosterior.(p)(:))));
+                    fitting.ub(idx) = max(fitting.ub(idx), double(max(xPosterior.(p)(:))));
+                end
+            end
             out = res2out@mcmc(xPosterior,fitting,mask);
-            if nargin < 4 || isempty(diagnostics); return; end
 
             fields  = fieldnames(xPosterior);
             Nrep    = size(xPosterior.(fields{1}),3);
+            if isfield(diagnostics,'sampledParams'); sampled = diagnostics.sampledParams; else; sampled = fitting.modelParams; end
 
-            % acceptance [x,y,z,Nblock,Nrep] and final u-space step size [x,y,z,Nrep]
+            % acceptance [x,y,z,Nblock,Nrep] and final u-space step size [x,y,z,Nrep] (sampled parameters only)
             out.diagnostics.acceptance          = mcmc_bayes.vec2image(diagnostics.acceptance,mask);
             out.diagnostics.acceptanceBlocks    = diagnostics.acceptanceBlocks;
-            for kvar = 1:numel(fields)
-                idx = find(strcmp(fitting.modelParams,fields{kvar}));
-                out.diagnostics.stepSize.(fields{kvar}) = mcmc_bayes.vec2image(permute(diagnostics.stepSize(:,idx,:),[1 3 2]),mask);
+            for kvar = 1:numel(sampled)
+                out.diagnostics.stepSize.(sampled{kvar}) = mcmc_bayes.vec2image(permute(diagnostics.stepSize(:,kvar,:),[1 3 2]),mask);
             end
 
             % R-hat (repetition > 1) and ESS on native-space samples, per voxel per parameter
@@ -752,5 +1114,18 @@ else
     % linear
     x       = u;
     logJ    = u*0;
+end
+end
+
+% elementwise kernel of mcmc_bayes.loglik_marginal (GPU arrayfun):
+%   logL = -a*log(R) - cG*log(gWg), -Inf for R <= rssFloor, gWg <= gFloor, or NaN
+%   (the comparisons are false for NaN). The logs are evaluated on clamped
+%   values (max/min ignore NaN), so logL stays finite before the final -Inf
+%   and keeps the class of R in both branches.
+function logL = marginal_kernel(R, gWg, a, cG, rssFloor, gFloor)
+ok      = (R > rssFloor) && (gWg > gFloor) && (gWg < Inf);
+logL    = -a*log(max(R, rssFloor)) - cG*log(min(max(gWg, gFloor), 1/gFloor));
+if ~ok
+    logL = logL - Inf;
 end
 end

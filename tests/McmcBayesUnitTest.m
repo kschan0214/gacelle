@@ -4,8 +4,11 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     % not-implemented guard for Phase 2+ options.
     % Phase 1: parameter transforms, per-parameter parsing, R-hat/ESS and
     % a small GPU run of the new sampling path.
+    % Phase 2: marginal likelihoods vs numerical integration, weighted form,
+    % parameter dropping/restoring, S0Param errors, nuisance draws, GPU runs.
     %
-    % All tests except testNewPathRuns* are pure math and need no GPU.
+    % All tests except testNewPath*, testFusedKernel* and testRecoverNuisance*
+    % are pure math and need no GPU.
     %
     % Tolerances (stated before running; see each test):
     %   transform round trip        : |x - inv(fwd(x))| <= 1e-10*(ub-lb) (double), 1e-4*(ub-lb) (single)
@@ -19,6 +22,18 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %   R-hat, iid                              : 99th percentile of |R-1| <= 0.005
     %   R-hat, AR(1) phi=0.9                    : median R <= 1.01
     %   R-hat, chains shifted by 1 SD each      : min R >= 1.1
+    %   Phase 2 (double precision, CPU):
+    %   marginal logL difference between two theta vs numerical integration
+    %     (integral / integral2, RelTol 1e-10) of the joint density     : |diff| <= 1e-6
+    %     Zellner prior with k = 1e12 (broad-limit error (m/2)(y'Wg)^2/(k c RSS) ~ 1e-8)
+    %     flat prior U(-1e3, 1e3) on S0 (truncation error negligible)
+    %   Zellner vs flat difference for the same theta pair            : >= 0.1 (test is discriminative)
+    %   weighted form vs unweighted on W^(1/2)-scaled y and g          : AbsTol 1e-9
+    %   W = I vs reference unweighted formula (y'y - (y'g)^2/g'g)       : AbsTol 1e-9
+    %   scale invariance g -> 3g: Zellner unchanged, flat -log(3)       : AbsTol 1e-9
+    %   degenerate states (g = 0, RSS = 0, NaN)                         : logL == -Inf (never NaN)
+    %   Phase 2 (GPU, single): post-hoc draws, 2e5 samples of one state: mean(sigma^2), mean(S0),
+    %     var(S0) within 5 MC standard errors of the analytic value (InvGamma / Student-t moments)
     %
     % Kwok-Shing Chan @ MGH
 
@@ -37,12 +52,12 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             'prior',                    {{'prior', struct('hierarchical', struct())}} ...
             )
 
-        % Phase 2+ options, still not implemented
-        phase2Option = struct( ...
-            'likelihood',               {{'likelihood', 'marginal_noise'}}, ...
-            'S0Param',                  {{'S0Param', 'M0'}}, ...
+        % Phase 3+ options, still not implemented
+        phase3Option = struct( ...
             'prior',                    {{'prior', struct('hierarchical', struct())}} ...
             )
+
+        marginalLikelihood = {'marginal_S0noise','marginal_S0noise_flat'}
 
         transformMethod = {'linear','sigmoid','log'}
     end
@@ -96,10 +111,10 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyEqual(nonDefault, {name});
         end
 
-        function testPhase2OptionErrorsNotImplemented(testCase, phase2Option)
+        function testPhase3OptionErrorsNotImplemented(testCase, phase3Option)
             % the guard fires before any GPU code, so no GPU is needed
             fitting = struct();
-            fitting.(phase2Option{1}) = phase2Option{2};
+            fitting.(phase3Option{1}) = phase3Option{2};
             testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], fitting, []), ...
                 'mcmc_bayes:notImplemented');
 
@@ -265,6 +280,256 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyGreaterThanOrEqual(min(mcmc_bayes.rhat(x)), 1.1);
         end
 
+        %% Phase 2: marginal likelihoods (pure math, double precision)
+        function testMarginalNoiseVsNumericalIntegration(testCase)
+            [y, w, g1, g2] = McmcBayesUnitTest.marginalVoxel();
+            y  = y ./ 1.05;                     % normalised data, no amplitude
+            m  = numel(y);
+            % numerical: log int (2 pi s2)^(-m/2) exp(-r'Wr/(2 s2)) (1/s2) ds2, with s2 = exp(t)
+            num = zeros(1,2);
+            G   = {g1, g2};
+            for k = 1:2
+                R    = sum(w.*(y - G{k}).^2);
+                logf = @(t) -m/2*log(2*pi) - m/2*t - R./(2*exp(t));     % (1/s2) ds2 = dt
+                t0   = log(R/m); K = logf(t0);
+                num(k) = log(integral(@(t) exp(logf(t) - K), t0-60, t0+60, 'RelTol', 1e-10, 'AbsTol', 0)) + K;
+            end
+            ana = mcmc_bayes.loglik_marginal([g1 g2], [y y], [w w], 'marginal_noise', 0);
+            testCase.verifyEqual(ana(1)-ana(2), num(1)-num(2), 'AbsTol', 1e-6);
+            % the full analytic constant too: log L = log Gamma(m/2) - (m/2) log(pi) - (m/2) log R
+            testCase.verifyEqual(ana(1) + gammaln(m/2) - m/2*log(pi), num(1), 'AbsTol', 1e-6);
+        end
+
+        function testMarginalS0noiseVsNumericalIntegration(testCase, marginalLikelihood)
+            [y, w, g1, g2] = McmcBayesUnitTest.marginalVoxel();
+            num = [McmcBayesUnitTest.logMarginal2D(y, w, g1, marginalLikelihood), ...
+                   McmcBayesUnitTest.logMarginal2D(y, w, g2, marginalLikelihood)];
+            ana = mcmc_bayes.loglik_marginal([g1 g2], [y y], [w w], marginalLikelihood, 0);
+            testCase.verifyEqual(ana(1)-ana(2), num(1)-num(2), 'AbsTol', 1e-6, ...
+                sprintf('%s: analytic %.8f vs numerical %.8f', marginalLikelihood, ana(1)-ana(2), num(1)-num(2)));
+        end
+
+        function testZellnerAndFlatDiffer(testCase)
+            % the two S0 priors give different theta-dependence (so the tests above can tell them apart)
+            [y, w, g1, g2] = McmcBayesUnitTest.marginalVoxel();
+            z = mcmc_bayes.loglik_marginal([g1 g2], [y y], [w w], 'marginal_S0noise', 0);
+            f = mcmc_bayes.loglik_marginal([g1 g2], [y y], [w w], 'marginal_S0noise_flat', 0);
+            testCase.verifyGreaterThanOrEqual(abs((z(1)-z(2)) - (f(1)-f(2))), 0.1);
+        end
+
+        function testMarginalWeightedForm(testCase)
+            rng(11);
+            m = 12; Nv = 5;
+            g = exp(-rand(m,Nv)*3); y = (0.8+0.4*rand(1,Nv)).*g + 0.02*randn(m,Nv);
+            w = 0.2 + rand(m,Nv);
+            for name = {'marginal_noise','marginal_S0noise','marginal_S0noise_flat'}
+                % weighted form == unweighted form on W^(1/2)-scaled data and model
+                [lw, sw] = mcmc_bayes.loglik_marginal(g, y, w, name{1}, 0);
+                [lu, su] = mcmc_bayes.loglik_marginal(sqrt(w).*g, sqrt(w).*y, ones(m,Nv), name{1}, 0);
+                testCase.verifyEqual(lw, lu, 'AbsTol', 1e-9, name{1});
+                testCase.verifyEqual(sw(1,:), su(1,:), 'RelTol', 1e-9, name{1});
+            end
+
+            % W = I: the reference (BayesIVIM) unweighted formula
+            one = ones(m,Nv);
+            ref = -m/2*log(sum(y.^2) - sum(y.*g).^2./sum(g.^2));
+            testCase.verifyEqual(mcmc_bayes.loglik_marginal(g, y, one, 'marginal_S0noise', 0), ref, 'AbsTol', 1e-9);
+
+            % cached statistics: RSS (residual form) == y'Wy - (y'Wg)^2/g'Wg, Shat, g'Wg
+            [~, st] = mcmc_bayes.loglik_marginal(g, y, w, 'marginal_S0noise', 0);
+            yWg = sum(w.*y.*g); gWg = sum(w.*g.^2);
+            testCase.verifyEqual(st(1,:), sum(w.*y.^2) - yWg.^2./gWg, 'RelTol', 1e-8);
+            testCase.verifyEqual(st(2,:), yWg./gWg, 'RelTol', 1e-12);
+            testCase.verifyEqual(st(3,:), gWg, 'RelTol', 1e-12);
+
+            % scale invariance g -> 3g: Zellner broad limit unchanged, flat shifts by -log(3)
+            z1 = mcmc_bayes.loglik_marginal(g, y, w, 'marginal_S0noise', 0);
+            z3 = mcmc_bayes.loglik_marginal(3*g, y, w, 'marginal_S0noise', 0);
+            testCase.verifyEqual(z3, z1, 'AbsTol', 1e-9);
+            f1 = mcmc_bayes.loglik_marginal(g, y, w, 'marginal_S0noise_flat', 0);
+            f3 = mcmc_bayes.loglik_marginal(3*g, y, w, 'marginal_S0noise_flat', 0);
+            testCase.verifyEqual(f3, f1 - log(3), 'AbsTol', 1e-9);
+        end
+
+        function testMarginalDegenerateStatesRejected(testCase)
+            m = 6;
+            y = [1; 0.8; 0.6; 0.5; 0.4; 0.3];
+            w = ones(m,1);
+            g0   = zeros(m,1);              % g'Wg = 0
+            gFit = y/2;                     % y = 2*g exactly -> RSS = 0
+            gNaN = [NaN; y(2:end)];
+            gInf = [Inf; y(2:end)];
+            for name = {'marginal_S0noise','marginal_S0noise_flat'}
+                l = mcmc_bayes.loglik_marginal([g0 gFit gNaN gInf], repmat(y,1,4), repmat(w,1,4), name{1}, 1e-12);
+                testCase.verifyEqual(l, -Inf(1,4), name{1});
+            end
+            l = mcmc_bayes.loglik_marginal([y gNaN], [y y], [w w], 'marginal_noise', 1e-12);
+            testCase.verifyEqual(l, -Inf(1,2));
+            % single precision keeps its class
+            l = mcmc_bayes.loglik_marginal(single([g0 y]), single([y y]), single([w w]), 'marginal_S0noise', single(1e-12));
+            testCase.verifyClass(l, 'single');
+            testCase.verifyEqual(l(1), single(-Inf));
+        end
+
+        %% Phase 2: parameter dropping/restoring and errors (pure, no GPU)
+        function testSetupLikelihoodDropsAndRestores(testCase)
+            fitting.modelParams = {'M0';'R2star';'noise'};
+            fitting.lb          = [0; 0.1; 0.001];
+            fitting.ub          = [2; 200; 0.1];
+            fitting.xStepSize   = [0.01; 1; 0.005];
+            fitting.parameterTransform = {'linear','log','sigmoid'};
+            fitting.likelihood  = 'marginal_S0noise';
+            fitting.S0Param     = 'M0';
+            [fs, lik] = mcmc_bayes.setup_likelihood(fitting);
+            testCase.verifyEqual(fs.modelParams, {'R2star'});
+            testCase.verifyEqual([fs.lb fs.ub fs.xStepSize], [0.1 200 1]);
+            testCase.verifyEqual(fs.parameterTransform, {'log'});
+            testCase.verifyEqual(lik.droppedParams, {'M0','noise'});
+            testCase.verifyEqual(lik.fixedParams, {'M0','noise'});
+            testCase.verifyEqual(lik.fittingOut.modelParams, {'M0';'R2star';'noise'});
+            testCase.verifyEqual(lik.fittingOut.lb, fitting.lb);
+            testCase.verifyEqual(lik.shapeOffset, 0);
+
+            % case-insensitive name, flat variant
+            fitting.likelihood = 'Marginal_S0noise_FLAT';
+            [~, lik] = mcmc_bayes.setup_likelihood(fitting);
+            testCase.verifyEqual(lik.name, 'marginal_S0noise_flat');
+            testCase.verifyEqual(lik.shapeOffset, 1);
+
+            % marginal_noise: noise dropped, M0 kept (order kept)
+            f2 = rmfield(fitting,'S0Param'); f2.likelihood = 'marginal_noise';
+            fs = mcmc_bayes.setup_likelihood(f2);
+            testCase.verifyEqual(fs.modelParams, {'M0';'R2star'});
+            testCase.verifyEqual(fs.parameterTransform, {'linear','log'});
+
+            % marginal_noise without a noise parameter: nothing dropped, 'noise' appended to the output
+            f3 = struct('modelParams', {{'fa','Da'}}, 'lb', [0 0], 'ub', [1 3], 'xStepSize', [0.1 0.1], 'likelihood', 'marginal_noise');
+            [fs, lik] = mcmc_bayes.setup_likelihood(f3);
+            testCase.verifyEqual(fs.modelParams, {'fa';'Da'});
+            testCase.verifyEqual(lik.fittingOut.modelParams, {'fa';'Da';'noise'});
+            testCase.verifyEqual(lik.fittingOut.ub(3), Inf);
+
+            % gaussian: nothing dropped
+            f4 = rmfield(fitting,{'likelihood','S0Param'});
+            [fs, lik] = mcmc_bayes.setup_likelihood(f4);
+            testCase.verifyEqual(fs.modelParams, {'M0';'R2star';'noise'});
+            testCase.verifyFalse(lik.isMarginal);
+        end
+
+        function testSetupLikelihoodErrors(testCase)
+            base.modelParams = {'M0';'R2star';'noise'};
+            base.lb          = [0; 0.1; 0.001];
+            base.ub          = [2; 200; 0.1];
+            base.xStepSize   = [0.01; 1; 0.005];
+
+            % errors are raised by optimisation before any GPU code
+            run = @(f) mcmc_bayes().optimisation([], [], [], [], f, []);
+
+            f = base; f.likelihood = 'marginal_S0noise';                    % missing S0Param
+            testCase.verifyError(@() run(f), 'mcmc_bayes:S0Param');
+            f.S0Param = 'S0';                                               % not a modelParam
+            testCase.verifyError(@() run(f), 'mcmc_bayes:S0Param');
+            f.S0Param = 'noise';
+            testCase.verifyError(@() run(f), 'mcmc_bayes:S0Param');
+            f = base; f.S0Param = 'M0';                                     % S0Param with gaussian
+            testCase.verifyError(@() run(f), 'mcmc_bayes:S0Param');
+            f.likelihood = 'marginal_noise';                                % S0Param with marginal_noise
+            testCase.verifyError(@() run(f), 'mcmc_bayes:S0Param');
+            f = base; f.likelihood = 'orton';
+            testCase.verifyError(@() run(f), 'mcmc_bayes:invalidLikelihood');
+            f = base; f.likelihood = 'marginal_S0noise'; f.S0Param = 'M0';
+            f.parameterTransform = {'log'};                                 % not one per modelParams
+            testCase.verifyError(@() run(f), 'mcmc_bayes:invalidTransform');
+            f = rmfield(f,'parameterTransform'); f.xStepSize = [1 1];
+            testCase.verifyError(@() run(f), 'mcmc_bayes:xStepSize');
+            f = base; f.modelParams = {'noise'}; f.lb = 0; f.ub = 1; f.xStepSize = 1; f.likelihood = 'marginal_noise';
+            testCase.verifyError(@() run(f), 'mcmc_bayes:noSampledParams');
+            f = base; f.modelParams = {'M0';'R2star';'sigma'};              % gaussian needs 'noise'
+            f.updateScheme = 'componentwise';                               % (non-default -> new path)
+            testCase.verifyError(@() run(f), 'mcmc_bayes:noNoise');
+        end
+
+        %% Phase 2: post-hoc nuisance draws (GPU randg)
+        function testRecoverNuisance(testCase)
+            gacelletest.assumeGPU(testCase);
+            fitting.modelParams = {'M0';'R2star';'noise'};
+            fitting.lb = [0; 0.1; 0.001]; fitting.ub = [2; 200; 0.1]; fitting.xStepSize = [0.01; 1; 0.005];
+            fitting.likelihood = 'marginal_S0noise'; fitting.S0Param = 'M0';
+            [~, lik] = mcmc_bayes.setup_likelihood(fitting);
+
+            m = 12; RSS = 0.005; Shat = 1.03; c = 4.2;
+            Nv = 2; Ns = 1e5; Nrep = 2;
+            statsPost = repmat(single([RSS; Shat; c]), 1, Nv, Ns, Nrep);
+            xPost.R2star = rand(Nv, Ns, Nrep, 'single');
+            parallel.gpu.rng(5);
+            xOut = mcmc_bayes.recover_nuisance(xPost, statsPost, lik, m);
+
+            % full modelParams order, sampled field untouched, sizes
+            testCase.verifyEqual(fieldnames(xOut), {'M0';'R2star';'noise'});
+            testCase.verifyEqual(xOut.R2star, xPost.R2star);
+            testCase.verifyEqual(size(xOut.M0), [Nv Ns Nrep]);
+            testCase.verifyEqual(size(xOut.noise), [Nv Ns Nrep]);
+            testCase.verifyTrue(all(xOut.noise(:) > 0));
+
+            % moments: sigma^2 ~ InvGamma(a, RSS/2), S0 ~ Shat + t_{2a} * sqrt(RSS/(2a c))
+            a   = m/2; b = RSS/2; N = Nv*Ns*Nrep;
+            s2  = double(xOut.noise(:)).^2;
+            Es2 = b/(a-1); Vs2 = b^2/((a-1)^2*(a-2));
+            testCase.verifyLessThanOrEqual(abs(mean(s2) - Es2), 5*sqrt(Vs2/N));
+            S0  = double(xOut.M0(:));
+            VS0 = Es2/c;                                        % var of the t mixture = E[sigma^2]/c
+            testCase.verifyLessThanOrEqual(abs(mean(S0) - Shat), 5*sqrt(VS0/N));
+            k4  = 3*(2*a-2)/(2*a-4);                            % kurtosis of t_{2a}
+            testCase.verifyLessThanOrEqual(abs(var(S0) - VS0), 5*VS0*sqrt((k4-1)/N));
+        end
+
+        function testNewPathMarginalRuns(testCase, marginalLikelihood)
+            gacelletest.assumeGPU(testCase);
+            [y, mask, w, pars0, fitting, obj] = McmcBayesUnitTest.r2starSetup();
+            f = fitting;
+            f.likelihood    = marginalLikelihood;
+            f.S0Param       = 'M0';
+            f.metric        = {'mean','std','median','mode'};
+            f.parameterTransform = {'linear','sigmoid','log'};      % one per FULL modelParams
+            f.repetition    = 2;
+            f.overdisp      = 0.01;
+            out = mcmc_bayes().optimisation(y, mask, w, pars0, f, @obj.FWD, 'mcmc', f);
+
+            testCase.verifyEqual(fieldnames(out.posterior), {'M0';'R2star';'noise'});
+            sz = [nnz(mask) numel(21:2:200) 2];     % [Nv, Ns, Nrep], Nburnin = 20, thinning = 2
+            for p = {'M0','R2star','noise'}
+                testCase.verifyEqual(size(out.posterior.(p{1})), sz);
+                for metric = {'mean','std','median','mode'}
+                    testCase.verifyTrue(all(isfinite(out.(metric{1}).(p{1})(:))), [metric{1} '.' p{1}]);
+                end
+            end
+            testCase.verifyGreaterThanOrEqual(min(out.posterior.R2star(:)), single(fitting.lb(2)));
+            testCase.verifyLessThanOrEqual(max(out.posterior.R2star(:)), single(fitting.ub(2)));
+            testCase.verifyTrue(all(out.posterior.noise(:) > 0));
+            testCase.verifyEqual(fieldnames(out.diagnostics.stepSize), {'R2star'});
+            testCase.verifyTrue(isfield(out.diagnostics.rhat, 'M0'));
+            testCase.verifyEqual(out.settings.likelihood, marginalLikelihood);
+            testCase.verifyEqual(out.settings.sampledParams, {'R2star'});
+            testCase.verifyEqual(out.settings.droppedParams, {'M0','noise'});
+            testCase.verifyEqual(out.settings.nuisance.fields, {'noise','M0'});
+            % posterior mean M0 near the truth range (1 to 1.1), noise near 1/50 (loose sanity bounds)
+            testCase.verifyTrue(all(abs(out.mean.M0(:) - 1.05) < 0.2));
+            testCase.verifyTrue(all(out.mean.noise(:) > 0.005 & out.mean.noise(:) < 0.08));
+        end
+
+        function testNewPathMarginalNoiseRuns(testCase)
+            gacelletest.assumeGPU(testCase);
+            [y, mask, w, pars0, fitting, obj] = McmcBayesUnitTest.r2starSetup();
+            f = fitting;
+            f.likelihood    = 'marginal_noise';
+            f.updateScheme  = 'componentwise';
+            out = mcmc_bayes().optimisation(y, mask, w, pars0, f, @obj.FWD, 'mcmc', f);
+            testCase.verifyEqual(fieldnames(out.posterior), {'M0';'R2star';'noise'});
+            testCase.verifyEqual(out.settings.sampledParams, {'M0','R2star'});
+            testCase.verifyEqual(size(out.diagnostics.acceptance), [size(mask,1:3) 2]);
+            testCase.verifyTrue(all(out.posterior.noise(:) > 0));
+        end
+
         %% Phase 1: new sampling path on the GPU
         function testNewPathRunsAllPhase1Options(testCase)
             gacelletest.assumeGPU(testCase);
@@ -347,6 +612,52 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             pars0               = obj.determine_x0(y, mask, fitting);
             w                   = obj.compute_optimisation_weights(y, fitting);
             fitting.xStepSize   = obj.step;
+        end
+
+        % one synthetic monoexponential voxel and two theta values (amplitude-free g)
+        function [y, w, g1, g2] = marginalVoxel()
+            rng(20260926);
+            te  = linspace(0, 40e-3, 12).';
+            y   = 1.05*exp(-te*32) + 0.02*randn(size(te));
+            w   = 0.5 + rand(size(te));
+            g1  = exp(-te*30);
+            g2  = exp(-te*45);
+        end
+
+        % log marginal likelihood by 2D numerical integration over S0 and sigma^2,
+        % directly from the joint density (no analytic S0 or sigma^2 integral used)
+        %   'marginal_S0noise'      : S0 | sigma^2 ~ N(0, k sigma^2/g'Wg), k = 1e12 (broad Zellner), p(sigma^2) ∝ 1/sigma^2
+        %   'marginal_S0noise_flat' : S0 ~ U(-A, A), A = 1e3,                                        p(sigma^2) ∝ 1/sigma^2
+        % Variables: t = log sigma^2, S0 = S0c + z*sqrt(sigma^2/c) (the substitution only centres and
+        % scales the quadrature; S0c and c are ordinary numbers here, the Jacobian is included).
+        function logL = logMarginal2D(y, w, g, name)
+            m   = numel(y);
+            c   = sum(w.*g.^2);
+            S0c = sum(w.*y.*g)/c;
+            R0  = sum(w.*(y - S0c*g).^2);
+            k   = 1e12; A = 1e3;
+            t0  = log(R0/m);
+            logf = @(t, z) McmcBayesUnitTest.logJoint(t, z, y, w, g, c, S0c, m, name, k, A);
+            K   = logf(t0, 0);
+            val = integral2(@(t,z) exp(logf(t,z) - K), t0-40, t0+40, -60, 60, 'RelTol', 1e-10, 'AbsTol', 0, 'Method', 'iterated');
+            logL = log(val) + K;
+        end
+
+        function lf = logJoint(t, z, y, w, g, c, S0c, m, name, k, A)
+            s2  = exp(t);
+            S0  = S0c + z.*sqrt(s2./c);
+            % Q = sum_i w_i (y_i - S0 g_i)^2, expanded elementwise over the (t,z) arrays
+            Q   = sum(w.*y.^2) - 2*S0.*sum(w.*y.*g) + S0.^2.*sum(w.*g.^2);
+            lf  = -m/2*log(2*pi*s2) - Q./(2*s2);            % likelihood (prod(w)^(1/2) dropped)
+            if strcmp(name, 'marginal_S0noise')
+                v   = k.*s2./c;
+                lf  = lf - 0.5*log(2*pi*v) - S0.^2./(2*v);  % Zellner g-prior
+            else
+                lf  = lf - log(2*A);                        % flat, truncated at +/- A
+                lf(abs(S0) > A) = -Inf;
+            end
+            % p(sigma^2) ∝ 1/sigma^2 (-t) times d sigma^2 = sigma^2 dt (+t), and dS0 = sqrt(sigma^2/c) dz
+            lf  = lf + 0.5*(t - log(c));
         end
 
         function fitting = explicitDefaults()

@@ -29,6 +29,19 @@ Phase 1 scripts (a few minutes each on an A40):
   agrees statistically with legacy `mcmc`; also reports same-seed bitwise
   identity and wall time (information only).
 
+Phase 2 scripts (marginal likelihoods; minutes each on an A40):
+
+- `test_T2_1_grid_reference.m`: `marginal_S0noise` posterior quantiles of the
+  non-linear parameters vs a brute-force double-precision grid reference
+  (monoexponential R2star, 1D grid; IVIM D/F/Dstar, refined 3D grid), SNR 20
+  and 50, transforms 'linear' and 'sigmoid'; z-scores from the quantile MC
+  standard error (ESS of the indicator).
+- `test_T2_2_nuisance_recovery.m`: the post-hoc sigma and S0 draws vs a
+  reference (monoexponential: 3D joint grid over R2star, S0, log sigma^2 from
+  the priors only; IVIM: grid posterior x exact conditionals).
+- `test_T2_3_rician_bias.m`: characterisation only (no pass/fail): bias of
+  the posterior mean/median under Rician vs Gaussian noise at SNR 5 and 10.
+
 Shared helpers:
 
 - `ivim_fwd.m`: minimal IVIM forward model,
@@ -42,6 +55,14 @@ Shared helpers:
 - `thin_by_ess.m`: thin one chain by 2*tau (tau = N/ESS).
 - `mc_compare.m`: MC z-scores of posterior mean/SD differences between two
   runs.
+- `ivim_t2_config.m`, `ivim_sim.m`: Phase 2 IVIM truth, b-values, box and
+  Gaussian/Rician simulation.
+- `run_chains.m`: several independent chains per voxel as voxel copies in one
+  mcmc_bayes call.
+- `grid3_refine.m`: coarse-then-refined 3D grid posterior (double, GPU) with a
+  second, coarser refined grid for the discretisation error.
+- `grid_quantiles.m`: quantiles and density of a 1D marginal on grid nodes.
+- `quantile_z.m`: z-scores of sampler quantiles vs reference quantiles.
 
 Fast unit tests and the bitwise legacy-identity test live in
 `tests/McmcBayesUnitTest.m` and `tests/McmcBayesLegacyTest.m`. This folder
