@@ -1072,7 +1072,9 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             bad = {struct('potential','tv'), struct('tau',0), struct('tau',[1 2]), struct('W',[1 -1]), struct('W',[1 1 1]), ...
                    struct('mode','1d'), struct('radius',1.5), struct('radius',2,'connectivity','face'), ...
                    struct('connectivity','edge'), struct('huberDelta',0), struct('beta',1), ...
-                   struct('subsetForward','yes'), struct('subsetForward',[true true]), struct('subsetForward',2)};
+                   struct('subsetForward','yes'), struct('subsetForward',[true true]), struct('subsetForward',2), ...
+                   struct('bayesivimWeights','yes'), struct('bayesivimWeights',true,'potential','huber'), ...
+                   struct('bayesivimWeights',true,'W',[1 1])};
             for k = 1:numel(bad)
                 g = f; g.prior = struct('hierarchical', fixedH, 'mrf', bad{k});
                 testCase.verifyError(@() run(g), 'mcmc_bayes:invalidMrf', sprintf('case %d', k));
@@ -1096,10 +1098,67 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyEqual(m.delta, [2; 0.5]);
             testCase.verifyEqual({m.potential, m.mode, m.connectivity, m.radius, m.tau, m.update}, {'l1','3d','face',1,1,'chromatic'});
             testCase.verifyTrue(m.subsetForward);                  % Phase 4b default
+            testCase.verifyFalse(m.stateWeight);                   % TEST ONLY bayesivimWeights off by default
+            g2 = g; g2.prior.mrf = struct('bayesivimWeights', true);
+            m2 = mcmc_bayes.setup_mrf(mcmc_bayes.check_set_default_bayes(g2), mcmc_bayes.setup_hierarchical(mcmc_bayes.setup_likelihood(g2)));
+            testCase.verifyTrue(m2.stateWeight);
+            testCase.verifyEqual(m2.W, [1; 1]);
             g.prior.mrf = struct('mode','2d','radius',2,'huberDelta',0.5);
             m  = mcmc_bayes.setup_mrf(g, mcmc_bayes.setup_hierarchical(mcmc_bayes.setup_likelihood(g)));
             testCase.verifyEqual(m.connectivity, 'full');
             testCase.verifyEqual(m.delta, [1; 0.25]);
+        end
+
+        %% TEST ONLY bayesivimWeights: local term vs BayesIVIM's formula written out directly
+        function testBayesivimWeightsLocalDelta(testCase)
+            % Tolerance (stated before running): |dPhi_local - dPhi_direct| <= 1e-5 * max(1, |dPhi_direct|),
+            % single precision vs double. BayesIVIM (ivim_bayes.m, wSumNeighb): for voxel i and parameter p,
+            % S(u) = sum over the (2r+1)^2 in-mask block INCLUDING the centre of |u_block,curr - u|,
+            % and the spatial ratio is exp(-(1/tau) (S(u_prop) - S(u_curr)) / |u_i,curr|).
+            rng(812);
+            mask = rand(9,8) > 0.25; mask_idx = find(mask); Nv = numel(mask_idx);
+            nbr  = mcmc_bayes.build_neighbours(mask_idx, [size(mask) 1], '2d', 2, 'full');
+            K    = size(nbr,1); self = repmat(int32(1:Nv), K, 1); nbrS = nbr; nbrS(nbr == 0) = self(nbr == 0);
+            w    = double(nbr > 0);
+            tau  = 0.7;
+            u    = -3 + randn(1, Nv);                          % one parameter, away from 0 (weight 1/|u|)
+            img  = nan(size(mask)); img(mask_idx) = u;
+            for t = 1:20
+                i  = randi(Nv); uNew = u(i) + 0.5*randn;
+                [ix, iy] = ind2sub(size(mask), mask_idx(i));
+                blk = img(max(1,ix-2):min(end,ix+2), max(1,iy-2):min(end,iy+2)); blk = blk(~isnan(blk));   % includes centre
+                Sn  = sum(abs(blk - uNew)); So = sum(abs(blk - u(i)));
+                ref = (Sn - So) / abs(u(i)) / tau;
+                loc = mcmc_bayes.mrf_local_delta(single(uNew), single(u(i)), single(u), nbrS(:,i), single(w(:,i)), ...
+                                                 single(1/tau), single(1), 'l1', true);
+                testCase.verifyLessThanOrEqual(abs(double(loc) - ref), 1e-5*max(1, abs(ref)), sprintf('trial %d', t));
+            end
+            % without the flag the same call is the ordinary L1 term (no centre, no 1/|u|)
+            i = 1; uNew = u(i) + 0.3;
+            loc0 = mcmc_bayes.mrf_local_delta(single(uNew), single(u(i)), single(u), nbrS(:,i), single(w(:,i)), single(1/tau), single(1), 'l1');
+            ref0 = sum(w(:,i) .* (abs(uNew - u(nbrS(:,i))') - abs(u(i) - u(nbrS(:,i))'))) / tau;
+            testCase.verifyLessThanOrEqual(abs(double(loc0) - ref0), 1e-5*max(1, abs(ref0)));
+        end
+
+        %% forward-model output size check
+        function testForwardSizeCheck(testCase)
+            testCase.verifyError(@() mcmc_bayes.check_forward_size(zeros(1,5), 16, 5), 'mcmc_bayes:forwardSize');
+            testCase.verifyError(@() mcmc_bayes.check_forward_size(zeros(16,4), 16, 5), 'mcmc_bayes:forwardSize');
+            testCase.verifyError(@() mcmc_bayes.check_forward_size(zeros(16,5,2), 16, 5), 'mcmc_bayes:forwardSize');
+            mcmc_bayes.check_forward_size(zeros(16,5), 16, 5);         % no error
+            % end to end: 3-D single-slice data [nx,ny,Nb] is read as a volume with one measurement
+            gacelletest.assumeGPU(testCase);
+            addpath(fullfile(fileparts(mfilename('fullpath')), 'validation', 'mcmc_bayes'));   % ivim_fwd
+            b  = [0 0.1 0.3 0.6 0.9];
+            f  = struct('modelParams', {{'S0','D','F','Dstar'}}, 'lb', [0 0.1 0 1], 'ub', [2 3 0.5 50], ...
+                        'xStepSize', [0.01 0.02 0.01 1], 'algorithm', 'MH', 'likelihood', 'marginal_S0noise', 'S0Param', 'S0', ...
+                        'parameterTransform', 'sigmoid', 'iteration', 20, 'burnin', 10, 'thinning', 1, 'metric', {{'mean'}});
+            x0 = struct('S0', ones(3,4), 'D', ones(3,4), 'F', 0.1*ones(3,4), 'Dstar', 10*ones(3,4));
+            y3 = rand(3, 4, numel(b)) + 0.5;
+            testCase.verifyError(@() mcmc_bayes().optimisation(y3, true(3,4), [], x0, f, @ivim_fwd, b), 'mcmc_bayes:forwardSize');
+            y4 = reshape(y3, [3 4 1 numel(b)]);
+            out = mcmc_bayes().optimisation(y4, true(3,4), [], x0, f, @ivim_fwd, b);
+            testCase.verifyTrue(all(isfinite(out.mean.D(:))));
         end
 
         %% Phase 4: GPU runs of the MRF prior

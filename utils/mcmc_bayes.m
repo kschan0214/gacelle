@@ -81,6 +81,17 @@ classdef mcmc_bayes < mcmc
 %                                       This targets the WRONG distribution on purpose: it is the negative
 %                                       control of test_T4_3 (it must fail test_T4_2). Never use it for
 %                                       inference.
+%   .prior.mrf.bayesivimWeights : false *** TEST ONLY *** replicate the spatial term of the BayesIVIM
+%                                       code (Spinner et al. 2021, ivim_bayes.m) to show that mcmc_bayes
+%                                       reproduces it under identical conditions: for voxel i and parameter
+%                                       p the local term is (1/tau) [sum_{j in N(i)} |u_i^p - u_j^p| +
+%                                       |u_i^p - u_i^p,curr|] / |u_i^p,curr| (the centre voxel of their
+%                                       block is included, and the weight comes from the CURRENT state).
+%                                       Requires potential 'l1'; W is not used. The weight depends on the
+%                                       units of u, so run in BayesIVIM's units. Combine with mrfUpdate =
+%                                       'simultaneous', updateScheme = 'componentwise', mode '2d', radius 2,
+%                                       connectivity 'full' for their exact scheme. The target distribution
+%                                       is undefined; never use it for inference.
 %
 % Phase 1 (sampler infrastructure) design notes
 % ---------------------------------------------
@@ -766,6 +777,13 @@ classdef mcmc_bayes < mcmc
             xStart  = max(xStart,lb); xStart = min(xStart,ub);         % set boundary
             uStart  = this.transform_forward(xStart, method, lb, ub);
 
+            % the forward model must return one row per measurement and one column per voxel
+            parsChk = this.array2struct(xStart, fitting.modelParams);
+            if isMarginal; parsChk = mcmc_bayes.inject_fixed(parsChk, lik.fixedParams, fixedVal); end
+            if hasUserFixed; parsChk = mcmc_bayes.inject_values(parsChk, userFixed); end
+            mcmc_bayes.check_forward_size(FWDfunc(parsChk, varargin{:}), Nm, Nv);
+            clear parsChk
+
             % initial u-space proposal scale at the start point (used for overdisp of
             % unbounded rows and for the hierarchical variance floor)
             if isHier || any(isUnbounded)
@@ -963,7 +981,7 @@ classdef mcmc_bayes < mcmc
                     if isMarginal; [logLProposed, statsProposed] = loglikC{kc}(xProposed); else; logLProposed = loglikC{kc}(xProposed); end
                     lpProposed  = this.logprior_normal(uProposed(hIdx,:), muG, PG);     % the MRF requires the hierarchical prior
                     dPhi        = this.mrf_local_delta(uProposed(hIdx,:), uA(hIdx,:), uCurr(hIdx,:), ...
-                                                       mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential);
+                                                       mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential, mrf.stateWeight);
                     if hasJac
                         logRatio    = logLProposed - logLCurr(act) + sum(logJProposed - logJCurr(:,act), 1);
                     else
@@ -1019,7 +1037,7 @@ classdef mcmc_bayes < mcmc
                             logRatio            = logRatio + (lpProposed - lpA);
                             pH                  = find(hIdx==kp);
                             dPhi                = this.mrf_local_delta(uProposed_p, uA(kp,:), uCurr(kp,:), ...
-                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef(pH), mrfDelta(pH), mrf.potential);
+                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef(pH), mrfDelta(pH), mrf.potential, mrf.stateWeight);
                             logRatio            = logRatio - dPhi;
                         end
                         rAll                        = rand(1,Nv,'like',logLProposed);
@@ -1069,7 +1087,7 @@ classdef mcmc_bayes < mcmc
                     % MRF: change of the local term of the active voxels, current neighbours (never cached)
                     if isMRF
                         dPhi = this.mrf_local_delta(uProposed(hIdx,act), uCurr(hIdx,act), uCurr(hIdx,:), ...
-                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential);
+                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential, mrf.stateWeight);
                     end
                     % 2.2 accept with probability min(1, exp(logRatio)); NaN is rejected
                     if hasJac
@@ -1134,7 +1152,7 @@ classdef mcmc_bayes < mcmc
                             if isMRF
                                 pH              = find(hIdx==kp);
                                 dPhi            = this.mrf_local_delta(uProposed_p(act), uCurr(kp,act), uCurr(kp,:), ...
-                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef(pH), mrfDelta(pH), mrf.potential);
+                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef(pH), mrfDelta(pH), mrf.potential, mrf.stateWeight);
                                 logRatio(act)   = logRatio(act) - dPhi;
                             end
                         end
@@ -2050,7 +2068,7 @@ classdef mcmc_bayes < mcmc
         %
             mrf = struct('on', false, 'potential', '', 'tau', [], 'W', [], 'Wrule', '', 'huberDelta', [], 'delta', [], ...
                          'mode', '', 'radius', [], 'connectivity', '', 'edgeWeights', [], 'maxGPUMemory', [], 'update', 'chromatic', ...
-                         'subsetForward', true);
+                         'subsetForward', true, 'stateWeight', false);
             update = lower(char(field_or_default(fitting, 'mrfUpdate', 'chromatic')));
             if ~any(strcmp(update, {'chromatic','simultaneous'}))
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.mrfUpdate must be ''chromatic'' or ''simultaneous'' (TEST ONLY).');
@@ -2068,7 +2086,8 @@ classdef mcmc_bayes < mcmc
             if ~isstruct(m) || ~isscalar(m)
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.prior.mrf must be a structure (or true).');
             end
-            valid = {'potential','tau','W','huberDelta','edgeWeights','mode','radius','connectivity','maxGPUMemory','subsetForward'};
+            valid = {'potential','tau','W','huberDelta','edgeWeights','mode','radius','connectivity','maxGPUMemory','subsetForward', ...
+                     'bayesivimWeights'};
             bad   = setdiff(fieldnames(m), valid);
             if ~isempty(bad)
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: unknown field(s) in fitting.prior.mrf: %s (valid: %s).', ...
@@ -2105,6 +2124,21 @@ classdef mcmc_bayes < mcmc
                     error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.W must be positive and finite, a scalar or %d entries.', d);
                 end
                 W = double(W(:)) .* ones(d, 1); Wrule = 'user';
+            end
+            % TEST ONLY: BayesIVIM's state-dependent spatial weight (see the class header)
+            stateWeight = field_or_default(m, 'bayesivimWeights', false);
+            if ~(islogical(stateWeight) || isnumeric(stateWeight)) || ~isscalar(stateWeight) || ~any(stateWeight == [0 1])
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.bayesivimWeights must be true or false (TEST ONLY).');
+            end
+            stateWeight = logical(stateWeight);
+            if stateWeight
+                if ~strcmp(potential, 'l1')
+                    error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.bayesivimWeights (TEST ONLY) requires potential ''l1''.');
+                end
+                if isfield(m,'W') && ~isempty(m.W)
+                    error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.bayesivimWeights (TEST ONLY) replaces W; do not set prior.mrf.W.');
+                end
+                W = ones(d, 1); Wrule = 'TEST ONLY bayesivimWeights: W = 1, per-voxel weight 1/|u_i| of the current state';
             end
             huberDelta = field_or_default(m, 'huberDelta', 1);
             if ~(isnumeric(huberDelta) && any(numel(huberDelta) == [1 d]) && all(isfinite(huberDelta(:))) && all(huberDelta(:) > 0))
@@ -2153,6 +2187,7 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.subsetForward must be true or false.');
             end
             mrf.subsetForward   = logical(subsetForward);
+            mrf.stateWeight     = stateWeight;
         end
 
         % neighbour offsets [K,3], sorted lexicographically (offset K+1-k = -offset k)
@@ -2282,6 +2317,16 @@ classdef mcmc_bayes < mcmc
             end
         end
 
+        % forward model output must be [Nm, Nv] (measurements x voxels)
+        function check_forward_size(g, Nm, Nv)
+            if size(g,1) ~= Nm || size(g,2) ~= Nv || ndims(g) > 2
+                error('mcmc_bayes:forwardSize', ...
+                    ['mcmc_bayes: FWDfunc returned an array of size %s, but the data are [%d measurements x %d voxels]. ' ...
+                     'GACELLE treats dims 1-3 of the data as spatial and dims 4+ as measurements, so single-slice ' ...
+                     'data must be given as [nx, ny, 1, Nmeas], not [nx, ny, Nmeas].'], mat2str(size(g)), Nm, Nv);
+            end
+        end
+
         % potential rho(x), elementwise (CPU or GPU); delta is the Huber threshold (u space)
         function r = mrf_rho(x, potential, delta)
             switch potential
@@ -2298,7 +2343,7 @@ classdef mcmc_bayes < mcmc
         end
 
         % change of the local MRF term Phi_i of the active voxels, current neighbours
-        function dPhi = mrf_local_delta(uNewA, uOldA, uAll, nbrA, wA, coef, delta, potential)
+        function dPhi = mrf_local_delta(uNewA, uOldA, uAll, nbrA, wA, coef, delta, potential, stateWeight)
         % Input
         % -----
         % uNewA, uOldA  : [dA, Na] proposed and current u of the active voxels (MRF parameters)
@@ -2310,8 +2355,13 @@ classdef mcmc_bayes < mcmc
         % delta         : [dA, 1] Huber thresholds
         % Output
         % ------
+        % stateWeight   : (optional, TEST ONLY) BayesIVIM's term: add the centre voxel
+        %                 |uNew - uOld| and divide by |uOld| (weight from the current state)
+        % Output
+        % ------
         % dPhi          : [1, Na] Phi_i(uNew) - Phi_i(uOld)
         %
+            if nargin < 9; stateWeight = false; end
             Na   = size(uNewA, 2);
             dPhi = zeros(1, Na, 'like', uNewA);
             for p = 1:size(uNewA, 1)
@@ -2319,7 +2369,11 @@ classdef mcmc_bayes < mcmc
                 Unb  = reshape(v(nbrA), size(nbrA));                 % [K, Na]
                 r    = mcmc_bayes.mrf_rho(uNewA(p,:) - Unb, potential, delta(p)) - ...
                        mcmc_bayes.mrf_rho(uOldA(p,:) - Unb, potential, delta(p));
-                dPhi = dPhi + coef(p) .* sum(wA .* r, 1);
+                s    = sum(wA .* r, 1);
+                if stateWeight
+                    s = (s + abs(uNewA(p,:) - uOldA(p,:))) ./ abs(uOldA(p,:));
+                end
+                dPhi = dPhi + coef(p) .* s;
             end
         end
 
@@ -2366,11 +2420,18 @@ classdef mcmc_bayes < mcmc
             else
                 upd = 'chromatic: one MH step per colour class, conditioning on the current other voxels';
             end
+            if mrf.stateWeight
+                energy = ['TEST ONLY bayesivimWeights (Spinner et al. 2021 code): local term of voxel i, parameter p = ' ...
+                          '(1/tau) [sum_{j in N(i)} |u_i^p - u_j^p| + |u_i^p - u_i^p,curr|] / |u_i^p,curr|, weight from the ' ...
+                          'CURRENT state; not a well-defined joint prior (the target distribution is undefined)'];
+            else
+                energy = 'Phi = (1/tau) sum_p W_p sum_{(i,j) in E} w_ij rho(u_i^p - u_j^p), each edge once, u space';
+            end
             s = struct( ...
                 'params',       {hier.params}, ...
                 'potential',    mrf.potential, ...
                 'rho',          rho, ...
-                'energy',       'Phi = (1/tau) sum_p W_p sum_{(i,j) in E} w_ij rho(u_i^p - u_j^p), each edge once, u space', ...
+                'energy',       energy, ...
                 'tau',          mrf.tau, ...
                 'W',            mrf.W, ...
                 'Wrule',        mrf.Wrule, ...
