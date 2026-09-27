@@ -67,6 +67,11 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     1e-5 * S + 1e-6, S = sum of |terms| of the local difference (double brute force over all edges)
     %   MRF GPU runs (checkCache): voxels outside the active colour never move (exactly 0);
     %     caches <= 1e-5 as above
+    %   Phase 4b (subsetForward): the setup check is used for lingauss_fwd and ivim_fwd (and records
+    %     maxRelDiff <= 1e-6), falls back with mcmc_bayes:subsetForwardFallback for a FWD with a
+    %     voxel-dimensioned varargin input (differs / errors / wrong size); the fallback run is
+    %     bitwise identical to subsetForward = false (same seed); with the subset, the caches equal a
+    %     fresh full-volume recompute within 1e-5 and inactive voxels never move (exactly 0)
     %
     % Kwok-Shing Chan @ MGH
 
@@ -1066,7 +1071,8 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             % invalid MRF options
             bad = {struct('potential','tv'), struct('tau',0), struct('tau',[1 2]), struct('W',[1 -1]), struct('W',[1 1 1]), ...
                    struct('mode','1d'), struct('radius',1.5), struct('radius',2,'connectivity','face'), ...
-                   struct('connectivity','edge'), struct('huberDelta',0), struct('beta',1)};
+                   struct('connectivity','edge'), struct('huberDelta',0), struct('beta',1), ...
+                   struct('subsetForward','yes'), struct('subsetForward',[true true]), struct('subsetForward',2)};
             for k = 1:numel(bad)
                 g = f; g.prior = struct('hierarchical', fixedH, 'mrf', bad{k});
                 testCase.verifyError(@() run(g), 'mcmc_bayes:invalidMrf', sprintf('case %d', k));
@@ -1089,6 +1095,7 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyEqual(m.W, [0.5; 2]);
             testCase.verifyEqual(m.delta, [2; 0.5]);
             testCase.verifyEqual({m.potential, m.mode, m.connectivity, m.radius, m.tau, m.update}, {'l1','3d','face',1,1,'chromatic'});
+            testCase.verifyTrue(m.subsetForward);                  % Phase 4b default
             g.prior.mrf = struct('mode','2d','radius',2,'huberDelta',0.5);
             m  = mcmc_bayes.setup_mrf(g, mcmc_bayes.setup_hierarchical(mcmc_bayes.setup_likelihood(g)));
             testCase.verifyEqual(m.connectivity, 'full');
@@ -1128,6 +1135,107 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             % memory guard
             f.mrfUpdate = 'chromatic'; f.prior.mrf = struct('maxGPUMemory', 1);
             testCase.verifyError(@() mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd), 'mcmc_bayes:mrfMemory');
+        end
+
+        %% Phase 4b: forward model on the active colour only
+        function testMrfSubsetForwardUsed(testCase, updateScheme)
+            % used for lingauss_fwd (gaussian, known noise) and ivim_fwd (marginal_S0noise, per-voxel m);
+            % caches equal a fresh recompute after the colour steps, inactive voxels never move
+            gacelletest.assumeGPU(testCase);
+            addpath(fullfile(fileparts(mfilename('fullpath')), 'validation', 'mcmc_bayes'));
+            [yy, mask, x0, f, ~] = McmcBayesUnitTest.linGaussGrid([6 5 3], 2);
+            rng(3); x0.u1 = 0.5 + 0.3*randn(size(mask)); x0.u2 = 0.5 + 0.3*randn(size(mask));   % non-trivial start
+            A   = McmcBayesUnitTest.linGaussA(2);
+            fwd = @(p) lingauss_fwd(p, A);
+            f.updateScheme = updateScheme; f.checkCache = true; f.adaptStepSize = true; f.adaptInterval = 20;
+            for mrfCfg = {struct('potential','l1'), struct('potential','huber','mode','2d','radius',2)}
+                f.prior.mrf = mrfCfg{1};
+                out = testCase.verifyWarningFree(@() mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd));
+                sfi = out.settings.mrf.subsetForward;
+                testCase.verifyTrue(sfi.requested && sfi.used, sfi.reason);
+                testCase.verifyLessThanOrEqual(sfi.maxRelDiff, 1e-6);
+                testCase.verifyTrue(contains(out.settings.mrf.cost, 'active colour only'));
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.inactiveMoved, 0, 'a voxel outside the active colour moved');
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5);
+                testCase.verifyEqual(cc.Ncheck, f.iteration);
+            end
+            % IVIM, marginal_S0noise with per-voxel weights (zeros: per-voxel m), log/sigmoid transforms
+            [y, maskI, x0I, g, fwdI] = McmcBayesUnitTest.ivimGrid();
+            rng(4); w = 0.5 + rand(size(y)); w(rand(size(y)) < 0.05) = 0;
+            g.updateScheme = updateScheme; g.checkCache = true;
+            g.prior.mrf = struct('potential','l1','tau',1,'mode','2d','radius',2);
+            rng(11); parallel.gpu.rng(11);
+            outT = mcmc_bayes().optimisation(y, maskI, w, x0I, g, fwdI);
+            sfi = outT.settings.mrf.subsetForward;
+            testCase.verifyTrue(sfi.used, sfi.reason);
+            testCase.verifyTrue(sfi.bitwise, 'ivim_fwd is elementwise: bitwise subset expected');
+            cc  = outT.diagnostics.cacheCheck;
+            testCase.verifyEqual(cc.inactiveMoved, 0);
+            testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5);
+            % same seed, subsetForward = false: identical chain for the elementwise ivim_fwd
+            g.prior.mrf.subsetForward = false;
+            rng(11); parallel.gpu.rng(11);
+            outF = mcmc_bayes().optimisation(y, maskI, w, x0I, g, fwdI);
+            testCase.verifyFalse(outF.settings.mrf.subsetForward.used);
+            testCase.verifyEqual(outT.posterior, outF.posterior);
+        end
+
+        function testMrfSubsetForwardFallback(testCase)
+            % FWD with a voxel-dimensioned varargin input: the subset is detected and not used
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, ~] = McmcBayesUnitTest.linGaussGrid([6 5 3], 2);
+            rng(3); x0.u1 = 0.5 + 0.3*randn(size(mask)); x0.u2 = 0.5 + 0.3*randn(size(mask));
+            A   = McmcBayesUnitTest.linGaussA(2);
+            Nv  = nnz(mask);
+            sc  = gpuArray(single(0.5 + rand(1, Nv)));             % per-voxel scale (voxel dimension)
+            f.prior.mrf = struct('potential','l1','tau',1);
+            f.checkCache = true;
+            cases = { ...
+                {@(p, s) McmcBayesUnitTest.linGaussFwd(p, A) .* s(1:numel(p.u1)), 'differs'}, ...   % accepts any Nv, wrong columns
+                {@(p, s) McmcBayesUnitTest.linGaussFwd(p, A) .* s, 'errors'}, ...                    % implicit expansion fails
+                {@(p, s) McmcBayesUnitTest.linGaussFwd(p, A) .* ones(1, numel(p.u1)) + 0*s(1) + ...
+                         0*McmcBayesUnitTest.assertNv(p, numel(s)), 'errors'}, ...                  % fixed voxel count
+                {@(p, s) repmat(McmcBayesUnitTest.linGaussFwd(p, A), 1, numel(s)/numel(p.u1)), 'size'} };  % [m, Nv] always (errors if not integer)
+            for k = 1:numel(cases)
+                fwdK = @(p) cases{k}{1}(p, sc);
+                rng(12); parallel.gpu.rng(12);
+                outT = testCase.verifyWarning(@() mcmc_bayes().optimisation(yy, mask, [], x0, f, fwdK), 'mcmc_bayes:subsetForwardFallback', cases{k}{2});
+                sfi  = outT.settings.mrf.subsetForward;
+                testCase.verifyTrue(sfi.requested && ~sfi.used, cases{k}{2});
+                testCase.verifyNotEmpty(sfi.reason);
+                testCase.verifyTrue(contains(outT.settings.mrf.cost, 'all voxels'));
+                testCase.verifyEqual(outT.diagnostics.cacheCheck.inactiveMoved, 0);
+                % the fallback is the full evaluation: bitwise identical to subsetForward = false
+                g = f; g.prior.mrf.subsetForward = false;
+                rng(12); parallel.gpu.rng(12);
+                outF = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwdK);
+                testCase.verifyEqual(outT.posterior, outF.posterior, cases{k}{2});
+                testCase.verifyEqual(outT.diagnostics, outF.diagnostics, cases{k}{2});
+            end
+            testCase.verifyTrue(contains(sfi.reason, 'size') || contains(sfi.reason, 'errors'));
+            % the helper directly: reasons per failure type
+            p   = struct('u1', gpuArray(single([1 2 3 4])), 'u2', gpuArray(single([1 1 1 1])));
+            pS  = {struct('u1', p.u1([1 3]), 'u2', p.u2([1 3])), struct('u1', p.u1([2 4]), 'u2', p.u2([2 4]))};
+            idx = {[1 3], [2 4]};
+            info = mcmc_bayes.check_subset_forward(@(q) q.u1 + q.u2, {}, p, pS, idx, 4, 1e-6);
+            testCase.verifyTrue(info.used && info.bitwise);
+            testCase.verifyEqual(info.maxRelDiff, 0);
+            info = mcmc_bayes.check_subset_forward(@(q, s) q.u1 .* s(1:numel(q.u1)), {gpuArray(single([1 2 3 4]))}, p, pS, idx, 4, 1e-6);
+            testCase.verifyFalse(info.used); testCase.verifyTrue(contains(info.reason, 'differs'));
+            info = mcmc_bayes.check_subset_forward(@(q, s) q.u1 .* s, {gpuArray(single([1 2 3 4]))}, p, pS, idx, 4, 1e-6);
+            testCase.verifyFalse(info.used); testCase.verifyTrue(contains(info.reason, 'errors'));
+            info = mcmc_bayes.check_subset_forward(@(q) q.u1 .* [1 1 1 1], {}, p, pS, idx, 4, 1e-6);
+            testCase.verifyFalse(info.used); testCase.verifyTrue(contains(info.reason, 'errors') || contains(info.reason, 'size'));
+            info = mcmc_bayes.check_subset_forward(@(q) q.u1 + 1e-5*numel(q.u1), {}, p, pS, idx, 4, 1e-6);   % tiny column coupling
+            testCase.verifyFalse(info.used); testCase.verifyTrue(contains(info.reason, 'differs'));
+            info = mcmc_bayes.check_subset_forward(@(q) q.u1 .* (1 + 1e-7*(numel(q.u1) == 2)), {}, p, pS, idx, 4, 1e-6);   % within tolerance
+            testCase.verifyTrue(info.used); testCase.verifyFalse(info.bitwise);
+            % simultaneous (TEST ONLY) and disabled: not used, recorded, no warning
+            g = f; g.mrfUpdate = 'simultaneous';
+            out = testCase.verifyWarningFree(@() mcmc_bayes().optimisation(yy, mask, [], x0, g, @(p) McmcBayesUnitTest.linGaussFwd(p, A)));
+            testCase.verifyFalse(out.settings.mrf.subsetForward.used);
+            testCase.verifyTrue(contains(out.settings.mrf.subsetForward.reason, 'simultaneous'));
         end
 
         function testRunTwoStage(testCase)
@@ -1261,6 +1369,43 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             u = zeros(d, numel(pars.u1), 'like', pars.u1);
             for k = 1:d; u(k,:) = pars.(sprintf('u%d',k))(:).'; end
             s = cast(A, 'like', u) * u;
+        end
+
+        % design matrix of linGaussGrid (same seed and draw order)
+        function A = linGaussA(d)
+            rng(42); m = 5;
+            dims = [6 5 3]; rand(dims); %#ok<RAND>                % the mask draw of linGaussGrid comes first
+            A = randn(m, d);
+        end
+
+        % error unless the parameter structure has N voxels (a FWD with a fixed voxel count)
+        function z = assertNv(p, N)
+            if numel(p.u1) ~= N; error('McmcBayesUnitTest:fixedNv', 'fixed voxel count %d (got %d)', N, numel(p.u1)); end
+            z = 0;
+        end
+
+        % small IVIM grid (ivim_fwd), marginal_S0noise, hierarchical fixed around the truth
+        function [y, mask, x0, f, fwd] = ivimGrid()
+            rng(43); dims = [7 6 3];
+            mask = rand(dims) > 0.15; Nv = nnz(mask);
+            b    = [0 0.02 0.05 0.1 0.2 0.4 0.7 1 1.5 2 3];
+            mu   = [log(1); log(0.1/0.9); log(20)]; Sigma = diag([0.1 0.3 0.2].^2);
+            u    = mu + chol(Sigma,'lower')*randn(3, Nv);
+            p    = struct('S0', 1 + 0.05*randn(1, Nv), 'D', exp(u(1,:)), 'F', 1./(1+exp(-u(2,:))), 'Dstar', exp(u(3,:)));
+            s    = ivim_fwd(p, b) + 0.02*randn(numel(b), Nv);
+            y    = zeros(numel(mask), numel(b)); y(mask(:), :) = s.';
+            y    = reshape(y, [dims numel(b)]);
+            o    = ones(dims);
+            x0   = struct('S0', o, 'D', o, 'F', 0.1*o, 'Dstar', 20*o, 'noise', 0.02*o);
+            f.modelParams = {'S0';'D';'F';'Dstar';'noise'};
+            f.lb = [0; 0; 0; 0; 0.001]; f.ub = [2; Inf; 1; Inf; 1];
+            f.xStepSize = [0.01; 0.05; 0.01; 2; 0.001];
+            f.parameterTransform = {'linear','log','sigmoid','log','linear'};
+            f.likelihood = 'marginal_S0noise'; f.S0Param = 'S0';
+            f.algorithm = 'MH'; f.iteration = 150; f.burnin = 50; f.thinning = 5; f.metric = {'mean'};
+            f.adaptStepSize = true; f.adaptInterval = 25;
+            f.prior.hierarchical = struct('fixed', true, 'mu', mu, 'Sigma', Sigma);
+            fwd  = @(pp) ivim_fwd(pp, b);
         end
 
         % log NIW(mu, Sigma | m, k, Psi, nu), all (mu,Sigma)-dependent terms

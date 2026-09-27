@@ -60,8 +60,8 @@ ok = ok && muN(1) > 0.5 && muN(1) < 1.5 && muN(3) > 8 && muN(3) < 40 && rm(1,1) 
 
 fprintf('T4.6 two-stage smoke (IVIM phantom, Nv %d, stage 1 on %d voxels)\n', numel(idx), eb.Nstage1);
 fprintf('stage-1 mu (native: D %.3f, F %.3f, Dstar %.2f); SigmaHat diag %s\n', muN, mat2str(diag(eb.SigmaHat).', 3));
-fprintf('stage-2 MRF: %s tau %g, W %s, %d colours, %d edges\n', out.settings.mrf.potential, out.settings.mrf.tau, ...
-    mat2str(out.settings.mrf.W.', 3), out.settings.mrf.NcoloursUsed, out.settings.mrf.Nedges);
+fprintf('stage-2 MRF: %s tau %g, W %s, %d colours, %d edges, subsetForward used %d\n', out.settings.mrf.potential, out.settings.mrf.tau, ...
+    mat2str(out.settings.mrf.W.', 3), out.settings.mrf.NcoloursUsed, out.settings.mrf.Nedges, out.settings.mrf.subsetForward.used);
 fprintf('RMSE of the posterior mean   D       F       Dstar\n');
 fprintf('  two-stage (hier + MRF)   %.4f  %.4f  %.3f\n', rm(1,:));
 fprintf('  hierarchical only        %.4f  %.4f  %.3f\n', rm(2,:));

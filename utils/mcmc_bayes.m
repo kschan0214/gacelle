@@ -55,6 +55,13 @@ classdef mcmc_bayes < mcmc
 %                                           [] -> 'face' for '3d' with r = 1, else 'full'
 %           .maxGPUMemory   : []            bytes for the memory guard, [] -> prior.hierarchical.maxGPUMemory,
 %                                           else gpuDevice().AvailableMemory
+%           .subsetForward  : true          evaluate FWDfunc and the likelihood on the voxels of the active
+%                                           colour only (Phase 4b, performance only, same target). Needs a
+%                                           column-separable FWDfunc (column v of the output depends on
+%                                           column v of the parameters only, for any number of columns);
+%                                           varargin entries with a voxel dimension are NOT subset. Checked
+%                                           automatically at setup, with a fallback to the full evaluation
+%                                           (warning mcmc_bayes:subsetForwardFallback), see Phase 4b below
 %
 % Test-only options (not part of the user interface)
 %   .forceNewPath       : false         run the new sampling loop even if all new options are at their
@@ -309,8 +316,9 @@ classdef mcmc_bayes < mcmc
 %   accepted voxels after each colour step; Phi_i is always recomputed from the current
 %   neighbours and never cached. Each voxel is updated once per sweep, so the per-voxel
 %   acceptance counts and the burn-in adaptation are unchanged.
-%   Cost (first version): the forward model is evaluated on ALL voxels and the result is used
-%   for the active colour only, i.e. C forward evaluations per sweep (C x Nvar componentwise).
+%   Cost with prior.mrf.subsetForward = false (the Phase 4 first version, and the fallback of
+%   Phase 4b): the forward model is evaluated on ALL voxels and the result is used for the active
+%   colour only, i.e. C forward evaluations per sweep (C x Nvar componentwise).
 % Negative control (fitting.mrfUpdate = 'simultaneous', TEST ONLY): one class with all voxels,
 %   each voxel's Phi_i uses the pre-sweep neighbours while the neighbours move at the same time.
 %   This is NOT a valid MH kernel for the joint target.
@@ -325,16 +333,49 @@ classdef mcmc_bayes < mcmc
 %
 % Memory. The MRF couples all voxels, so it needs a single call (no segmentation). The guard of
 %   the free hierarchical mode is extended by 4 x K x Nv x 6 bytes (neighbour table, edge weights,
-%   neighbour-value temporaries); mcmc_bayes errors (mcmc_bayes:mrfMemory) if it does not fit.
+%   neighbour-value temporaries), plus 8 x Nm x Nv bytes with subsetForward (per-colour copies of
+%   y and weights); mcmc_bayes errors (mcmc_bayes:mrfMemory) if it does not fit.
 %
 % Output (MRF): out.settings.mrf holds the resolved potential, tau, W, delta, mode, radius,
-%   connectivity, # neighbours, # colours and # edges.
+%   connectivity, # neighbours, # colours, # edges and the subsetForward outcome.
+%
+% Phase 4b (forward model on the active colour only, prior.mrf.subsetForward = true)
+% ----------------------------------------------------------------------------------
+% Performance only; the target and the MH kernel are unchanged. In each colour step (chromatic
+%   update only) the parameter structure is built for the Na active voxels only (with S0Param,
+%   'noise' and test-only fixedParams injected as [1,Na]), y, weights, rssFloor and the per-voxel m
+%   (mNZ) are taken from per-colour copies prepared once on the GPU, FWDfunc and the likelihood
+%   are evaluated on these Na columns, and the hierarchical log-prior, log-Jacobian, bound check,
+%   MRF term and acceptance are computed for them only. Accepted values are scattered back into
+%   the full-size state and caches (u, x, log-likelihood, marginal statistics, log-prior,
+%   log-Jacobian) through the GPU index arrays of the colour. Forward cost per sweep: ~1 full
+%   evaluation (Nvar componentwise) instead of C.
+%   Random numbers: the proposal normals and the acceptance uniforms are still drawn for all Nv
+%   voxels (and the active columns used), so the random stream is exactly that of the full
+%   evaluation; for a forward model whose columns are computed identically for any number of
+%   columns, the chain is then the same as with subsetForward = false for the same seed.
+%   Without the MRF (one class) and with the TEST ONLY mrfUpdate = 'simultaneous' nothing changes.
+% Requirement: FWDfunc must be column-separable (output column v depends on parameter column v
+%   only, [Nm, Na] output for Na input columns, for any Na). varargin is passed unchanged (NOT
+%   subset), so a varargin entry with a voxel dimension (e.g. a per-voxel map) breaks it.
+% Safety check (setup, no random numbers): FWDfunc is evaluated at the starting state once on all
+%   voxels (gF) and once on every colour subset (gS). The subset evaluation is used only if every
+%   gS has the size of gF(:, act) and
+%       |gS - gF(:, act)| <= 1e-6 * max_rows |gF(:, v)|     for every element (column v),
+%   with equal Inf/NaN positions. Bitwise equality is expected for elementwise models; 1e-6
+%   (~8 single-precision ulps of the column scale) allows a different reduction/GEMM order.
+%   Otherwise (a difference, a size mismatch or an error on a subset) the sampler falls back to
+%   the full evaluation with the warning mcmc_bayes:subsetForwardFallback. The outcome is recorded
+%   in out.settings.mrf.subsetForward (.requested, .used, .reason, .tolerance, .maxRelDiff, .bitwise).
+%   The check cannot prove separability for all states; it catches the common failures
+%   (voxel-dimensioned varargin, fixed-size models).
 %
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
 % Date modified: 26 September 2026 (Phase 3: hierarchical Normal prior; m counts non-zero weights only)
 % Date modified: 26 September 2026 (Phase 4: MRF prior, chromatic updates, two-stage empirical Bayes)
+% Date modified: 26 September 2026 (Phase 4b: forward model on the active colour only, subsetForward)
 %
 
     methods
@@ -766,9 +807,11 @@ classdef mcmc_bayes < mcmc
                 selfIdx = repmat(int32(1:Nv), Knb, 1);
                 nbrSelf = nbr; nbrSelf(nbr == 0) = selfIdx(nbr == 0);
                 mrfAct  = cell(1, Ncol); mrfMask = cell(1, Ncol); mrfNbr = cell(1, Ncol); mrfW = cell(1, Ncol);
+                mrfActH = cell(1, Ncol);
                 for kc = 1:Ncol
                     isC         = colours == colList(kc);
-                    mrfAct{kc}  = gpuArray(uint32(find(isC)));
+                    mrfActH{kc} = find(isC);
+                    mrfAct{kc}  = gpuArray(uint32(mrfActH{kc}));
                     mrfMask{kc} = gpuArray(isC);
                     mrfNbr{kc}  = gpuArray(uint32(nbrSelf(:, isC)));
                     mrfW{kc}    = gpuArray(single(wEdge(:, isC)));
@@ -776,8 +819,58 @@ classdef mcmc_bayes < mcmc
                 clear selfIdx nbrSelf
                 mrfCoef  = gpuArray(single(mrf.W(:) ./ mrf.tau));  % [d,1] W_p/tau
                 mrfDelta = gpuArray(single(mrf.delta(:)));          % [d,1] Huber thresholds (u space)
+
+                % Phase 4b: forward model and likelihood on the active colour only (see the header)
+                sfTol  = 1e-6;
+                sfInfo = struct('requested', logical(mrf.subsetForward), 'used', false, 'reason', '', ...
+                                'tolerance', sfTol, 'maxRelDiff', [], 'bitwise', []);
+                if ~strcmp(mrf.update, 'chromatic')
+                    sfInfo.reason = 'mrfUpdate = ''simultaneous'' (TEST ONLY): one class with all voxels, full evaluation';
+                elseif ~mrf.subsetForward
+                    sfInfo.reason = 'disabled (prior.mrf.subsetForward = false): full evaluation in every colour step';
+                else
+                    % per colour: y, weights (and rssFloor, m) of the active voxels, [1,Na] injected
+                    % values, and the likelihood handle on these columns (all on the GPU, built once)
+                    mkPars  = @(x, fv, uf) mcmc_bayes.inject_values(mcmc_bayes.inject_fixed( ...
+                                    this.array2struct(x, fitting.modelParams), lik.fixedParams, fv), uf);
+                    loglikC = cell(1, Ncol); parsC = cell(1, Ncol);
+                    for kc = 1:Ncol
+                        act = mrfAct{kc}; NaK = numel(mrfActH{kc});
+                        yA  = y(:, act); wA = weights(:, act);
+                        fvA = ones(1, NaK, 'like', y);
+                        ufA = struct();
+                        for q = 1:numel(ufNames); ufA.(ufNames{q}) = lik.userFixed.(ufNames{q}) .* ones(1, NaK, 'like', y); end
+                        if isMarginal
+                            rfA = rssFloor(act);
+                            if isscalar(mArg); mA = mArg; else; mA = mArg(act); end
+                            loglikC{kc} = @(x) mcmc_bayes.loglik_marginal(FWDfunc(mkPars(x, fvA, ufA), varargin{:}), ...
+                                                yA, wA, lik.name, rfA, mA);
+                        elseif hasUserFixed
+                            loglikC{kc} = @(x) mcmc_bayes.loglik_gaussian(mcmc_bayes.inject_values(this.array2struct(x,fitting.modelParams), ufA), ...
+                                                yA, wA, Nm, FWDfunc, varargin{:});
+                        else
+                            loglikC{kc} = @(x) mcmc_bayes.loglik_gaussian(this.array2struct(x,fitting.modelParams), yA, wA, Nm, FWDfunc, varargin{:});
+                        end
+                        parsC{kc} = mkPars(xStart(:, act), fvA, ufA);
+                    end
+                    clear yA wA fvA ufA rfA mA
+                    % safety check at the starting state: subset columns == columns of the full evaluation
+                    sfInfo = this.check_subset_forward(FWDfunc, varargin, mkPars(xStart, ones(1, Nv, 'like', y), userFixed), ...
+                                                       parsC, mrfActH, Nv, sfTol);
+                    clear parsC
+                    if ~sfInfo.used
+                        warning('mcmc_bayes:subsetForwardFallback', ...
+                            ['mcmc_bayes: prior.mrf.subsetForward: %s. Falling back to the full forward evaluation in every ' ...
+                             'colour step (same target, ~%d x the forward cost). The forward model must be column-separable and ' ...
+                             'accept any number of voxels; varargin entries with a voxel dimension are not subset. Set ' ...
+                             'prior.mrf.subsetForward = false to skip this check.'], sfInfo.reason, Ncol);
+                        clear loglikC
+                    end
+                end
+                useSubset = sfInfo.used;
             else
                 Ncol    = 1;
+                useSubset = false;
             end
 
             disp('-------------------------');
@@ -846,7 +939,110 @@ classdef mcmc_bayes < mcmc
                     if fitting.checkCache; uBefore = uCurr; end
                 end
 
-                if ~isComponent
+                if useSubset && ~isComponent
+                    % ========== joint update, active colour only (Phase 4b) ==========
+                    % the random numbers are drawn for all voxels (same stream as the full evaluation)
+                    % and the active columns are used; everything else is computed on the Na active voxels
+                    zAll            = randn(size(uCurr),'like',uCurr);
+                    uA              = uCurr(:,act);
+                    uProposed       = uA + sigma(:,act).*zAll(:,act);
+                    if hasJac
+                        [xProposed, logJProposed] = this.transform_inverse_logjac_fused(uProposed, code, lb, ub);
+                        if dropJac; logJProposed = logJProposed .* jacRow; end
+                    else
+                        xProposed = uProposed;
+                    end
+                    if allReject
+                        isOutofbound = max(or(xProposed<lb, xProposed>ub),[],1);
+                    else
+                        isOutofbound = max(isRejectRow & or(xProposed<lb, xProposed>ub),[],1);
+                    end
+                    xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
+
+                    % forward model and likelihood on the active voxels only
+                    if isMarginal; [logLProposed, statsProposed] = loglikC{kc}(xProposed); else; logLProposed = loglikC{kc}(xProposed); end
+                    lpProposed  = this.logprior_normal(uProposed(hIdx,:), muG, PG);     % the MRF requires the hierarchical prior
+                    dPhi        = this.mrf_local_delta(uProposed(hIdx,:), uA(hIdx,:), uCurr(hIdx,:), ...
+                                                       mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential);
+                    if hasJac
+                        logRatio    = logLProposed - logLCurr(act) + sum(logJProposed - logJCurr(:,act), 1);
+                    else
+                        logRatio    = logLProposed - logLCurr(act);
+                    end
+                    logRatio        = logRatio + (lpProposed - lpCurr(act));
+                    logRatio        = logRatio - dPhi;
+                    rAll            = rand(1,Nv,'like',logLProposed);
+                    isAccA          = exp(logRatio) > rAll(act);    % NaN is rejected
+                    isAccA(isOutofbound) = 0;
+                    % scatter the accepted voxels back into the full-size state and caches
+                    isAccSweep(act) = isAccA;
+                    accIdx          = act(isAccA);
+                    logLCurr(accIdx)    = logLProposed(isAccA);
+                    uCurr(:,accIdx)     = uProposed(:,isAccA);
+                    if isMarginal; statsCurr(:,accIdx) = statsProposed(:,isAccA); end
+                    lpCurr(accIdx)      = lpProposed(isAccA);
+                    if hasJac
+                        xCurr(:,accIdx)     = xProposed(:,isAccA);
+                        logJCurr(:,accIdx)  = logJProposed(:,isAccA);
+                    end
+
+                elseif useSubset
+                    % ========== componentwise update, active colour only (Phase 4b) ==========
+                    % local copies of the active columns, written back after the last parameter
+                    uA      = uCurr(:,act);
+                    xA      = xCurr(:,act);
+                    sigmaA  = sigma(:,act);
+                    logLA   = logLCurr(act);
+                    lpA     = lpCurr(act);
+                    if isMarginal; statsA = statsCurr(:,act); end
+                    if hasJac; logJA = logJCurr(:,act); end
+                    accA    = false(Nvar, numel(lpA), 'like', isRejectRow);
+                    for kp = 1:Nvar
+                        zAll            = randn(1,Nv,'like',uCurr);
+                        uProposed_p     = uA(kp,:) + sigmaA(kp,:).*zAll(act);
+                        if isLinear(kp)
+                            xProposed_p = uProposed_p;
+                        else
+                            [xProposed_p, logJProposed_p] = this.transform_inverse_logjac_fused(uProposed_p, code(kp), lb(kp), ub(kp));
+                        end
+                        isOutofbound    = isRejectRow(kp) & or(xProposed_p<lb(kp), xProposed_p>ub(kp));
+                        xProposed_p     = max(xProposed_p,lb(kp)); xProposed_p = min(xProposed_p,ub(kp));
+                        xProposed       = xA; xProposed(kp,:) = xProposed_p;
+
+                        if isMarginal; [logLProposed, statsProposed] = loglikC{kc}(xProposed); else; logLProposed = loglikC{kc}(xProposed); end
+                        logRatio        = logLProposed - logLA;
+                        if useJac(kp); logRatio = logRatio + logJProposed_p - logJA(kp,:); end
+                        if isHierRow(kp)
+                            uProposedH          = uA(hIdx,:);
+                            uProposedH(hIdx==kp,:) = uProposed_p;
+                            lpProposed          = this.logprior_normal(uProposedH, muG, PG);
+                            logRatio            = logRatio + (lpProposed - lpA);
+                            pH                  = find(hIdx==kp);
+                            dPhi                = this.mrf_local_delta(uProposed_p, uA(kp,:), uCurr(kp,:), ...
+                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef(pH), mrfDelta(pH), mrf.potential);
+                            logRatio            = logRatio - dPhi;
+                        end
+                        rAll                        = rand(1,Nv,'like',logLProposed);
+                        isAccepted_p                = exp(logRatio) > rAll(act);
+                        isAccepted_p(isOutofbound)  = 0;
+                        logLA(isAccepted_p)         = logLProposed(isAccepted_p);
+                        if isMarginal; statsA(:,isAccepted_p) = statsProposed(:,isAccepted_p); end
+                        if isHierRow(kp); lpA(isAccepted_p) = lpProposed(isAccepted_p); end
+                        uA(kp,isAccepted_p)         = uProposed_p(isAccepted_p);
+                        xA(kp,isAccepted_p)         = xProposed_p(isAccepted_p);
+                        if useJac(kp); logJA(kp,isAccepted_p) = logJProposed_p(isAccepted_p); end
+                        accA(kp,:)                  = isAccepted_p;
+                    end
+                    % scatter the active columns back (inactive voxels untouched)
+                    uCurr(:,act)    = uA;
+                    xCurr(:,act)    = xA;
+                    logLCurr(act)   = logLA;
+                    lpCurr(act)     = lpA;
+                    if isMarginal; statsCurr(:,act) = statsA; end
+                    if hasJac; logJCurr(:,act) = logJA; end
+                    isAccepted(:,act) = accA;
+
+                elseif ~isComponent
                     % ========== joint update: all parameters of a voxel together ==========
                     % 1. make a proposal with normal distribution in u space
                     uProposed       = uCurr + sigma.*randn(size(uCurr),'like',uCurr);
@@ -1065,7 +1261,7 @@ classdef mcmc_bayes < mcmc
                 priorSettings = [];
             end
             if isMRF
-                mrfSettings = this.mrf_settings(mrf, hier, Knb, NcolNominal, Ncol, Nedges);
+                mrfSettings = this.mrf_settings(mrf, hier, Knb, NcolNominal, Ncol, Nedges, sfInfo);
                 priorSettings.mrf = mrfSettings;
             else
                 mrfSettings = [];
@@ -1853,7 +2049,8 @@ classdef mcmc_bayes < mcmc
         %   .update                     : 'chromatic' | 'simultaneous' (TEST ONLY)
         %
             mrf = struct('on', false, 'potential', '', 'tau', [], 'W', [], 'Wrule', '', 'huberDelta', [], 'delta', [], ...
-                         'mode', '', 'radius', [], 'connectivity', '', 'edgeWeights', [], 'maxGPUMemory', [], 'update', 'chromatic');
+                         'mode', '', 'radius', [], 'connectivity', '', 'edgeWeights', [], 'maxGPUMemory', [], 'update', 'chromatic', ...
+                         'subsetForward', true);
             update = lower(char(field_or_default(fitting, 'mrfUpdate', 'chromatic')));
             if ~any(strcmp(update, {'chromatic','simultaneous'}))
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.mrfUpdate must be ''chromatic'' or ''simultaneous'' (TEST ONLY).');
@@ -1871,7 +2068,7 @@ classdef mcmc_bayes < mcmc
             if ~isstruct(m) || ~isscalar(m)
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.prior.mrf must be a structure (or true).');
             end
-            valid = {'potential','tau','W','huberDelta','edgeWeights','mode','radius','connectivity','maxGPUMemory'};
+            valid = {'potential','tau','W','huberDelta','edgeWeights','mode','radius','connectivity','maxGPUMemory','subsetForward'};
             bad   = setdiff(fieldnames(m), valid);
             if ~isempty(bad)
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: unknown field(s) in fitting.prior.mrf: %s (valid: %s).', ...
@@ -1951,6 +2148,11 @@ classdef mcmc_bayes < mcmc
             mrf.edgeWeights     = edgeWeights;
             mrf.maxGPUMemory    = field_or_default(m, 'maxGPUMemory', hier.maxGPUMemory);
             mrf.update          = update;
+            subsetForward = field_or_default(m, 'subsetForward', true);
+            if ~((islogical(subsetForward) || isnumeric(subsetForward)) && isscalar(subsetForward) && any(double(subsetForward) == [0 1]))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.subsetForward must be true or false.');
+            end
+            mrf.subsetForward   = logical(subsetForward);
         end
 
         % neighbour offsets [K,3], sorted lexicographically (offset K+1-k = -offset k)
@@ -2129,6 +2331,8 @@ classdef mcmc_bayes < mcmc
         % error if the coupled MRF run does not fit on the GPU
         function check_mrf_memory(Nm, Nv, Nvar, K, mrf)
             need = mcmc_bayes.estimate_mrf_memory(Nm, Nv, Nvar, K);
+            % Phase 4b: per-colour copies of y and weights
+            if isfield(mrf,'subsetForward') && mrf.subsetForward && strcmp(mrf.update, 'chromatic'); need = need + 8 * Nm * Nv; end
             if isempty(mrf.maxGPUMemory)
                 dev   = gpuDevice;
                 avail = dev.AvailableMemory;
@@ -2145,13 +2349,18 @@ classdef mcmc_bayes < mcmc
         end
 
         % resolved MRF settings for out.settings.mrf
-        function s = mrf_settings(mrf, hier, K, NcolNominal, NcolUsed, Nedges)
+        function s = mrf_settings(mrf, hier, K, NcolNominal, NcolUsed, Nedges, sfInfo)
             switch mrf.potential
                 case 'l1';        rho = '|x|';
                 case 'huber';     rho = 'x^2/(2 delta) for |x| <= delta, |x| - delta/2 otherwise (Huber/delta)';
                 case 'quadratic'; rho = 'x^2/2';
             end
             if isempty(mrf.edgeWeights); ew = 'uniform (1)'; else; ew = 'user (fixed, symmetric)'; end
+            if sfInfo.used
+                cost = 'forward model on the active colour only (Phase 4b): ~1 full forward evaluation per sweep (x Nvar componentwise)';
+            else
+                cost = 'forward model evaluated on all voxels per colour step: Ncolours forward evaluations per sweep (x Nvar componentwise)';
+            end
             if strcmp(mrf.update, 'simultaneous')
                 upd = 'simultaneous: TEST ONLY negative control, targets the WRONG distribution';
             else
@@ -2176,7 +2385,87 @@ classdef mcmc_bayes < mcmc
                 'Nedges',       Nedges, ...
                 'edgeWeights',  ew, ...
                 'update',       upd, ...
-                'cost',         'forward model evaluated on all voxels per colour step: Ncolours forward evaluations per sweep (x Nvar componentwise)');
+                'cost',         cost, ...
+                'subsetForward', sfInfo);
+        end
+
+        % Phase 4b safety check: FWDfunc on each colour subset vs the columns of the full evaluation
+        function info = check_subset_forward(FWDfunc, fwdArgs, parsFull, parsSub, actIdx, Nv, tol)
+        % Input
+        % -----
+        % FWDfunc   : forward model handle
+        % fwdArgs   : cell, varargin of FWDfunc (passed unchanged)
+        % parsFull  : parameter structure of all Nv voxels (injected values included)
+        % parsSub   : cell, parameter structure of the active voxels of every colour
+        % actIdx    : cell, host indices (1..Nv) of the active voxels of every colour
+        % Nv        : # voxels
+        % tol       : relative tolerance, |gS - gF(:,act)| <= tol * max_rows |gF(:,v)| per element
+        % Output
+        % ------
+        % info      : structure .requested (true), .used, .reason, .tolerance, .maxRelDiff, .bitwise
+        %
+            info = struct('requested', true, 'used', false, 'reason', '', 'tolerance', tol, 'maxRelDiff', [], 'bitwise', []);
+            try
+                gF = FWDfunc(parsFull, fwdArgs{:});
+            catch err
+                info.reason = sprintf('the forward model errors on all %d voxels (%s)', Nv, err.message);
+                return
+            end
+            if ~ismatrix(gF) || size(gF, 2) ~= Nv
+                info.reason = sprintf('the full forward output has size %s, expected [Nm, %d]', mat2str(size(gF)), Nv);
+                return
+            end
+            gF      = double(gather(gF));
+            maxRel  = 0; bitwise = true;
+            for kc = 1:numel(parsSub)
+                act = actIdx{kc};
+                try
+                    gS = FWDfunc(parsSub{kc}, fwdArgs{:});
+                catch err
+                    info.reason = sprintf(['the forward model errors on the colour-%d subset of %d voxels (%s); a varargin ' ...
+                                           'entry with a voxel dimension or a fixed voxel count'], kc, numel(act), err.message);
+                    return
+                end
+                ref = gF(:, act);
+                if ~isequal(size(gS), size(ref))
+                    info.reason = sprintf(['the forward output on the colour-%d subset has size %s, expected %s; a varargin ' ...
+                                           'entry with a voxel dimension or a fixed voxel count'], kc, mat2str(size(gS)), mat2str(size(ref)));
+                    return
+                end
+                [rel, same] = mcmc_bayes.subset_rel_diff(double(gather(gS)), ref);
+                maxRel  = max(maxRel, rel);
+                bitwise = bitwise && same;
+                if ~(rel <= tol)
+                    info.maxRelDiff = maxRel; info.bitwise = false;
+                    info.reason = sprintf(['the forward output on the colour-%d subset differs from the full evaluation ' ...
+                                           '(max relative difference %.3g > %.3g): the model is not column-separable, e.g. a ' ...
+                                           'varargin entry with a voxel dimension'], kc, rel, tol);
+                    return
+                end
+            end
+            info.used       = true;
+            info.maxRelDiff = maxRel;
+            info.bitwise    = bitwise;
+            if bitwise
+                info.reason = 'subset outputs equal the columns of the full evaluation (bitwise) at the starting state';
+            else
+                info.reason = sprintf('subset outputs match the full evaluation at the starting state within %.3g (max %.3g)', tol, maxRel);
+            end
+        end
+
+        % largest element difference relative to the column scale max_rows |ref(:,v)| (finite
+        % entries); equal values (incl. Inf and NaN at the same positions) count as 0, a one-sided
+        % NaN/Inf as Inf. same: true if a and b are identical (NaN == NaN)
+        function [rel, same] = subset_rel_diff(a, b)
+            same    = isequaln(a, b);
+            if same; rel = 0; return; end
+            bf      = b; bf(~isfinite(bf)) = 0;
+            scale   = max(max(abs(bf), [], 1), realmin);
+            dif     = abs(a - b);
+            dif((a == b) | (isnan(a) & isnan(b))) = 0;
+            dif(isnan(dif)) = Inf;
+            rel     = max(dif ./ scale, [], 'all');
+            if isempty(rel); rel = 0; end
         end
 
         % largest |a - b| over all elements (equal infinities count as 0, one-sided NaN/Inf as Inf)

@@ -39,7 +39,8 @@ for kc = 1:numel(cfgs)
     zStar = sqrt(2)*erfcinv(0.01/R.N);
     frac  = mean(abs(R.z) > 1.96); zmax = max(abs(R.z));
     isPass(kc) = frac <= 0.10 && zmax <= zStar && R.zFlatMedian >= 3 && R.scalingCheck <= 1e-10;
-    fprintf('[%d] %s: Nv %d, edges %d, colours %d, run %.0f s\n', kc, c{6}, R.Nv, R.Nedges, R.settings.NcoloursUsed, R.tRun);
+    fprintf('[%d] %s: Nv %d, edges %d, colours %d, run %.0f s, subsetForward used %d\n', kc, c{6}, R.Nv, R.Nedges, R.settings.NcoloursUsed, R.tRun, ...
+        isfield(R.settings, 'subsetForward') && R.settings.subsetForward.used);
     fprintf('    mean diagonal precision: local %.2f, MRF %.2f | exact neighbour correlation (median) %.3f | scaling check %.1e\n', ...
         R.priorVsMrfDiag(1), R.priorVsMrfDiag(2), R.nbrCorrExact, R.scalingCheck);
     for q = 1:numel(R.cat)
