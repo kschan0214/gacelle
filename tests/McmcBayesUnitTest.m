@@ -1,7 +1,6 @@
 classdef McmcBayesUnitTest < matlab.unittest.TestCase
     % Unit tests for the EXPERIMENTAL mcmc_bayes subclass.
-    % Phase 0: legacy-option detection (mcmc_bayes.isLegacy) and the
-    % not-implemented guard for Phase 2+ options.
+    % Phase 0: legacy-option detection (mcmc_bayes.isLegacy).
     % Phase 1: parameter transforms, per-parameter parsing, R-hat/ESS and
     % a small GPU run of the new sampling path.
     % Phase 2: marginal likelihoods vs numerical integration, weighted form,
@@ -10,8 +9,13 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     % NIW posterior parameters vs a closed form, Gibbs-block stationary moments
     % (NIW and Jeffreys-half), hierarchical option validation, log-prior cache
     % consistency and GPU runs of the hierarchical prior.
+    % Phase 4: MRF neighbour tables and colouring (both modes, several radii,
+    % masks with holes and volume edges), edge-weight validation, T4.1 (local
+    % vs global MRF energy for every potential), MRF option errors, GPU runs
+    % of the chromatic sweep and of run_two_stage.
     %
-    % All tests except testNewPath*, testFusedKernel* and testRecoverNuisance*
+    % All tests except testNewPath*, testFusedKernel*, testRecoverNuisance*, testHierarchicalCache*,
+    % testMrfRuns and testRunTwoStage
     % are pure math and need no GPU.
     %
     % Tolerances (stated before running; see each test):
@@ -55,6 +59,14 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     E[Sigma] = S/(n-2d-2))
     %   log-prior / log-likelihood / log-Jacobian caches (GPU, checkCache): max |cached - fresh| <= 1e-5
     %     (0 expected: identical deterministic computation)
+    %   Phase 4:
+    %   neighbour table vs brute-force enumeration of all masked voxel pairs (Chebyshev distance <= r,
+    %     Manhattan distance 1 for 'face', same slice for '2d'): exact; symmetry and proper colouring:
+    %     exact; colour counts 2 / (r+1)^3 / (r+1)^2 on a 9^3 box: exact
+    %   T4.1 local vs global MRF energy (single, CPU and GPU): |dPhi_local - dPhi_bruteforce| <=
+    %     1e-5 * S + 1e-6, S = sum of |terms| of the local difference (double brute force over all edges)
+    %   MRF GPU runs (checkCache): voxels outside the active colour never move (exactly 0);
+    %     caches <= 1e-5 as above
     %
     % Kwok-Shing Chan @ MGH
 
@@ -74,11 +86,18 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             'fixedParams',              {{'fixedParams', struct('noise', 0.1)}} ...
             )
 
-        % Phase 4 options, still not implemented
-        phase4Option = struct( ...
-            'mrf',                      {{'prior', struct('mrf', struct())}}, ...
-            'mrfWithHierarchical',      {{'prior', struct('hierarchical', struct(), 'mrf', struct('tau', 1))}} ...
+        % MRF geometry configurations {mode, radius, connectivity, K}
+        mrfGeometry = struct( ...
+            'face3d',   {{'3d', 1, 'face', 6}}, ...
+            'full3dR1', {{'3d', 1, 'full', 26}}, ...
+            'full3dR2', {{'3d', 2, 'full', 124}}, ...
+            'face2d',   {{'2d', 1, 'face', 4}}, ...
+            'full2dR1', {{'2d', 1, 'full', 8}}, ...
+            'full2dR2', {{'2d', 2, 'full', 24}}, ...
+            'full2dR3', {{'2d', 3, 'full', 48}} ...
             )
+
+        mrfPotential = {'l1','huber','quadratic'}
 
         hyperprior = {'niw','jeffreys_half'}
 
@@ -136,20 +155,6 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             [tf, nonDefault] = mcmc_bayes.isLegacy(fitting);
             testCase.verifyFalse(tf);
             testCase.verifyEqual(nonDefault, {name});
-        end
-
-        function testPhase4OptionErrorsNotImplemented(testCase, phase4Option)
-            % the guard fires before any GPU code, so no GPU is needed
-            fitting = struct();
-            fitting.(phase4Option{1}) = phase4Option{2};
-            testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], fitting, []), ...
-                'mcmc_bayes:notImplemented');
-
-            % also together with Phase 1 options
-            fitting.parameterTransform = 'sigmoid';
-            fitting.updateScheme       = 'componentwise';
-            testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], fitting, []), ...
-                'mcmc_bayes:notImplemented');
         end
 
         function testEnsembleErrorsOnNewPath(testCase)
@@ -912,6 +917,243 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             out = mcmc_bayes().optimisation(y, mask, w, pars0, fFixed, @obj.FWD, 'mcmc', fFixed);
             testCase.verifyEqual(out.settings.prior.hierarchical.Sigma, SigmaHat);
         end
+
+        %% Phase 4: MRF geometry (pure, no GPU)
+        function testMrfNeighboursAndColouring(testCase, mrfGeometry)
+            [mode, r, conn, K] = mrfGeometry{:};
+            % masks: full box (volume edges) and a box with random holes (mask edges)
+            rng(400);
+            masks = {true(7,6,5), rand(8,7,5) > 0.3, true(9,1,1), true(5,6)};
+            for km = 1:numel(masks)
+                mask     = masks{km};
+                mask_idx = find(mask);
+                dims     = size(mask);
+                nbr      = mcmc_bayes.build_neighbours(mask_idx, dims, mode, r, conn);
+                testCase.verifyClass(nbr, 'int32');
+                testCase.verifySize(nbr, [K numel(mask_idx)]);
+                % symmetry (also asserted inside), checked independently here
+                [kk, v] = find(nbr > 0);
+                n = double(nbr(sub2ind(size(nbr), kk, v)));
+                testCase.verifyEqual(double(nbr(sub2ind(size(nbr), K+1-kk, n))), v, sprintf('mask %d symmetry', km));
+                % neighbour sets vs brute-force enumeration of all masked pairs
+                d3 = [dims ones(1, 3-numel(dims))];
+                [i, j, l] = ind2sub(d3, mask_idx);
+                P  = [i j l];
+                D  = abs(permute(P, [1 3 2]) - permute(P, [3 1 2]));        % [Nv, Nv, 3]
+                if strcmp(conn, 'face'); A = sum(D, 3) == 1; else; A = max(D, [], 3) <= r & max(D, [], 3) > 0; end
+                if strcmp(mode, '2d'); A = A & D(:,:,3) == 0; end
+                B  = false(numel(mask_idx));
+                B(sub2ind(size(B), v, n)) = true;
+                testCase.verifyEqual(B, A, sprintf('mask %d neighbour sets', km));
+                % proper colouring, colours in 1..Nc
+                [col, Nc] = mcmc_bayes.build_colours(mask_idx, dims, mode, r, conn, nbr);
+                testCase.verifySize(col, [1 numel(mask_idx)]);
+                testCase.verifyTrue(all(col >= 1 & col <= Nc));
+                testCase.verifyFalse(any(col(v(:).') == col(n(:).')), sprintf('mask %d colouring', km));
+            end
+            % colour counts: 2 ('face'), (r+1)^3 ('3d') or (r+1)^2 ('2d'); all used on a large box
+            mask = true(9,9,9);
+            [col, Nc] = mcmc_bayes.build_colours(find(mask), size(mask), mode, r, conn);
+            if strcmp(conn, 'face'); NcRef = 2; elseif strcmp(mode, '3d'); NcRef = (r+1)^3; else; NcRef = (r+1)^2; end
+            testCase.verifyEqual(Nc, NcRef);
+            testCase.verifyEqual(numel(unique(col)), NcRef);
+            % an interior voxel has all K neighbours
+            nbr = mcmc_bayes.build_neighbours(find(mask), size(mask), mode, r, conn);
+            testCase.verifyEqual(nnz(nbr(:, sub2ind(size(mask), 5, 5, 5))), K);
+            % an improper colouring is detected
+            testCase.verifyError(@() mcmc_bayes.check_colouring(nbr, ones(1, numel(mask))), 'mcmc_bayes:mrfColouring');
+        end
+
+        function testMrfNeighbourAsymmetryDetected(testCase)
+            mask = true(4,4,2);
+            nbr  = mcmc_bayes.build_neighbours(find(mask), size(mask), '3d', 1, 'face');
+            k    = find(nbr(:,1) > 0, 1);
+            nbr(k,1) = 0;                                   % break one direction of an edge
+            testCase.verifyError(@() mcmc_bayes.check_neighbour_symmetry(nbr), 'mcmc_bayes:mrfNeighbours');
+        end
+
+        function testMrfEdgeWeights(testCase)
+            rng(401);
+            mask = rand(6,5,3) > 0.25;
+            nbr  = mcmc_bayes.build_neighbours(find(mask), size(mask), '3d', 1, 'full');
+            w    = McmcBayesUnitTest.symmetricEdgeWeights(nbr);
+            w(nbr == 0) = NaN;                              % entries of absent neighbours are ignored
+            wc   = mcmc_bayes.check_edge_weights(w, nbr);
+            testCase.verifyEqual(wc(nbr == 0), zeros(nnz(nbr == 0), 1));
+            testCase.verifyEqual(wc(nbr > 0), w(nbr > 0));
+            % wrong size, negative, non-finite, asymmetric
+            testCase.verifyError(@() mcmc_bayes.check_edge_weights(w(1:end-1,:), nbr), 'mcmc_bayes:invalidEdgeWeights');
+            [k, v] = find(nbr > 0, 1);
+            w2 = w; w2(k,v) = -1;
+            testCase.verifyError(@() mcmc_bayes.check_edge_weights(w2, nbr), 'mcmc_bayes:invalidEdgeWeights');
+            w2 = w; w2(k,v) = Inf;
+            testCase.verifyError(@() mcmc_bayes.check_edge_weights(w2, nbr), 'mcmc_bayes:invalidEdgeWeights');
+            w2 = w; w2(k,v) = w2(k,v) + 0.1;
+            testCase.verifyError(@() mcmc_bayes.check_edge_weights(w2, nbr), 'mcmc_bayes:invalidEdgeWeights');
+        end
+
+        %% Phase 4: T4.1 local vs global MRF energy (CPU single; GPU if available)
+        function testMrfLocalMatchesGlobal(testCase, mrfPotential)
+            % Tolerance (stated before running): for every perturbation,
+            %   |dPhi_local - dPhi_bruteforce| <= 1e-5 * S + 1e-6,
+            % with dPhi_local from mcmc_bayes.mrf_local_delta in single precision,
+            % dPhi_bruteforce = Phi(u_new) - Phi(u_old) over all edges (each once) in double, and
+            % S the sum of |terms| entering the local difference (scale of the single-precision sums).
+            geoms = {{'3d',1,'face'}, {'3d',1,'full'}, {'2d',2,'full'}, {'2d',1,'face'}, {'3d',2,'full'}};
+            useGPU = canUseGPU();
+            for kg = 1:numel(geoms)
+                [mode, r, conn] = geoms{kg}{:};
+                rng(410 + kg);
+                mask = rand(7,6,4) > 0.3;
+                mask_idx = find(mask); Nv = numel(mask_idx);
+                nbr  = mcmc_bayes.build_neighbours(mask_idx, size(mask), mode, r, conn);
+                col  = mcmc_bayes.build_colours(mask_idx, size(mask), mode, r, conn, nbr);
+                w    = McmcBayesUnitTest.symmetricEdgeWeights(nbr);
+                K    = size(nbr, 1);
+                self = repmat(int32(1:Nv), K, 1); nbrS = nbr; nbrS(nbr == 0) = self(nbr == 0);
+                d    = 2; W = [0.7; 1.3]; tau = 0.8; delta = [0.3; 0.6];
+                u    = randn(d, Nv);
+                phi  = @(uu) McmcBayesUnitTest.bruteForcePhi(uu, nbr, w, W, tau, mrfPotential, delta);
+                % (a) single-voxel perturbations, all parameters (joint) and one parameter (componentwise)
+                for t = 1:15
+                    i = randi(Nv);
+                    uN = u; uN(:,i) = uN(:,i) + 0.7*randn(d,1);
+                    if t == 1; uN(:,i) = u(:,i) + delta; end            % exactly at the Huber threshold
+                    ref = phi(uN) - phi(u);
+                    loc = mcmc_bayes.mrf_local_delta(single(uN(:,i)), single(u(:,i)), single(u), nbrS(:,i), single(w(:,i)), ...
+                                                     single(W/tau), single(delta), mrfPotential);
+                    S   = McmcBayesUnitTest.localScale(uN(:,i), u(:,i), u, nbrS(:,i), w(:,i), W/tau, delta, mrfPotential);
+                    testCase.verifyLessThanOrEqual(abs(double(loc) - ref), 1e-5*S + 1e-6, sprintf('%s %s r%d joint', mrfPotential, mode, r));
+                    p   = randi(d);
+                    uN  = u; uN(p,i) = uN(p,i) + 0.7*randn;
+                    ref = phi(uN) - phi(u);
+                    loc = mcmc_bayes.mrf_local_delta(single(uN(p,i)), single(u(p,i)), single(u(p,:)), nbrS(:,i), single(w(:,i)), ...
+                                                     single(W(p)/tau), single(delta(p)), mrfPotential);
+                    testCase.verifyLessThanOrEqual(abs(double(loc) - ref), 1e-5*S + 1e-6, sprintf('%s %s r%d componentwise', mrfPotential, mode, r));
+                end
+                % (b) a whole colour class moved at once: dPhi = sum of the local differences
+                for c = unique(col)
+                    act = find(col == c);
+                    uN  = u; uN(:,act) = uN(:,act) + 0.5*randn(d, numel(act));
+                    ref = phi(uN) - phi(u);
+                    loc = mcmc_bayes.mrf_local_delta(single(uN(:,act)), single(u(:,act)), single(u), nbrS(:,act), single(w(:,act)), ...
+                                                     single(W/tau), single(delta), mrfPotential);
+                    S   = McmcBayesUnitTest.localScale(uN(:,act), u(:,act), u, nbrS(:,act), w(:,act), W/tau, delta, mrfPotential);
+                    testCase.verifyLessThanOrEqual(abs(sum(double(loc)) - ref), 1e-5*S + 1e-6, sprintf('%s %s r%d colour %d', mrfPotential, mode, r, c));
+                    if useGPU
+                        locG = mcmc_bayes.mrf_local_delta(gpuArray(single(uN(:,act))), gpuArray(single(u(:,act))), gpuArray(single(u)), ...
+                                    gpuArray(uint32(nbrS(:,act))), gpuArray(single(w(:,act))), gpuArray(single(W/tau)), gpuArray(single(delta)), mrfPotential);
+                        testCase.verifyLessThanOrEqual(abs(sum(double(gather(locG))) - ref), 1e-5*S + 1e-6, 'GPU');
+                    end
+                end
+            end
+        end
+
+        %% Phase 4: MRF option errors (pure, no GPU)
+        function testMrfOptionErrors(testCase)
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 10]; f.xStepSize = [0.2; 0.2; 0.01];
+            f.algorithm = 'MH'; f.fixedParams = struct('noise', 1);
+            fixedH = struct('fixed', true, 'mu', [0 0], 'Sigma', [4 0; 0 0.25]);
+            run = @(ff) mcmc_bayes().optimisation([], [], [], [], ff, []);
+            % mrf without hierarchical
+            g = f; g.prior = struct('mrf', struct());
+            testCase.verifyError(@() run(g), 'mcmc_bayes:mrfRequiresHierarchical');
+            % mrf with free hyperparameters
+            g = f; g.prior = struct('hierarchical', struct(), 'mrf', struct('tau', 1));
+            testCase.verifyError(@() run(g), 'mcmc_bayes:mrfFreeHyperparameters');
+            g.prior.mrf = true;
+            testCase.verifyError(@() run(g), 'mcmc_bayes:mrfFreeHyperparameters');
+            % invalid MRF options
+            bad = {struct('potential','tv'), struct('tau',0), struct('tau',[1 2]), struct('W',[1 -1]), struct('W',[1 1 1]), ...
+                   struct('mode','1d'), struct('radius',1.5), struct('radius',2,'connectivity','face'), ...
+                   struct('connectivity','edge'), struct('huberDelta',0), struct('beta',1)};
+            for k = 1:numel(bad)
+                g = f; g.prior = struct('hierarchical', fixedH, 'mrf', bad{k});
+                testCase.verifyError(@() run(g), 'mcmc_bayes:invalidMrf', sprintf('case %d', k));
+            end
+            % test-only simultaneous update needs an MRF; unknown update name
+            g = f; g.prior = struct('hierarchical', fixedH); g.mrfUpdate = 'simultaneous';
+            testCase.verifyError(@() run(g), 'mcmc_bayes:invalidMrf');
+            g.prior.mrf = struct(); g.mrfUpdate = 'jacobi';
+            testCase.verifyError(@() run(g), 'mcmc_bayes:invalidMrf');
+            % run_two_stage needs a free hierarchical prior and an MRF
+            g = f; g.prior = struct('hierarchical', fixedH, 'mrf', struct());
+            testCase.verifyError(@() mcmc_bayes().run_two_stage([], [], [], [], g, []), 'mcmc_bayes:invalidPrior');
+            g = f; g.prior = struct('hierarchical', struct());
+            testCase.verifyError(@() mcmc_bayes().run_two_stage([], [], [], [], g, []), 'mcmc_bayes:invalidPrior');
+
+            % resolved defaults: W = 1/sqrt(diag(Sigma)), delta = huberDelta*sqrt(diag(Sigma)), connectivity
+            g = f; g.prior = struct('hierarchical', fixedH, 'mrf', struct());
+            fs = mcmc_bayes.setup_likelihood(mcmc_bayes.check_set_default_bayes(g));
+            m  = mcmc_bayes.setup_mrf(mcmc_bayes.check_set_default_bayes(fs), mcmc_bayes.setup_hierarchical(fs));
+            testCase.verifyEqual(m.W, [0.5; 2]);
+            testCase.verifyEqual(m.delta, [2; 0.5]);
+            testCase.verifyEqual({m.potential, m.mode, m.connectivity, m.radius, m.tau, m.update}, {'l1','3d','face',1,1,'chromatic'});
+            g.prior.mrf = struct('mode','2d','radius',2,'huberDelta',0.5);
+            m  = mcmc_bayes.setup_mrf(g, mcmc_bayes.setup_hierarchical(mcmc_bayes.setup_likelihood(g)));
+            testCase.verifyEqual(m.connectivity, 'full');
+            testCase.verifyEqual(m.delta, [1; 0.25]);
+        end
+
+        %% Phase 4: GPU runs of the MRF prior
+        function testMrfRuns(testCase, updateScheme)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.linGaussGrid([5 4 3], 2);
+            f.updateScheme = updateScheme; f.checkCache = true; f.repetition = 2; f.overdisp = 0.01;
+            f.adaptStepSize = true; f.adaptInterval = 20;
+            cfgs = {struct('potential','l1'), struct('potential','huber','mode','2d','radius',2), ...
+                    struct('potential','quadratic','mode','3d','radius',1,'connectivity','full')};
+            for k = 1:numel(cfgs)
+                f.prior.mrf = cfgs{k};
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.inactiveMoved, 0, 'a voxel outside the active colour moved');
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5);
+                s   = out.settings.mrf;
+                nbr = mcmc_bayes.build_neighbours(find(mask), size(mask), s.mode, s.radius, s.connectivity);
+                testCase.verifyEqual(s.Nedges, nnz(nbr)/2);
+                testCase.verifyEqual(s.Kneighbours, size(nbr,1));
+                testCase.verifyEqual(s.W, 1./sqrt(diag(f.prior.hierarchical.Sigma)));
+                testCase.verifyEqual(out.settings.prior.mrf, s);
+                testCase.verifyTrue(all(isfinite(out.mean.u1(:))));
+                acc = reshape(out.diagnostics.acceptance, numel(mask), []);
+                testCase.verifyTrue(all(acc(mask(:),:) > 0, 'all'));
+            end
+            testCase.verifyEqual(out.settings.mrf.Ncolours, 8);
+            % test-only simultaneous update runs and is labelled
+            f.mrfUpdate = 'simultaneous'; f.prior.mrf = struct();
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+            testCase.verifyTrue(contains(out.settings.mrf.update, 'TEST ONLY'));
+            testCase.verifyEqual(out.settings.mrf.NcoloursUsed, 1);
+            % memory guard
+            f.mrfUpdate = 'chromatic'; f.prior.mrf = struct('maxGPUMemory', 1);
+            testCase.verifyError(@() mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd), 'mcmc_bayes:mrfMemory');
+        end
+
+        function testRunTwoStage(testCase)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.linGaussGrid([6 5 3], 2);
+            f.prior.hierarchical = struct();                       % free (stage 1)
+            f.prior.mrf = struct('potential','l1','tau',2);
+            out = mcmc_bayes().run_two_stage(yy, mask, [], x0, f, fwd);
+            eb  = out.settings.empiricalBayes;
+            testCase.verifyTrue(contains(eb.scheme, 'NOT the full joint posterior'));
+            testCase.verifyEqual(eb.muHat, out.stage1.hyper.mean.mu);
+            testCase.verifyEqual(eb.SigmaHat, out.stage1.hyper.mean.Sigma);
+            testCase.verifyTrue(out.hyper.fixed);
+            testCase.verifyEqual(out.hyper.mean.Sigma, eb.SigmaHat);
+            testCase.verifyEqual(out.settings.mrf.W, 1./sqrt(diag(eb.SigmaHat)));
+            testCase.verifyEqual(eb.Nstage1, nnz(mask));
+            testCase.verifyEqual(size(out.posterior.u1, 1), nnz(mask));
+            testCase.verifyTrue(all(isfinite(out.mean.u2(:))));
+            % stage 1 on a subset
+            f.prior.hierarchical = struct('subsetFraction', 0.5);
+            rng(5);
+            out = mcmc_bayes().run_two_stage(yy, mask, [], x0, f, fwd);
+            testCase.verifyEqual(out.settings.empiricalBayes.Nstage1, ceil(0.5*nnz(mask)));
+            testCase.verifyEqual(numel(out.stage1.voxelIndex), ceil(0.5*nnz(mask)));
+            testCase.verifyEqual(size(out.posterior.u1, 1), nnz(mask));
+        end
     end
 
     methods (Static)
@@ -1025,6 +1267,76 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
         function lp = logNIW(mu, Sigma, m, k, Psi, nu)
             d  = numel(mu); r = mu - m;
             lp = -0.5*log(det(Sigma)) - 0.5*k*(r.'/Sigma)*r - (nu+d+1)/2*log(det(Sigma)) - 0.5*trace(Psi/Sigma);
+        end
+
+        % linear Gaussian toy on a 3D grid with holes, fixed hierarchical prior (MRF tests)
+        function [yy, mask, x0, f, fwd] = linGaussGrid(dims, d)
+            rng(42); m = 5; s = 0.5;
+            mask = rand(dims) > 0.2;
+            Nv  = nnz(mask);
+            A   = randn(m, d);
+            mu  = 0.5*ones(d,1); Sigma = 0.3*eye(d) + 0.05;
+            u   = mu + chol(Sigma,'lower')*randn(d, Nv);
+            y   = zeros(numel(mask), m);
+            y(mask(:), :) = (A*u + s*randn(m, Nv)).';
+            yy  = reshape(y, [dims m]);
+            f.modelParams = [arrayfun(@(k) sprintf('u%d',k), (1:d).', 'UniformOutput', false); {'noise'}];
+            f.lb = [-Inf(d,1); 0]; f.ub = [Inf(d,1); 10]; f.xStepSize = [0.2*ones(d,1); 0.01];
+            f.algorithm = 'MH'; f.iteration = 200; f.burnin = 50; f.thinning = 5; f.metric = {'mean'};
+            f.fixedParams = struct('noise', s);
+            f.prior.hierarchical = struct('fixed', true, 'mu', mu, 'Sigma', Sigma);
+            for k = 1:d; x0.(sprintf('u%d',k)) = zeros(dims); end
+            fwd = @(p) McmcBayesUnitTest.linGaussFwd(p, A);
+        end
+
+        % symmetric positive edge weights in the layout of nbr (0 for absent neighbours)
+        function w = symmetricEdgeWeights(nbr)
+            [K, Nv] = size(nbr);
+            w = zeros(K, Nv);
+            [k, v] = find(nbr > 0);
+            n = double(nbr(sub2ind([K Nv], k, v)));
+            a = min(v, n); b = max(v, n);
+            w(sub2ind([K Nv], k, v)) = 0.5 + mod(a*7919 + b*104729, 97)/97;   % depends on the unordered pair only
+        end
+
+        % reference potential (independent of mcmc_bayes.mrf_rho)
+        function r = rhoRef(x, potential, delta)
+            switch potential
+                case 'l1';        r = abs(x);
+                case 'quadratic'; r = x.^2/2;
+                case 'huber'
+                    if abs(x) <= delta; r = x^2/(2*delta); else; r = abs(x) - delta/2; end
+            end
+        end
+
+        % brute-force Phi_MRF over all edges, each counted once (double, loops)
+        function phi = bruteForcePhi(u, nbr, w, W, tau, potential, delta)
+            phi = 0;
+            [K, Nv] = size(nbr);
+            for v = 1:Nv
+                for k = 1:K
+                    n = double(nbr(k,v));
+                    if n > v
+                        for p = 1:size(u,1)
+                            phi = phi + W(p)/tau * w(k,v) * McmcBayesUnitTest.rhoRef(u(p,v) - u(p,n), potential, delta(p));
+                        end
+                    end
+                end
+            end
+        end
+
+        % sum of |terms| entering the local differences (scale for the single-precision tolerance)
+        function S = localScale(uNewA, uOldA, uAll, nbrA, wA, coef, delta, potential)
+            S = 0;
+            for c = 1:size(nbrA, 2)
+                for k = 1:size(nbrA, 1)
+                    for p = 1:size(uNewA, 1)
+                        un = uAll(p, nbrA(k,c));
+                        S  = S + coef(p) * wA(k,c) * (McmcBayesUnitTest.rhoRef(uNewA(p,c) - un, potential, delta(p)) + ...
+                                                     McmcBayesUnitTest.rhoRef(uOldA(p,c) - un, potential, delta(p)));
+                    end
+                end
+            end
         end
 
         function fitting = explicitDefaults()

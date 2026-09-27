@@ -61,6 +61,30 @@ Phase 3 scripts (hierarchical Normal prior on u; GPU, minutes to hours):
 
 `MCMC_BAYES_SBC_R` / `MCMC_BAYES_SBC_NV` override the SBC sizes for pilot runs.
 
+Phase 4 scripts (MRF prior with chromatic updates; GPU):
+
+- `test_T4_2_gaussian_mrf_exact.m`: quadratic (Gaussian) MRF on the linear
+  Gaussian toy (8 x 8 x 4 grid with holes, d = 2, known noise, fixed mu/Sigma,
+  symmetric edge weights); sampler means, marginal variances, within-voxel and
+  neighbour covariances vs the exact sparse-precision posterior, '3d' face and
+  '2d' r = 2 at moderate/strong/very strong tau (`gmrf_exact_suite.m`,
+  `gmrf_exact_run.m`).
+- `test_T4_3_negative_control.m`: T4.2 with the TEST ONLY
+  `fitting.mrfUpdate = 'simultaneous'`; must fail the T4.2 criterion in every
+  strong configuration.
+- `test_T4_4_sbc_gaussian_mrf.m`: SBC with exact prior draws by sparse Cholesky
+  of the Gaussian MRF prior precision; 1000 replicates stacked in one call per
+  mode; power printed.
+- `test_T4_5_mixing_vs_tau.m`: report only; R-hat, ESS (per iteration and per
+  second) and acceptance vs tau (L1) on a small IVIM phantom
+  (`ivim_mrf_phantom.m`).
+- `test_T4_6_two_stage_smoke.m`: optional end-to-end smoke run of
+  `mcmc_bayes.run_two_stage` on the IVIM phantom (not a benchmark).
+
+Chains are run in parallel as copies of the volume stacked along dim 3 and
+separated by an empty slice, so that no MRF edge connects two copies.
+`MCMC_BAYES_T4_ITER` overrides the iterations of T4.2, T4.3 and T4.5 (pilots).
+
 Shared helpers:
 
 - `lingauss_fwd.m`: linear toy forward model `s = A*[u1;...;ud]`.

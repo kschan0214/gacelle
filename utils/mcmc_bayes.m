@@ -37,7 +37,24 @@ classdef mcmc_bayes < mcmc
 %           .subsetFraction : 1             fraction of voxels for stage 1 (estimate_hyper_subset only)
 %           .maxGPUMemory   : []            bytes available for the coupled free-hyperparameter run,
 %                                           [] -> gpuDevice().AvailableMemory
-%       .mrf            : []            MRF prior (Phase 4, not implemented yet)
+%       .mrf            : []            MRF prior on the hierarchical parameters (Phase 4), a structure
+%                                       (struct() or true for all defaults) with the fields below.
+%                                       Requires .hierarchical with fixed = true (use run_two_stage
+%                                       for the free-hyperparameter case)
+%           .potential      : 'l1'          'l1' | 'huber' | 'quadratic'
+%           .tau            : 1             temperature, > 0 (coupling strength 1/tau)
+%           .W              : []            [d,1] per-parameter weights W_p > 0, [] -> 1./sqrt(diag(Sigma))
+%                                           of the fixed Sigma (fixed for the whole run)
+%           .huberDelta     : 1             Huber threshold in units of sqrt(Sigma_pp): delta_p =
+%                                           huberDelta * sqrt(Sigma_pp) (scalar or [d,1]; 'huber' only)
+%           .edgeWeights    : []            [K,Nv] fixed symmetric edge weights w_ij >= 0 in the layout of
+%                                           build_neighbours (entries of absent neighbours ignored), [] -> 1
+%           .mode           : '3d'          '3d' | '2d' (in-plane only: dims 1-2 of the same slice)
+%           .radius         : 1             neighbourhood radius r (positive integer)
+%           .connectivity   : []            'face' (r = 1 only) | 'full' (cube/square of radius r),
+%                                           [] -> 'face' for '3d' with r = 1, else 'full'
+%           .maxGPUMemory   : []            bytes for the memory guard, [] -> prior.hierarchical.maxGPUMemory,
+%                                           else gpuDevice().AvailableMemory
 %
 % Test-only options (not part of the user interface)
 %   .forceNewPath       : false         run the new sampling loop even if all new options are at their
@@ -49,7 +66,14 @@ classdef mcmc_bayes < mcmc
 %                                       they are not in the output. Used for 'known noise' in T3.1.
 %   .checkCache         : false         after every sweep, recompute the log-likelihood, log-prior and
 %                                       log-Jacobian of the current state from scratch and record the
-%                                       largest difference to the cached values (diagnostics.cacheCheck)
+%                                       largest difference to the cached values (diagnostics.cacheCheck);
+%                                       with the MRF also the largest change of any voxel outside the
+%                                       active colour during a colour step (cacheCheck.inactiveMoved, must be 0)
+%   .mrfUpdate          : 'chromatic'   *** TEST ONLY *** 'simultaneous' proposes and accepts ALL voxels
+%                                       at once, each with its neighbours taken from the pre-sweep state.
+%                                       This targets the WRONG distribution on purpose: it is the negative
+%                                       control of test_T4_3 (it must fail test_T4_2). Never use it for
+%                                       inference.
 %
 % Phase 1 (sampler infrastructure) design notes
 % ---------------------------------------------
@@ -235,10 +259,82 @@ classdef mcmc_bayes < mcmc
 %   (repetition > 1) .rhat of every mu and Sigma entry; out.settings.prior holds
 %   the resolved hyperprior.
 %
+% Phase 4 (MRF prior with chromatic updates)
+% ------------------------------------------
+% Target (fixed mu, Sigma). With E the neighbour edges, each counted once:
+%       p(u_1..n | y, mu, Sigma) ∝ prod_i L(y_i | x(u_i)) N(u_i | mu, Sigma) * exp(-Phi_MRF(u))
+%       Phi_MRF(u) = (1/tau) sum_p W_p sum_{(i,j) in E} w_ij rho(u_i^p - u_j^p)
+%   over the hierarchical parameters p only (u space). rho:
+%       'l1'        : |x|
+%       'huber'     : x^2/(2 delta_p) for |x| <= delta_p, |x| - delta_p/2 otherwise. This is the Huber
+%                     function divided by delta_p (the "smoothed L1"), so that it has slope 1 for large |x|
+%                     and tau means the same as for 'l1' at large differences. delta_p = huberDelta *
+%                     sqrt(Sigma_pp), default huberDelta = 1 (provisional; Phase 5 decides).
+%       'quadratic' : x^2/2 (Gaussian MRF, used for the exact tests)
+%   W_p (default 1/sqrt(Sigma_pp)) and w_ij (default 1) are fixed before sampling and never depend
+%   on the chain state (unlike the reference's 1/|u_i|). The MRF alone is improper (shift
+%   invariant), hence it requires the hierarchical prior.
+%   Gaussian MRF scaling: for one parameter, sum_{(i,j) in E} w_ij (u_i - u_j)^2 = u' L_w u with
+%   L_w = D - A_w the weighted graph Laplacian (A_w(i,j) = w_ij, D = diag(sum_j w_ij)), so with
+%   rho = x^2/2 each edge counted once, exp(-Phi) = exp(-u' [(1/tau) L_w (x) diag(W)] u / 2): the
+%   MRF adds exactly (1/tau)(L_w (x) diag(W)) to the precision (voxel-major ordering of u).
+%
+% Local term. Only the edges at voxel i involve u_i, and each such edge appears once in
+%       Phi_i(u_i; u_N(i)) = (1/tau) sum_p W_p sum_{j in N(i)} w_ij rho(u_i^p - u_j^p),
+%   so changing u_i alone changes Phi_MRF by exactly the change of Phi_i (needs a symmetric
+%   neighbour table and symmetric w_ij; both are asserted).
+%
+% Geometry (build_neighbours). nbr [K,Nv] int32: position of each neighbour in the masked-voxel
+%   index (order of find(mask)), 0 if outside the mask or the volume. Offsets are sorted
+%   lexicographically, so offset K+1-k is the negative of offset k.
+%       '3d', 'face', r = 1 : 6 face neighbours
+%       '3d', 'full', r     : cube, (2r+1)^3 - 1 neighbours
+%       '2d', 'face', r = 1 : 4 in-plane neighbours (dims 1 and 2, same slice)
+%       '2d', 'full', r     : square, (2r+1)^2 - 1 (r = 2 is the reference's 5 x 5)
+% Colouring (build_colours), (i,j,k) the 1-based voxel subscripts:
+%       'face'      : parity of i+j+k ('3d') or i+j ('2d'), 2 colours (a face step changes one
+%                     coordinate by 1)
+%       'full', r   : (mod(i,r+1), mod(j,r+1)[, mod(k,r+1)]), (r+1)^3 ('3d') or (r+1)^2 ('2d') colours
+%                     (two voxels within Chebyshev distance r differ by 1..r in some coordinate,
+%                     which is non-zero mod r+1)
+%   Properness (no neighbour shares a colour) and the symmetry of nbr are asserted at construction.
+%
+% Chromatic sweep. One sweep loops over the (non-empty) colours in a fixed order. For colour c,
+%   every voxel of c is proposed (joint or componentwise) and accepted with
+%       log r = dlogL + dlog N(u_i | mu, Sigma) [+ dlog|J| of non-hierarchical rows] - dPhi_i,
+%   conditioning on the CURRENT values of all other voxels. The voxels of c are conditionally
+%   independent given the others (no two are neighbours), so the colour step is an exact MH
+%   update of their joint conditional; voxels outside c never change in that step. The log-
+%   likelihood (and marginal statistics) and hierarchical log-prior caches are updated for the
+%   accepted voxels after each colour step; Phi_i is always recomputed from the current
+%   neighbours and never cached. Each voxel is updated once per sweep, so the per-voxel
+%   acceptance counts and the burn-in adaptation are unchanged.
+%   Cost (first version): the forward model is evaluated on ALL voxels and the result is used
+%   for the active colour only, i.e. C forward evaluations per sweep (C x Nvar componentwise).
+% Negative control (fitting.mrfUpdate = 'simultaneous', TEST ONLY): one class with all voxels,
+%   each voxel's Phi_i uses the pre-sweep neighbours while the neighbours move at the same time.
+%   This is NOT a valid MH kernel for the joint target.
+%
+% Two-stage empirical Bayes (run_two_stage). With the MRF on, the normalising constant of the
+%   joint prior on u depends on Sigma, so the IW draw is no longer the exact conditional and the
+%   free-hyperparameter mode is not allowed with the MRF. run_two_stage: stage 1 samples
+%   (u, mu, Sigma) under the hierarchical prior without the MRF (optionally on a voxel subset,
+%   estimate_hyper_subset); stage 2 fixes mu, Sigma at their stage-1 posterior means and samples u
+%   under hierarchical + MRF with the same likelihood, starting from the stage-1 posterior means
+%   of u. This is NOT the full joint posterior (hyperparameter uncertainty is not propagated).
+%
+% Memory. The MRF couples all voxels, so it needs a single call (no segmentation). The guard of
+%   the free hierarchical mode is extended by 4 x K x Nv x 6 bytes (neighbour table, edge weights,
+%   neighbour-value temporaries); mcmc_bayes errors (mcmc_bayes:mrfMemory) if it does not fit.
+%
+% Output (MRF): out.settings.mrf holds the resolved potential, tau, W, delta, mode, radius,
+%   connectivity, # neighbours, # colours and # edges.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
 % Date modified: 26 September 2026 (Phase 3: hierarchical Normal prior; m counts non-zero weights only)
+% Date modified: 26 September 2026 (Phase 4: MRF prior, chromatic updates, two-stage empirical Bayes)
 %
 
     methods
@@ -249,19 +345,13 @@ classdef mcmc_bayes < mcmc
         % the class header.
         %
 
-            [isLegacy, nonDefault] = mcmc_bayes.isLegacy(fitting);
+            isLegacy     = mcmc_bayes.isLegacy(fitting);
             forceNewPath = isstruct(fitting) && isfield(fitting,'forceNewPath') && ~isempty(fitting.forceNewPath) && fitting.forceNewPath;
 
             % legacy path: identical to mcmc
             if isLegacy && ~forceNewPath
                 out = optimisation@mcmc(this, data, mask, weights, pars0, fitting, FWDfunc, varargin{:});
                 return
-            end
-
-            % Phase 4 options (MRF prior) are not available yet
-            if ismember('prior', nonDefault) && isstruct(fitting.prior) && isfield(fitting.prior,'mrf') && ~isempty(fitting.prior.mrf)
-                error('mcmc_bayes:notImplemented', ...
-                    'mcmc_bayes: non-default option(s) not implemented yet: prior.mrf');
             end
 
             fitting = this.check_set_default_bayes(fitting);
@@ -275,6 +365,7 @@ classdef mcmc_bayes < mcmc
             % likelihood, sampled/marginalised parameter sets and prior (validated before any GPU work)
             [fittingS, lik] = this.setup_likelihood(fitting);
             hier = this.setup_hierarchical(fittingS);
+            this.setup_mrf(fittingS, hier);         % MRF options (errors only)
             methodS  = this.parse_transform(fittingS.parameterTransform, numel(fittingS.modelParams));
             isHierS  = false(1, numel(fittingS.modelParams)); isHierS(hier.idx) = true;
             this.check_transform_bounds(methodS(~isHierS), fittingS.lb(~isHierS), fittingS.ub(~isHierS), fittingS.modelParams(~isHierS));
@@ -289,7 +380,7 @@ classdef mcmc_bayes < mcmc
             this.display_bayes_algorithm_parameters(fitting);
 
             % mask data to reduce memory load, same as mcmc; keep mask
-            % geometry for later phases (neighbour tables for MRF priors)
+            % geometry for the neighbour table of the MRF prior
             mask_idx = find(mask>0);
             geom     = struct('mask_idx', mask_idx, 'dims', size(mask));
             if ~ismatrix(data);     data    = utils.reshape_ND2GD(data,      mask_idx); else; data = data(:,mask_idx);     end
@@ -371,6 +462,102 @@ classdef mcmc_bayes < mcmc
             fittingFixed.prior.hierarchical = h;
         end
 
+        function out = run_two_stage(this, data, mask, weights, pars0, fitting, FWDfunc, varargin)
+        % Two-stage empirical Bayes for the MRF prior (see the class header).
+        %   Stage 1: free hierarchical prior (Gibbs block), NO MRF, on all voxels or, with
+        %            prior.hierarchical.subsetFraction < 1, on a random voxel subset
+        %            (estimate_hyper_subset).
+        %   Stage 2: mu, Sigma fixed at their stage-1 posterior means, hierarchical + MRF prior,
+        %            same likelihood, on all voxels (single call). Start: per voxel, the stage-1
+        %            posterior mean of u of every sampled parameter (mapped back to native space);
+        %            voxels outside the stage-1 subset start from pars0.
+        % This is NOT the full joint posterior p(u, mu, Sigma | y): the hyperparameter
+        % uncertainty is not propagated to stage 2.
+        %
+        % Input
+        % -----
+        % Same as optimisation. fitting.prior.hierarchical (not fixed) and fitting.prior.mrf are
+        % required. fitting.repetition etc. apply to both stages.
+        %
+        % Output
+        % ------
+        % out   : stage-2 output (as optimisation), plus
+        %   .stage1                 : compact stage-1 summary: .hyper, .diagnostics, .settings,
+        %                             .voxelIndex (linear indices into mask), .subsetFraction
+        %   .settings.empiricalBayes: description of the two-stage approximation, muHat, SigmaHat
+        %
+            if ~isstruct(fitting) || ~isfield(fitting,'prior') || ~isstruct(fitting.prior) || ...
+                    ~isfield(fitting.prior,'hierarchical') || isempty(fitting.prior.hierarchical) || ...
+                    (islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes.run_two_stage: fitting.prior.hierarchical is required.');
+            end
+            if ~isfield(fitting.prior,'mrf') || isempty(fitting.prior.mrf) || (islogical(fitting.prior.mrf) && ~fitting.prior.mrf)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes.run_two_stage: fitting.prior.mrf is required (use optimisation without an MRF).');
+            end
+            h = fitting.prior.hierarchical;
+            if islogical(h); h = struct(); end
+            if isfield(h,'fixed') && ~isempty(h.fixed) && h.fixed
+                error('mcmc_bayes:invalidPrior', ['mcmc_bayes.run_two_stage: prior.hierarchical.fixed must be false (stage 1 ' ...
+                    'estimates mu and Sigma); with known mu/Sigma call optimisation directly.']);
+            end
+            frac = field_or_default(h, 'subsetFraction', 1);
+
+            % stage 1: hierarchical prior only (the test-only mrfUpdate is a stage-2 option)
+            f1 = fitting;
+            f1.prior = rmfield(fitting.prior, 'mrf');
+            if isfield(f1,'mrfUpdate'); f1 = rmfield(f1, 'mrfUpdate'); end
+            mask_idx = find(mask>0);
+            if frac < 1
+                [muHat, SigmaHat, ~, out1, idxSub] = this.estimate_hyper_subset(data, mask, weights, pars0, f1, FWDfunc, varargin{:});
+            else
+                h1 = h; h1.fixed = false; h1.subsetFraction = 1;
+                f1.prior.hierarchical = h1;
+                out1    = this.optimisation(data, mask, weights, pars0, f1, FWDfunc, varargin{:});
+                muHat   = out1.hyper.mean.mu;
+                SigmaHat= out1.hyper.mean.Sigma;
+                idxSub  = mask_idx;
+            end
+
+            % stage-2 start: per voxel, posterior mean of u of every sampled parameter
+            [fS, ~] = this.setup_likelihood(this.check_set_default_bayes(fitting));
+            method  = this.parse_transform(fS.parameterTransform, numel(fS.modelParams));
+            pars2   = pars0;
+            for k = 1:numel(fS.modelParams)
+                p       = fS.modelParams{k};
+                xs      = double(out1.posterior.(p));                        % [Nsub, Ns, Nrep]
+                Nsub    = size(xs, 1);
+                us      = this.transform_forward(reshape(xs, 1, []), method(k), fS.lb(k), fS.ub(k));
+                uMean   = mean(reshape(us, Nsub, []), 2);
+                xMean   = this.transform_inverse(uMean.', method(k), fS.lb(k), fS.ub(k));
+                img     = double(pars0.(p));
+                if isscalar(img); img = img .* ones(size(mask)); end
+                img     = reshape(img, size(mask));
+                img(idxSub) = xMean;
+                pars2.(p) = img;
+            end
+
+            % stage 2: fixed mu, Sigma at the stage-1 posterior means, plus the MRF
+            f2 = fitting;
+            h2 = h; h2.fixed = true; h2.mu = muHat; h2.Sigma = SigmaHat; h2.subsetFraction = 1;
+            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0'}));
+            f2.prior.hierarchical = h2;
+            out = this.optimisation(data, mask, weights, pars2, f2, FWDfunc, varargin{:});
+
+            out.stage1 = struct('hyper', out1.hyper, 'diagnostics', out1.diagnostics, 'settings', out1.settings, ...
+                                'voxelIndex', idxSub, 'subsetFraction', frac);
+            out.settings.empiricalBayes = struct( ...
+                'scheme',       'two-stage empirical Bayes (NOT the full joint posterior)', ...
+                'stage1',       'free hierarchical prior (Gibbs block), no MRF; on a random voxel subset if subsetFraction < 1', ...
+                'stage2',       'mu, Sigma fixed at the stage-1 posterior means; hierarchical + MRF prior; same likelihood', ...
+                'init',         'stage-1 posterior mean of u per voxel (voxels outside the stage-1 subset: pars0)', ...
+                'reason',       ['with the MRF the normalising constant of the joint prior on u depends on Sigma, so the ' ...
+                                 'inverse-Wishart draw is not the exact conditional; the hyperparameter uncertainty is not propagated'], ...
+                'muHat',        muHat, ...
+                'SigmaHat',     SigmaHat, ...
+                'Nstage1',      numel(idxSub), ...
+                'subsetFraction', frac);
+        end
+
         function [xPosterior, diagnostics] = metropolis_hastings_bayes(this,y,x0,weights,fitting,geom,FWDfunc,varargin)
         % Input
         % ------
@@ -404,6 +591,9 @@ classdef mcmc_bayes < mcmc
             hier            = this.setup_hierarchical(fitting);
             isHier          = hier.on;
             isGibbs         = isHier && ~hier.fixed;
+            % MRF prior on the hierarchical parameters (fixed mu/Sigma only)
+            mrf             = this.setup_mrf(fitting, hier);
+            isMRF           = mrf.on;
 
             % record RNG states before any random number is drawn
             rngState    = rng;
@@ -436,6 +626,28 @@ classdef mcmc_bayes < mcmc
                     error('mcmc_bayes:hierarchicalTooFewVoxels', ...
                         'mcmc_bayes: hyperprior ''jeffreys_half'' needs more than 2d-1 = %d voxels (got %d).', 2*hier.d-1, Nv);
                 end
+            end
+
+            % MRF: neighbour table, colour classes and edge weights (host), memory guard
+            if isMRF
+                if isempty(geom) || ~isfield(geom,'mask_idx') || numel(geom.mask_idx) ~= Nv
+                    error('mcmc_bayes:mrfGeometry', 'mcmc_bayes: the MRF prior needs the mask geometry of all %d voxels.', Nv);
+                end
+                nbr     = this.build_neighbours(geom.mask_idx, geom.dims, mrf.mode, mrf.radius, mrf.connectivity);
+                Knb     = size(nbr, 1);
+                this.check_mrf_memory(Nm, Nv, Nvar, Knb, mrf);
+                if strcmp(mrf.update, 'simultaneous')
+                    % TEST ONLY negative control: one class with all voxels (wrong target)
+                    colours = ones(1, Nv); NcolNominal = 1;
+                else
+                    [colours, NcolNominal] = this.build_colours(geom.mask_idx, geom.dims, mrf.mode, mrf.radius, mrf.connectivity, nbr);
+                end
+                if isempty(mrf.edgeWeights)
+                    wEdge = double(nbr > 0);
+                else
+                    wEdge = this.check_edge_weights(mrf.edgeWeights, nbr);
+                end
+                Nedges  = nnz(nbr) / 2;
             end
 
             % transforms
@@ -543,6 +755,29 @@ classdef mcmc_bayes < mcmc
             end
             if fitting.checkCache
                 cacheErr = struct('loglik', 0, 'logprior', 0, 'logjac', 0, 'Ncheck', 0);
+                if isMRF; cacheErr.inactiveMoved = 0; end
+            end
+
+            % MRF on the GPU, per colour class: active voxels, their neighbours and edge weights.
+            % An absent neighbour points to the voxel itself with weight 0 (contributes 0).
+            if isMRF
+                colList = unique(colours);                  % non-empty classes only
+                Ncol    = numel(colList);
+                selfIdx = repmat(int32(1:Nv), Knb, 1);
+                nbrSelf = nbr; nbrSelf(nbr == 0) = selfIdx(nbr == 0);
+                mrfAct  = cell(1, Ncol); mrfMask = cell(1, Ncol); mrfNbr = cell(1, Ncol); mrfW = cell(1, Ncol);
+                for kc = 1:Ncol
+                    isC         = colours == colList(kc);
+                    mrfAct{kc}  = gpuArray(uint32(find(isC)));
+                    mrfMask{kc} = gpuArray(isC);
+                    mrfNbr{kc}  = gpuArray(uint32(nbrSelf(:, isC)));
+                    mrfW{kc}    = gpuArray(single(wEdge(:, isC)));
+                end
+                clear selfIdx nbrSelf
+                mrfCoef  = gpuArray(single(mrf.W(:) ./ mrf.tau));  % [d,1] W_p/tau
+                mrfDelta = gpuArray(single(mrf.delta(:)));          % [d,1] Huber thresholds (u space)
+            else
+                Ncol    = 1;
             end
 
             disp('-------------------------');
@@ -599,6 +834,17 @@ classdef mcmc_bayes < mcmc
 
             counter = 0; start = tic;
             for k = 1:fitting.iteration
+                % 1-2. MH block, one colour class at a time (a single class with all voxels without MRF)
+                if isComponent
+                    isAccepted = false(Nvar, Nv, 'like', isRejectRow);
+                elseif isMRF
+                    isAccSweep = false(1, Nv, 'like', isRejectRow);
+                end
+                for kc = 1:Ncol
+                if isMRF
+                    act = mrfAct{kc};
+                    if fitting.checkCache; uBefore = uCurr; end
+                end
 
                 if ~isComponent
                     % ========== joint update: all parameters of a voxel together ==========
@@ -624,15 +870,22 @@ classdef mcmc_bayes < mcmc
                     % 2.1 proposal probability (+ log-Jacobian of the transform, + hierarchical log-prior)
                     if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
                     if isHier; lpProposed = this.logprior_normal(uProposed(hIdx,:), muG, PG); end
+                    % MRF: change of the local term of the active voxels, current neighbours (never cached)
+                    if isMRF
+                        dPhi = this.mrf_local_delta(uProposed(hIdx,act), uCurr(hIdx,act), uCurr(hIdx,:), ...
+                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential);
+                    end
                     % 2.2 accept with probability min(1, exp(logRatio)); NaN is rejected
                     if hasJac
                         logRatio            = logLProposed - logLCurr + sum(logJProposed - logJCurr, 1);
                         if isHier; logRatio = logRatio + (lpProposed - lpCurr); end
+                        if isMRF; logRatio(act) = logRatio(act) - dPhi; end
                         isAccepted          = exp(logRatio) > rand(1,Nv,'like',logLProposed);
                     elseif isMarginal || isHier
                         % degenerate states have logL = -Inf; -Inf - (-Inf) = NaN is rejected
                         logRatio            = logLProposed - logLCurr;
                         if isHier; logRatio = logRatio + (lpProposed - lpCurr); end
+                        if isMRF; logRatio(act) = logRatio(act) - dPhi; end
                         isAccepted          = exp(logRatio) > rand(1,Nv,'like',logLProposed);
                     else
                         % neutral path: same expression as mcmc.metropolis_hastings (the GPU evaluates
@@ -642,6 +895,11 @@ classdef mcmc_bayes < mcmc
                         isOutofbound        = isOutofbound | isnan(logLProposed);  % mcmc would accept NaN via min(NaN,1) = 1
                     end
                     isAccepted(isOutofbound)= 0;    % reject out of bound (and NaN) proposal
+                    % MRF: only the voxels of the active colour can move
+                    if isMRF
+                        isAccepted  = isAccepted & mrfMask{kc};
+                        isAccSweep  = isAccSweep | isAccepted;
+                    end
                     % 2.3 update parameters if accepted
                     logLCurr(isAccepted)    = logLProposed(isAccepted);
                     uCurr(:,isAccepted)     = uProposed(:,isAccepted);
@@ -655,7 +913,6 @@ classdef mcmc_bayes < mcmc
 
                 else
                     % ========== componentwise update: one parameter at a time ==========
-                    isAccepted = false(Nvar, Nv, 'like', isRejectRow);
                     for kp = 1:Nvar
                         % 1. proposal for parameter kp only
                         uProposed_p     = uCurr(kp,:) + sigma(kp,:).*randn(1,Nv,'like',uCurr);
@@ -677,9 +934,17 @@ classdef mcmc_bayes < mcmc
                             uProposedH(hIdx==kp,:) = uProposed_p;
                             lpProposed          = this.logprior_normal(uProposedH, muG, PG);
                             logRatio            = logRatio + (lpProposed - lpCurr);
+                            % MRF: change of the local term of parameter kp of the active voxels
+                            if isMRF
+                                pH              = find(hIdx==kp);
+                                dPhi            = this.mrf_local_delta(uProposed_p(act), uCurr(kp,act), uCurr(kp,:), ...
+                                                    mrfNbr{kc}, mrfW{kc}, mrfCoef(pH), mrfDelta(pH), mrf.potential);
+                                logRatio(act)   = logRatio(act) - dPhi;
+                            end
                         end
                         isAccepted_p                = exp(logRatio) > rand(1,Nv,'like',logLProposed);
                         isAccepted_p(isOutofbound)  = 0;
+                        if isMRF; isAccepted_p = isAccepted_p & mrfMask{kc}; end
                         % 3. update parameter kp and the cache before the next parameter
                         logLCurr(isAccepted_p)      = logLProposed(isAccepted_p);
                         if isMarginal; statsCurr(:,isAccepted_p) = statsProposed(:,isAccepted_p); end
@@ -687,9 +952,19 @@ classdef mcmc_bayes < mcmc
                         uCurr(kp,isAccepted_p)      = uProposed_p(isAccepted_p);
                         xCurr(kp,isAccepted_p)      = xProposed_p(isAccepted_p);
                         if useJac(kp); logJCurr(kp,isAccepted_p) = logJProposed_p(isAccepted_p); end
-                        isAccepted(kp,:)            = isAccepted_p;
+                        if isMRF
+                            isAccepted(kp,:)        = isAccepted(kp,:) | isAccepted_p;
+                        else
+                            isAccepted(kp,:)        = isAccepted_p;
+                        end
                     end
                 end
+                % test only: voxels outside the active colour must not have changed
+                if isMRF && fitting.checkCache
+                    cacheErr.inactiveMoved = max(cacheErr.inactiveMoved, this.max_abs_diff(uCurr(:,~mrfMask{kc}), uBefore(:,~mrfMask{kc})));
+                end
+                end     % colour classes
+                if isMRF && ~isComponent; isAccepted = isAccSweep; end
 
                 % 3. Gibbs block: exact conditional draws of (mu, Sigma), then refresh the log-prior cache
                 if isGibbs
@@ -789,6 +1064,12 @@ classdef mcmc_bayes < mcmc
                 diagnostics.hyper = [];
                 priorSettings = [];
             end
+            if isMRF
+                mrfSettings = this.mrf_settings(mrf, hier, Knb, NcolNominal, Ncol, Nedges);
+                priorSettings.mrf = mrfSettings;
+            else
+                mrfSettings = [];
+            end
             diagnostics.settings    = struct( ...
                 'parameterTransform',   {method}, ...
                 'updateScheme',         lower(fitting.updateScheme), ...
@@ -809,6 +1090,7 @@ classdef mcmc_bayes < mcmc
                 'fixedParams',          lik.userFixed, ...
                 'nuisance',             lik.nuisance, ...
                 'prior',                priorSettings, ...
+                'mrf',                  mrfSettings, ...
                 'rngState',             rngState, ...
                 'gpuRngState',          gpuRngState, ...
                 'geom',                 geom);
@@ -892,6 +1174,7 @@ classdef mcmc_bayes < mcmc
             if ~isfield(fitting,'forceNewPath');        fitting2.forceNewPath       = false;         end
             if ~isfield(fitting,'fixedParams');         fitting2.fixedParams        = [];            end
             if ~isfield(fitting,'checkCache');          fitting2.checkCache         = false;         end
+            if ~isfield(fitting,'mrfUpdate');           fitting2.mrfUpdate          = 'chromatic';   end
 
             if ~any(strcmpi(fitting2.updateScheme,{'joint','componentwise'}))
                 error('mcmc_bayes:invalidUpdateScheme', ...
@@ -928,6 +1211,14 @@ classdef mcmc_bayes < mcmc
                 else
                     disp( 'Prior             : hierarchical Normal on u, hyperprior niw');
                 end
+            end
+            if isstruct(fitting.prior) && isfield(fitting.prior,'mrf') && ~isempty(fitting.prior.mrf) && ...
+                    ~(islogical(fitting.prior.mrf) && ~fitting.prior.mrf)
+                m = fitting.prior.mrf;
+                if ~isstruct(m); m = struct(); end
+                disp(['MRF prior         : potential ', char(field_or_default(m,'potential','l1')), ...
+                      ', tau ', num2str(field_or_default(m,'tau',1)), ', mode ', char(field_or_default(m,'mode','3d')), ...
+                      ', radius ', num2str(field_or_default(m,'radius',1)), ', update ', char(fitting.mrfUpdate)]);
             end
         end
 
@@ -1249,9 +1540,6 @@ classdef mcmc_bayes < mcmc
             if ~isempty(bad)
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior: %s (valid: hierarchical, mrf).', strjoin(bad, ', '));
             end
-            if isfield(prior,'mrf') && ~isempty(prior.mrf)
-                error('mcmc_bayes:notImplemented', 'mcmc_bayes: non-default option(s) not implemented yet: prior.mrf');
-            end
             if ~isfield(prior,'hierarchical') || isempty(prior.hierarchical); return; end
             h = prior.hierarchical;
             if islogical(h) && isscalar(h)
@@ -1545,6 +1833,350 @@ classdef mcmc_bayes < mcmc
                 s.hierarchical.floorVar = hp.floorVar;
             end
             s.mrf = [];
+        end
+
+        %% MRF prior (Phase 4), see the derivation in the class header
+        % resolve and validate fitting.prior.mrf (pure, no GPU)
+        function mrf = setup_mrf(fitting, hier)
+        % Input
+        % -----
+        % fitting   : fitting structure (sampled parameter set)
+        % hier      : setup_hierarchical output
+        % Output
+        % ------
+        % mrf       : structure
+        %   .on                         : true if the MRF prior is used
+        %   .potential                  : 'l1' | 'huber' | 'quadratic'
+        %   .tau, .W [d,1], .delta [d,1]: temperature, per-parameter weights, Huber thresholds (u space)
+        %   .Wrule, .huberDelta         : how W was set, Huber threshold in units of sqrt(Sigma_pp)
+        %   .mode, .radius, .connectivity, .edgeWeights, .maxGPUMemory
+        %   .update                     : 'chromatic' | 'simultaneous' (TEST ONLY)
+        %
+            mrf = struct('on', false, 'potential', '', 'tau', [], 'W', [], 'Wrule', '', 'huberDelta', [], 'delta', [], ...
+                         'mode', '', 'radius', [], 'connectivity', '', 'edgeWeights', [], 'maxGPUMemory', [], 'update', 'chromatic');
+            update = lower(char(field_or_default(fitting, 'mrfUpdate', 'chromatic')));
+            if ~any(strcmp(update, {'chromatic','simultaneous'}))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.mrfUpdate must be ''chromatic'' or ''simultaneous'' (TEST ONLY).');
+            end
+            isOn = isfield(fitting,'prior') && isstruct(fitting.prior) && isfield(fitting.prior,'mrf') && ...
+                   ~isempty(fitting.prior.mrf) && ~(islogical(fitting.prior.mrf) && isscalar(fitting.prior.mrf) && ~fitting.prior.mrf);
+            if ~isOn
+                if strcmp(update, 'simultaneous')
+                    error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.mrfUpdate = ''simultaneous'' needs fitting.prior.mrf.');
+                end
+                return
+            end
+            m = fitting.prior.mrf;
+            if islogical(m) && isscalar(m); m = struct(); end
+            if ~isstruct(m) || ~isscalar(m)
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: fitting.prior.mrf must be a structure (or true).');
+            end
+            valid = {'potential','tau','W','huberDelta','edgeWeights','mode','radius','connectivity','maxGPUMemory'};
+            bad   = setdiff(fieldnames(m), valid);
+            if ~isempty(bad)
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: unknown field(s) in fitting.prior.mrf: %s (valid: %s).', ...
+                    strjoin(bad, ', '), strjoin(valid, ', '));
+            end
+
+            % the MRF alone is improper and needs fixed hyperparameters (two-stage scheme)
+            if ~hier.on
+                error('mcmc_bayes:mrfRequiresHierarchical', ...
+                    'mcmc_bayes: prior.mrf requires prior.hierarchical (the MRF alone is improper: it is shift invariant).');
+            end
+            if ~hier.fixed
+                error('mcmc_bayes:mrfFreeHyperparameters', ...
+                    ['mcmc_bayes: prior.mrf with free hyperparameters (prior.hierarchical.fixed = false) is not a valid Gibbs ' ...
+                     'conditional (the normalising constant of the joint prior depends on Sigma). Use ' ...
+                     'mcmc_bayes().run_two_stage(...) (two-stage empirical Bayes), or set prior.hierarchical.fixed = true with mu/Sigma.']);
+            end
+            d = hier.d;
+
+            potential = lower(char(field_or_default(m, 'potential', 'l1')));
+            if ~any(strcmp(potential, {'l1','huber','quadratic'}))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.potential must be ''l1'', ''huber'' or ''quadratic'' (got ''%s'').', potential);
+            end
+            tau = field_or_default(m, 'tau', 1);
+            if ~(isnumeric(tau) && isscalar(tau) && isfinite(tau) && tau > 0)
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.tau must be a positive finite scalar.');
+            end
+            sdPrior = sqrt(diag(hier.Sigma));
+            W = field_or_default(m, 'W', []);
+            if isempty(W)
+                W = 1 ./ sdPrior; Wrule = '1./sqrt(diag(Sigma)) of the fixed Sigma';
+            else
+                if ~(isnumeric(W) && any(numel(W) == [1 d]) && all(isfinite(W(:))) && all(W(:) > 0))
+                    error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.W must be positive and finite, a scalar or %d entries.', d);
+                end
+                W = double(W(:)) .* ones(d, 1); Wrule = 'user';
+            end
+            huberDelta = field_or_default(m, 'huberDelta', 1);
+            if ~(isnumeric(huberDelta) && any(numel(huberDelta) == [1 d]) && all(isfinite(huberDelta(:))) && all(huberDelta(:) > 0))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.huberDelta must be positive and finite, a scalar or %d entries.', d);
+            end
+            delta = double(huberDelta(:)) .* sdPrior;
+
+            mode = lower(char(field_or_default(m, 'mode', '3d')));
+            if ~any(strcmp(mode, {'3d','2d'}))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.mode must be ''3d'' or ''2d'' (got ''%s'').', mode);
+            end
+            radius = field_or_default(m, 'radius', 1);
+            if ~(isnumeric(radius) && isscalar(radius) && radius >= 1 && radius == round(radius))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.radius must be a positive integer.');
+            end
+            connectivity = lower(char(field_or_default(m, 'connectivity', '')));
+            if isempty(connectivity)
+                if strcmp(mode,'3d') && radius == 1; connectivity = 'face'; else; connectivity = 'full'; end
+            end
+            if ~any(strcmp(connectivity, {'face','full'}))
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.connectivity must be ''face'' or ''full'' (got ''%s'').', connectivity);
+            end
+            if strcmp(connectivity,'face') && radius ~= 1
+                error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.connectivity = ''face'' needs radius = 1 (use ''full'' for a larger radius).');
+            end
+            edgeWeights = field_or_default(m, 'edgeWeights', []);
+            if ~isempty(edgeWeights) && ~isnumeric(edgeWeights)
+                error('mcmc_bayes:invalidEdgeWeights', 'mcmc_bayes: prior.mrf.edgeWeights must be numeric [K, Nv] (or []).');
+            end
+
+            mrf.on              = true;
+            mrf.potential       = potential;
+            mrf.tau             = double(tau);
+            mrf.W               = W;
+            mrf.Wrule           = Wrule;
+            mrf.huberDelta      = double(huberDelta(:));
+            mrf.delta           = delta;
+            mrf.mode            = mode;
+            mrf.radius          = double(radius);
+            mrf.connectivity    = connectivity;
+            mrf.edgeWeights     = edgeWeights;
+            mrf.maxGPUMemory    = field_or_default(m, 'maxGPUMemory', hier.maxGPUMemory);
+            mrf.update          = update;
+        end
+
+        % neighbour offsets [K,3], sorted lexicographically (offset K+1-k = -offset k)
+        function off = mrf_offsets(mode, radius, connectivity)
+            r = radius;
+            if strcmpi(connectivity, 'face')
+                off = [eye(3); -eye(3)];
+            else
+                [a, b, c] = ndgrid(-r:r, -r:r, -r:r);
+                off = [a(:) b(:) c(:)];
+            end
+            if strcmpi(mode, '2d'); off = off(off(:,3) == 0, :); end
+            off = off(any(off ~= 0, 2), :);
+            off = unique(off, 'rows');                              % sorted lexicographically
+        end
+
+        % neighbour table in the masked-voxel index, see the class header
+        function nbr = build_neighbours(mask_idx, dims, mode, radius, connectivity)
+        % Input
+        % -----
+        % mask_idx      : linear indices of the masked voxels (find(mask)), Nv entries
+        % dims          : size(mask), up to 3 dimensions
+        % mode          : '3d' | '2d' (in-plane: dims 1-2 of the same slice)
+        % radius        : positive integer r
+        % connectivity  : 'face' (r = 1) | 'full'
+        % Output
+        % ------
+        % nbr           : [K, Nv] int32, position of neighbour k of voxel v in mask_idx, 0 if the
+        %                 neighbour is outside the mask or the volume. Asserted symmetric:
+        %                 nbr(K+1-k, nbr(k,v)) == v.
+        %
+            if nargin < 5 || isempty(connectivity)
+                if strcmpi(mode,'3d') && radius == 1; connectivity = 'face'; else; connectivity = 'full'; end
+            end
+            dims = [dims(:).' ones(1, 3)];
+            if any(dims(4:end-3) ~= 1)
+                error('mcmc_bayes:mrfGeometry', 'mcmc_bayes: the MRF needs a mask with at most 3 dimensions.');
+            end
+            dims    = dims(1:3);
+            mask_idx= double(mask_idx(:));
+            Nv      = numel(mask_idx);
+            off     = mcmc_bayes.mrf_offsets(mode, radius, connectivity);
+            K       = size(off, 1);
+            map     = zeros(dims, 'int32');
+            map(mask_idx) = int32(1:Nv);
+            [i, j, k] = ind2sub(dims, mask_idx);
+            nbr     = zeros(K, Nv, 'int32');
+            for kk = 1:K
+                ii  = i + off(kk,1); jj = j + off(kk,2); ll = k + off(kk,3);
+                in  = ii >= 1 & ii <= dims(1) & jj >= 1 & jj <= dims(2) & ll >= 1 & ll <= dims(3);
+                nbr(kk, in) = map(sub2ind(dims, ii(in), jj(in), ll(in)));
+            end
+            mcmc_bayes.check_neighbour_symmetry(nbr);
+        end
+
+        % assert nbr(K+1-k, nbr(k,v)) == v for every present neighbour
+        function check_neighbour_symmetry(nbr)
+            [K, Nv] = size(nbr);
+            [kk, v] = find(nbr > 0);
+            n       = double(nbr(sub2ind([K Nv], kk, v)));
+            back    = nbr(sub2ind([K Nv], K + 1 - kk, n));
+            if ~isequal(double(back(:)), v(:))
+                error('mcmc_bayes:mrfNeighbours', 'mcmc_bayes: the neighbour table is not symmetric.');
+            end
+        end
+
+        % colour labels, see the class header; the colouring is asserted proper
+        function [colours, Ncolours] = build_colours(mask_idx, dims, mode, radius, connectivity, nbr)
+        % Output
+        % ------
+        % colours   : [1, Nv] colour labels in 1..Ncolours
+        % Ncolours  : nominal number of colours (2, (r+1)^2 or (r+1)^3); classes can be empty
+        %
+            if nargin < 5 || isempty(connectivity)
+                if strcmpi(mode,'3d') && radius == 1; connectivity = 'face'; else; connectivity = 'full'; end
+            end
+            if nargin < 6 || isempty(nbr)
+                nbr = mcmc_bayes.build_neighbours(mask_idx, dims, mode, radius, connectivity);
+            end
+            dims = [dims(:).' ones(1, 3)]; dims = dims(1:3);
+            [i, j, k] = ind2sub(dims, double(mask_idx(:)).');
+            is2d = strcmpi(mode, '2d');
+            if strcmpi(connectivity, 'face')
+                if is2d; colours = mod(i + j, 2) + 1; else; colours = mod(i + j + k, 2) + 1; end
+                Ncolours = 2;
+            else
+                q = radius + 1;
+                colours = mod(i, q) + q .* mod(j, q) + 1;
+                Ncolours = q^2;
+                if ~is2d
+                    colours = colours + q^2 .* mod(k, q);
+                    Ncolours = q^3;
+                end
+            end
+            mcmc_bayes.check_colouring(nbr, colours);
+        end
+
+        % assert that no two neighbours share a colour
+        function check_colouring(nbr, colours)
+            has = nbr > 0;
+            cN  = zeros(size(nbr));
+            cN(has) = colours(nbr(has));
+            cV  = repmat(colours(:).', size(nbr, 1), 1);
+            if any(cN(has) == cV(has))
+                error('mcmc_bayes:mrfColouring', 'mcmc_bayes: improper colouring (two neighbours share a colour).');
+            end
+        end
+
+        % validate fixed edge weights [K, Nv]: finite, >= 0 and symmetric; absent neighbours -> 0
+        function w = check_edge_weights(w, nbr)
+            [K, Nv] = size(nbr);
+            if ~(isnumeric(w) && isequal(size(w), [K Nv]))
+                error('mcmc_bayes:invalidEdgeWeights', 'mcmc_bayes: prior.mrf.edgeWeights must be [K, Nv] = [%d, %d] (rows as build_neighbours).', K, Nv);
+            end
+            w   = double(w);
+            has = nbr > 0;
+            w(~has) = 0;
+            if any(~isfinite(w(has))) || any(w(has) < 0)
+                error('mcmc_bayes:invalidEdgeWeights', 'mcmc_bayes: prior.mrf.edgeWeights must be finite and >= 0.');
+            end
+            [kk, v] = find(has);
+            n   = double(nbr(sub2ind([K Nv], kk, v)));
+            wf  = w(sub2ind([K Nv], kk, v));
+            wb  = w(sub2ind([K Nv], K + 1 - kk, n));
+            if any(abs(wf - wb) > 1e-6 * max(abs(w(:))))
+                error('mcmc_bayes:invalidEdgeWeights', 'mcmc_bayes: prior.mrf.edgeWeights must be symmetric (w_ij == w_ji).');
+            end
+        end
+
+        % potential rho(x), elementwise (CPU or GPU); delta is the Huber threshold (u space)
+        function r = mrf_rho(x, potential, delta)
+            switch potential
+                case 'l1'
+                    r = abs(x);
+                case 'quadratic'
+                    r = 0.5 .* x.^2;
+                case 'huber'
+                    % Huber / delta: x^2/(2 delta) for |x| <= delta, |x| - delta/2 otherwise
+                    a = abs(x);
+                    m = min(a, delta);
+                    r = m .* (a - 0.5 .* m) ./ delta;
+            end
+        end
+
+        % change of the local MRF term Phi_i of the active voxels, current neighbours
+        function dPhi = mrf_local_delta(uNewA, uOldA, uAll, nbrA, wA, coef, delta, potential)
+        % Input
+        % -----
+        % uNewA, uOldA  : [dA, Na] proposed and current u of the active voxels (MRF parameters)
+        % uAll          : [dA, Nv] current u of all voxels (the neighbours' values)
+        % nbrA          : [K, Na] neighbour positions (an absent neighbour points to the voxel
+        %                 itself with weight 0)
+        % wA            : [K, Na] edge weights w_ij (0 for absent neighbours)
+        % coef          : [dA, 1] W_p / tau
+        % delta         : [dA, 1] Huber thresholds
+        % Output
+        % ------
+        % dPhi          : [1, Na] Phi_i(uNew) - Phi_i(uOld)
+        %
+            Na   = size(uNewA, 2);
+            dPhi = zeros(1, Na, 'like', uNewA);
+            for p = 1:size(uNewA, 1)
+                v    = uAll(p, :);
+                Unb  = reshape(v(nbrA), size(nbrA));                 % [K, Na]
+                r    = mcmc_bayes.mrf_rho(uNewA(p,:) - Unb, potential, delta(p)) - ...
+                       mcmc_bayes.mrf_rho(uOldA(p,:) - Unb, potential, delta(p));
+                dPhi = dPhi + coef(p) .* sum(wA .* r, 1);
+            end
+        end
+
+        % heuristic GPU memory (bytes) of one MRF sampler call, see the class header
+        function bytes = estimate_mrf_memory(Nm, Nv, Nvar, K)
+            bytes = mcmc_bayes.estimate_gpu_memory(Nm, Nv, Nvar) + 4 * K * Nv * 6;
+        end
+
+        % error if the coupled MRF run does not fit on the GPU
+        function check_mrf_memory(Nm, Nv, Nvar, K, mrf)
+            need = mcmc_bayes.estimate_mrf_memory(Nm, Nv, Nvar, K);
+            if isempty(mrf.maxGPUMemory)
+                dev   = gpuDevice;
+                avail = dev.AvailableMemory;
+            else
+                avail = mrf.maxGPUMemory;
+            end
+            if need > avail
+                error('mcmc_bayes:mrfMemory', ...
+                    ['mcmc_bayes: the MRF prior couples all %d voxels (%d neighbours each) into one GPU call; the estimated ' ...
+                     'memory (%.3g GB) exceeds the available %.3g GB. The MRF cannot be split into segments; reduce the mask ' ...
+                     '(e.g. fewer slices), the neighbourhood (radius, ''face'') or the number of measurements.'], ...
+                    Nv, K, need/1e9, avail/1e9);
+            end
+        end
+
+        % resolved MRF settings for out.settings.mrf
+        function s = mrf_settings(mrf, hier, K, NcolNominal, NcolUsed, Nedges)
+            switch mrf.potential
+                case 'l1';        rho = '|x|';
+                case 'huber';     rho = 'x^2/(2 delta) for |x| <= delta, |x| - delta/2 otherwise (Huber/delta)';
+                case 'quadratic'; rho = 'x^2/2';
+            end
+            if isempty(mrf.edgeWeights); ew = 'uniform (1)'; else; ew = 'user (fixed, symmetric)'; end
+            if strcmp(mrf.update, 'simultaneous')
+                upd = 'simultaneous: TEST ONLY negative control, targets the WRONG distribution';
+            else
+                upd = 'chromatic: one MH step per colour class, conditioning on the current other voxels';
+            end
+            s = struct( ...
+                'params',       {hier.params}, ...
+                'potential',    mrf.potential, ...
+                'rho',          rho, ...
+                'energy',       'Phi = (1/tau) sum_p W_p sum_{(i,j) in E} w_ij rho(u_i^p - u_j^p), each edge once, u space', ...
+                'tau',          mrf.tau, ...
+                'W',            mrf.W, ...
+                'Wrule',        mrf.Wrule, ...
+                'huberDelta',   mrf.huberDelta, ...
+                'delta',        mrf.delta, ...
+                'mode',         mrf.mode, ...
+                'radius',       mrf.radius, ...
+                'connectivity', mrf.connectivity, ...
+                'Kneighbours',  K, ...
+                'Ncolours',     NcolNominal, ...
+                'NcoloursUsed', NcolUsed, ...
+                'Nedges',       Nedges, ...
+                'edgeWeights',  ew, ...
+                'update',       upd, ...
+                'cost',         'forward model evaluated on all voxels per colour step: Ncolours forward evaluations per sweep (x Nvar componentwise)');
         end
 
         % largest |a - b| over all elements (equal infinities count as 0, one-sided NaN/Inf as Inf)
