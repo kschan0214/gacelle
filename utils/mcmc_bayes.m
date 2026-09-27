@@ -20,6 +20,10 @@ classdef mcmc_bayes < mcmc
 %   .adaptStepSize      : false         adapt proposal scale during burn-in (frozen afterwards)
 %   .adaptInterval      : 50            # iterations between two adaptation steps
 %   .adaptTarget        : []            target acceptance rate, [] -> 0.234 (joint) | 0.44 (componentwise)
+%   .adaptCovariance    : false         adaptive-covariance (Haario-style adaptive Metropolis) joint
+%                                       proposal, learnt per voxel during burn-in and frozen afterwards.
+%                                       Requires updateScheme = 'joint' and adaptStepSize = true (else error
+%                                       mcmc_bayes:adaptCovariance). See "Adaptive covariance" below
 %   .overdisp           : 0             relative over-dispersion of the start point for repetition > 1
 %   .prior              : []            structure with the fields
 %       .hierarchical   : []            hierarchical Normal prior N(u | mu, Sigma) on the transformed
@@ -381,12 +385,47 @@ classdef mcmc_bayes < mcmc
 %   The check cannot prove separability for all states; it catches the common failures
 %   (voxel-dimensioned varargin, fixed-size models).
 %
+% Adaptive covariance (fitting.adaptCovariance = true; joint update with adaptStepSize only)
+% -----------------------------------------------------------------------------------------
+% Proposal. Per voxel i, over all d = Nvar sampled rows of u (all rows the joint proposal moves):
+%       u' = u + lambda_i L_i eps,   eps ~ N(0, I_d),   L_i = chol(C_i, 'lower')
+%   Only the proposal changes: acceptance, caches, priors, out-of-bound rejection of 'linear'/'log'
+%   rows, the MRF colour steps (full and subsetForward) and the Gibbs block are as before. The
+%   random stream is the same as the diagonal proposal (one [Nvar,Nv] randn per colour step).
+% Phases (all rules are deterministic in k, the same for every voxel):
+%   1. k <= switch iteration kS: the diagonal proposal (L_i = diag(sigma_i), lambda = 1), with the
+%      usual per-voxel Robbins-Monro adaptation of log sigma (see Adaptation).
+%   2. Accumulation: from iteration 2*adaptInterval + 1 (warm-up of 2 adaptation windows discarded)
+%      to the end of burn-in, the state u_i after every iteration (accepted or not) updates the
+%      running mean and covariance of each voxel (Welford, double precision on the GPU).
+%   3. Switch: kS = the first adaptation step (k multiple of adaptInterval, within burn-in) with
+%      n >= 10 d accumulated states. There, lambda_i = 2.38/sqrt(d) (Roberts & Rosenthal scaling:
+%      proposal covariance (2.38^2/d) C_i) and the Robbins-Monro step continues on log lambda_i:
+%       log lambda_i <- log lambda_i + gamma_j (acc_j - adaptTarget)   (same gain sequence j).
+%   4. Refresh: at kS and at every later adaptation step within burn-in, C_i = sample covariance
+%      (n-1 normalisation, symmetrised) regularised as
+%       C_i <- C_i + 1e-6 diag(C_i) + 1e-12 max_p(C_i,pp) I    (+ realmin if C_i = 0),
+%      L_i = batched per-voxel Cholesky (double, chol_batch). A voxel keeps its previous L_i (at kS:
+%      diag(sigma_i) sqrt(d)/2.38, i.e. exactly its diagonal step) if the factorisation fails, a
+%      diagonal entry is not positive/finite, or it accepted fewer than d+1 moves since the start of
+%      the accumulation (C_i would be rank deficient).
+%   5. Freeze: lambda_i and L_i are fixed at the end of burn-in (no adaptation step after it). The
+%      kept chain is then a standard MH chain with a fixed symmetric Gaussian proposal per voxel, so
+%      the target is unchanged. Without enough burn-in for the switch (kS does not exist) the
+%      diagonal proposal is used throughout (warning mcmc_bayes:adaptCovarianceNoSwitch).
+%   The sigmoid cap sigma <= u-width is not applied to lambda_i L_i.
+% Output: out.diagnostics.adaptCovariance with .proposalCov [x,y,z,d,d,Nrep] (final lambda^2 L L'),
+%   .lambda, .condition (of proposalCov), .valid (sample covariance used) [x,y,z,Nrep], .params and
+%   .switchIteration; out.diagnostics.stepSize is sqrt(diag(proposalCov)); out.settings.adaptCovariance
+%   (logical) and .adaptCovarianceRule.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
 % Date modified: 26 September 2026 (Phase 3: hierarchical Normal prior; m counts non-zero weights only)
 % Date modified: 26 September 2026 (Phase 4: MRF prior, chromatic updates, two-stage empirical Bayes)
 % Date modified: 26 September 2026 (Phase 4b: forward model on the active colour only, subsetForward)
+% Date modified: 27 September 2026 (adaptive-covariance joint proposal, adaptCovariance)
 %
 
     methods
@@ -734,6 +773,24 @@ classdef mcmc_bayes < mcmc
                     'adaptStepSize is on but Nburnin (%d) < 2*adaptInterval (%d); %d adaptation step(s) only.', ...
                     Nburnin, 2*fitting.adaptInterval, Nadapt);
             end
+            % adaptive covariance (joint + adaptStepSize, validated in check_set_default_bayes)
+            isACov      = logical(fitting.adaptCovariance);
+            if isACov
+                acWarm  = 2*fitting.adaptInterval;              % warm-up iterations not accumulated
+                acMinN  = 10*Nvar;                              % accumulated states needed for the switch
+                acScale = 2.38/sqrt(Nvar);                      % initial lambda at the switch
+                acEps   = 1e-6;                                 % relative diagonal loading
+                acTiny  = 1e-12;                                % ridge, relative to max_p C_pp
+                kAd     = (1:Nadapt) .* fitting.adaptInterval;  % adaptation steps
+                kSwitch = kAd(find(kAd - acWarm >= acMinN, 1));
+                if isempty(kSwitch)
+                    kSwitch = NaN;
+                    warning('mcmc_bayes:adaptCovarianceNoSwitch', ...
+                        ['adaptCovariance is on but the burn-in (%d) is too short to accumulate %d states after the ' ...
+                         'warm-up of %d iterations at an adaptation step; the diagonal proposal is used throughout.'], ...
+                        Nburnin, acMinN, acWarm);
+                end
+            end
 
             % convert data into single datatype for better performance and put them into GPU
             y       = gpuArray( single(y) );
@@ -754,6 +811,12 @@ classdef mcmc_bayes < mcmc
             xPosterior  = zeros(Nvar, Nv, Ns, fitting.repetition,'single');
             acceptance  = zeros(Nv, Nblock, fitting.repetition,'single');
             stepSize    = zeros(Nv, Nvar, fitting.repetition,'single');
+            if isACov
+                acPropCov   = zeros(Nv, Nvar, Nvar, fitting.repetition, 'single');
+                acLambda    = zeros(Nv, fitting.repetition, 'single');
+                acCond      = zeros(Nv, fitting.repetition, 'single');
+                acValidOut  = false(Nv, fitting.repetition);
+            end
 
             % test-only fixed parameters, [1,Nv] each
             userFixed = struct();
@@ -952,6 +1015,18 @@ classdef mcmc_bayes < mcmc
             accPost = zeros(Nblock, Nv, 'like', uCurr);     % acceptance counts after burn-in
             jAdapt  = 0;
 
+            % adaptive covariance: running moments (double), acceptances since the accumulation start,
+            % and the proposal factor lambda.*L (used once acPhase is true)
+            if isACov
+                acPhase = false;
+                acN     = 0;
+                acMean  = zeros(Nvar, Nv, 'double', 'gpuArray');
+                acM2    = zeros(Nvar, Nvar, Nv, 'double', 'gpuArray');
+                acAccN  = zeros(1, Nv, 'like', uCurr);
+                acValid = false(1, Nv, 'gpuArray');
+                acLam   = [];  acL = [];  acLprop = [];
+            end
+
             counter = 0; start = tic;
             for k = 1:fitting.iteration
                 % 1-2. MH block, one colour class at a time (a single class with all voxels without MRF)
@@ -972,7 +1047,11 @@ classdef mcmc_bayes < mcmc
                     % and the active columns are used; everything else is computed on the Na active voxels
                     zAll            = randn(size(uCurr),'like',uCurr);
                     uA              = uCurr(:,act);
-                    uProposed       = uA + sigma(:,act).*zAll(:,act);
+                    if isACov && acPhase
+                        uProposed   = uA + mcmc_bayes.acov_step(acLprop(:,:,act), zAll(:,act));
+                    else
+                        uProposed   = uA + sigma(:,act).*zAll(:,act);
+                    end
                     if hasJac
                         [xProposed, logJProposed] = this.transform_inverse_logjac_fused(uProposed, code, lb, ub);
                         if dropJac; logJProposed = logJProposed .* jacRow; end
@@ -1072,7 +1151,11 @@ classdef mcmc_bayes < mcmc
                 elseif ~isComponent
                     % ========== joint update: all parameters of a voxel together ==========
                     % 1. make a proposal with normal distribution in u space
-                    uProposed       = uCurr + sigma.*randn(size(uCurr),'like',uCurr);
+                    if isACov && acPhase
+                        uProposed   = uCurr + mcmc_bayes.acov_step(acLprop, randn(size(uCurr),'like',uCurr));
+                    else
+                        uProposed   = uCurr + sigma.*randn(size(uCurr),'like',uCurr);
+                    end
                     % back to native space; find proposal that is out of bound for exclusion
                     if hasJac
                         % fused inverse transform and log-Jacobian (one GPU kernel)
@@ -1218,13 +1301,36 @@ classdef mcmc_bayes < mcmc
                 if k <= Nburnin
                     if isAdapt
                         accWin = accWin + isAccepted;
+                        % adaptive covariance: accumulate the state after this iteration (after the warm-up)
+                        if isACov && k > acWarm
+                            [acMean, acM2, acN] = this.welford_update(acMean, acM2, acN, uCurr);
+                            acAccN  = acAccN + isAccepted;
+                        end
                         if mod(k, fitting.adaptInterval) == 0
                             jAdapt  = jAdapt + 1;
                             delta   = this.adapt_gain(jAdapt) .* (accWin./fitting.adaptInterval - fitting.adaptTarget);
+                            if isACov && acPhase
+                                % covariance phase: Robbins-Monro on log lambda (one scalar per voxel)
+                                acLam   = acLam .* exp(delta);
+                            else
                             % joint: delta is [1,Nv] and scales all parameters of a voxel together
                             sigma   = sigma .* exp(delta);
                             if hasJac; sigma(~isLinear,:) = min(sigma(~isLinear,:), uWidth(~isLinear)); end
+                            end
                             accWin(:) = 0;
+                            % adaptive covariance: switch (first time) and refresh C_i, L_i
+                            if isACov && k >= kSwitch
+                                if ~acPhase
+                                    % previous factor at the switch: the diagonal step, lambda = 2.38/sqrt(d)
+                                    acL     = eye(Nvar, 'like', uCurr) .* reshape(sigma ./ acScale, 1, Nvar, Nv);
+                                    acLam   = acScale .* ones(1, Nv, 'like', uCurr);
+                                    acPhase = true;
+                                end
+                                [acL, acValid] = this.acov_refresh(acM2, acN, acAccN, acL, acValid, acEps, acTiny);
+                            end
+                            if isACov && acPhase
+                                acLprop = reshape(acLam, 1, 1, Nv) .* acL;
+                            end
                         end
                     end
                 else
@@ -1251,6 +1357,22 @@ classdef mcmc_bayes < mcmc
 
             acceptance(:,:,ii)  = gather(accPost.' ./ (fitting.iteration - Nburnin));
             stepSize(:,:,ii)    = gather(sigma.');
+            if isACov
+                % final (frozen) proposal covariance lambda^2 L L' (the diagonal one if never switched)
+                if acPhase
+                    Pc = gather(pagemtimes(acLprop, 'none', acLprop, 'transpose'));
+                else
+                    Pc = gather(eye(Nvar, 'like', uCurr) .* reshape(sigma.^2, 1, Nvar, Nv));
+                    acLam = ones(1, Nv, 'like', uCurr);
+                end
+                acPropCov(:,:,:,ii) = permute(Pc, [3 1 2]);
+                dPc                 = reshape(Pc, Nvar*Nvar, Nv);
+                stepSize(:,:,ii)    = sqrt(dPc(1:Nvar+1:end, :)).';
+                sv                  = pagesvd(double(Pc));                  % [d,1,Nv], descending
+                acCond(:,ii)        = reshape(sv(1,1,:) ./ sv(end,1,:), Nv, 1);
+                acLambda(:,ii)      = gather(acLam(:));
+                acValidOut(:,ii)    = gather(acValid(:));
+            end
             if isHier && isGibbs; muLast(:,ii) = mu; SigmaLast(:,:,ii) = Sigma; end
             end
 
@@ -1271,6 +1393,24 @@ classdef mcmc_bayes < mcmc
             diagnostics.sampledParams   = fitting.modelParams(:).';
             diagnostics.recoveredParams = lik.recoveredParams;
             if fitting.checkCache; diagnostics.cacheCheck = cacheErr; end
+            if isACov
+                diagnostics.adaptCovariance = struct('params', {fitting.modelParams(:).'}, ...
+                    'proposalCov', acPropCov, 'lambda', acLambda, 'condition', acCond, 'valid', acValidOut, ...
+                    'switchIteration', kSwitch);
+                acRule = struct( ...
+                    'proposal',         'u'' = u + lambda_i L_i eps, eps ~ N(0,I_d), L_i = chol(C_i,''lower''), d = # sampled parameters', ...
+                    'warmup',           acWarm, ...
+                    'accumulation',     'Welford mean/covariance (double) of the state after every iteration, from warmup+1 to the end of burn-in', ...
+                    'minSamples',       acMinN, ...
+                    'switchIteration',  kSwitch, ...
+                    'refresh',          'C_i and L_i at every adaptation step from switchIteration to the end of burn-in', ...
+                    'regularisation',   'C <- C + 1e-6*diag(C) + 1e-12*max(diag(C))*I; keep previous L_i if chol fails or < d+1 accepted moves', ...
+                    'lambdaInit',       acScale, ...
+                    'lambdaRule',       'lambda = 2.38/sqrt(d) at the switch, then log(lambda) += 2*j^(-0.6)*(acc_j - adaptTarget)', ...
+                    'frozen',           'lambda_i, L_i fixed after burn-in (fixed symmetric proposal, target unchanged)');
+            else
+                acRule = [];
+            end
             if isHier
                 hyper = struct('params', {hier.params}, ...
                                'transform', {this.transform_description(method(hIdx), fitting.lb(hIdx), fitting.ub(hIdx))}, ...
@@ -1304,6 +1444,8 @@ classdef mcmc_bayes < mcmc
                 'adaptTarget',          fitting.adaptTarget, ...
                 'adaptRule',            'log(sigma) += 2*j^(-0.6)*(acc_j - adaptTarget), every adaptInterval iterations within burn-in', ...
                 'Nadapt',               Nadapt*isAdapt, ...
+                'adaptCovariance',      isACov, ...
+                'adaptCovarianceRule',  acRule, ...
                 'Nburnin',              Nburnin, ...
                 'overdisp',             fitting.overdisp, ...
                 'overdispRule',         'u0 + overdisp*W.*randn for repetition > 1, W = T(ub)-T(lb), or 100 x initial u-step if unbounded', ...
@@ -1351,6 +1493,7 @@ classdef mcmc_bayes < mcmc
                          'adaptStepSize',       false;
                          'adaptInterval',       50;
                          'adaptTarget',         [];
+                         'adaptCovariance',     false;
                          'overdisp',            0;
                          'prior',               [];
                          'fixedParams',         []};
@@ -1395,6 +1538,7 @@ classdef mcmc_bayes < mcmc
             if ~isfield(fitting,'adaptStepSize');       fitting2.adaptStepSize      = false;         end
             if ~isfield(fitting,'adaptInterval');       fitting2.adaptInterval      = 50;            end
             if ~isfield(fitting,'adaptTarget');         fitting2.adaptTarget        = [];            end
+            if ~isfield(fitting,'adaptCovariance');     fitting2.adaptCovariance    = false;         end
             if ~isfield(fitting,'overdisp');            fitting2.overdisp           = 0;             end
             if ~isfield(fitting,'prior');               fitting2.prior              = [];            end
             if ~isfield(fitting,'forceNewPath');        fitting2.forceNewPath       = false;         end
@@ -1411,6 +1555,24 @@ classdef mcmc_bayes < mcmc
                 if strcmpi(fitting2.updateScheme,'componentwise'); fitting2.adaptTarget = 0.44; else; fitting2.adaptTarget = 0.234; end
             end
             if isempty(fitting2.overdisp); fitting2.overdisp = 0; end
+
+            % adaptive covariance: joint update with step-size adaptation only
+            ac = fitting2.adaptCovariance;
+            if isempty(ac); ac = false; end
+            if ~((islogical(ac) || isnumeric(ac)) && isscalar(ac) && any(double(ac) == [0 1]))
+                error('mcmc_bayes:adaptCovariance', 'mcmc_bayes: fitting.adaptCovariance must be true or false.');
+            end
+            fitting2.adaptCovariance = logical(ac);
+            if fitting2.adaptCovariance && ~strcmpi(fitting2.updateScheme, 'joint')
+                error('mcmc_bayes:adaptCovariance', ...
+                    ['mcmc_bayes: fitting.adaptCovariance = true needs updateScheme = ''joint'' (got ''%s''): the ' ...
+                     'adaptive covariance proposal moves all sampled parameters of a voxel together.'], char(fitting2.updateScheme));
+            end
+            if fitting2.adaptCovariance && ~(fitting2.adaptStepSize)
+                error('mcmc_bayes:adaptCovariance', ...
+                    ['mcmc_bayes: fitting.adaptCovariance = true needs adaptStepSize = true (the covariance and its ' ...
+                     'scale are learnt during burn-in at the adaptation steps).']);
+            end
         end
 
         % display the new sampler settings
@@ -1423,6 +1585,9 @@ classdef mcmc_bayes < mcmc
                 disp(['Adapt step size   : true (interval ', num2str(fitting.adaptInterval), ', target ', num2str(fitting.adaptTarget), ')']);
             else
                 disp( 'Adapt step size   : false');
+            end
+            if isfield(fitting,'adaptCovariance') && fitting.adaptCovariance
+                disp( 'Adapt covariance  : true (adaptive Metropolis, burn-in only)');
             end
             disp(['Over-dispersion   : ', num2str(fitting.overdisp)]);
             disp(['Likelihood        : ', char(fitting.likelihood)]);
@@ -2591,6 +2756,62 @@ classdef mcmc_bayes < mcmc
             out     = reshape(out, [numel(idx) 1 1 sz(nd+1:end)]);
         end
 
+        %% adaptive covariance helpers
+        % one Welford step per voxel: running mean m [d,N] and sum of outer products M2 [d,d,N] (double)
+        function [m, M2, n] = welford_update(m, M2, n, u)
+        % u : [d,N] new state (any float class, CPU or GPU), accumulated in the class of m
+            u   = cast(u, 'like', m);
+            [d, N] = size(u);
+            n   = n + 1;
+            d1  = u - m;
+            m   = m + d1 ./ n;
+            d2  = u - m;
+            M2  = M2 + reshape(d1, d, 1, N) .* reshape(d2, 1, d, N);
+        end
+
+        % batched lower Cholesky factor of [d,d,N] symmetric matrices (lower triangle used),
+        % elementwise over pages (CPU or GPU); ok [1,N] is false where a pivot is not > 0 / not finite
+        function [L, ok] = chol_batch(C)
+            [d, ~, N] = size(C);
+            L   = zeros(size(C), 'like', C);
+            ok  = true(1, 1, N, 'like', C(1) > 0);
+            for j = 1:d
+                s       = C(j,j,:) - sum(L(j,1:j-1,:).^2, 2);
+                ok      = ok & (s > 0) & isfinite(s);
+                Ljj     = sqrt(max(s, realmin(underlyingType(s))));
+                L(j,j,:) = Ljj;
+                if j < d
+                    L(j+1:d,j,:) = (C(j+1:d,j,:) - sum(L(j+1:d,1:j-1,:) .* L(j,1:j-1,:), 2)) ./ Ljj;
+                end
+            end
+            ok  = reshape(ok, 1, N);
+        end
+
+        % refresh the Cholesky factors from the running moments (see "Adaptive covariance")
+        function [L, valid] = acov_refresh(M2, n, accN, Lprev, validPrev, epsRel, tinyRel)
+        % M2 [d,d,N] double, n # accumulated states, accN [1,N] acceptances since the accumulation
+        % start, Lprev [d,d,N] previous factor (kept where the new one is not usable)
+            [d, ~, N] = size(M2);
+            C       = M2 ./ max(n - 1, 1);
+            C       = (C + permute(C, [2 1 3])) ./ 2;
+            dC      = reshape(C, d*d, N);
+            dC      = dC(1:d+1:end, :);                                 % [d,N] diagonals
+            I       = eye(d, 'like', C);
+            Creg    = C + epsRel .* (I .* reshape(dC, 1, d, N)) ...
+                        + I .* reshape(tinyRel .* max(max(dC, [], 1), 0) + realmin('double'), 1, 1, N);
+            [Lnew, ok] = mcmc_bayes.chol_batch(Creg);
+            ok      = ok & all(isfinite(dC), 1) & all(dC > 0, 1) & (reshape(accN, 1, N) >= d + 1);
+            L       = Lprev;
+            L(:,:,ok) = cast(Lnew(:,:,ok), 'like', Lprev);
+            valid   = reshape(validPrev, 1, N) | ok;
+        end
+
+        % proposal increment Lp*z per voxel: Lp [d,d,N], z [d,N] -> [d,N]
+        function s = acov_step(Lp, z)
+            [d, N] = size(z);
+            s = reshape(sum(Lp .* reshape(z, 1, d, N), 2), d, N);
+        end
+
         % Robbins-Monro gain of the j-th adaptation step
         function gamma = adapt_gain(j)
             gamma = 2 * j.^(-0.6);
@@ -2847,6 +3068,17 @@ classdef mcmc_bayes < mcmc
 
             % test-only cache check
             if isfield(diagnostics,'cacheCheck'); out.diagnostics.cacheCheck = diagnostics.cacheCheck; end
+
+            % adaptive covariance: final proposal covariance [x,y,z,d,d,Nrep], lambda/condition/valid [x,y,z,Nrep]
+            if isfield(diagnostics,'adaptCovariance')
+                ac = diagnostics.adaptCovariance;
+                out.diagnostics.adaptCovariance = struct('params', {ac.params}, ...
+                    'proposalCov',  mcmc_bayes.vec2image(ac.proposalCov, mask), ...
+                    'lambda',       mcmc_bayes.vec2image(ac.lambda, mask), ...
+                    'condition',    mcmc_bayes.vec2image(ac.condition, mask), ...
+                    'valid',        mcmc_bayes.vec2image(ac.valid, mask), ...
+                    'switchIteration', ac.switchIteration);
+            end
 
             % hierarchical prior: hyperparameter samples and summaries (u space)
             if isfield(diagnostics,'hyper') && ~isempty(diagnostics.hyper)

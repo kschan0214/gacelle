@@ -15,8 +15,11 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     % of the chromatic sweep and of run_two_stage.
     %
     % All tests except testNewPath*, testFusedKernel*, testRecoverNuisance*, testHierarchicalCache*,
-    % testMrfRuns and testRunTwoStage
+    % testMrfRuns, testRunTwoStage and testAdaptCovariance{Runs,CacheConsistency,CorrelatedToy,NoSwitch}
     % are pure math and need no GPU.
+    % Adaptive covariance (fitting.adaptCovariance): batched Cholesky, Welford moments, refresh fallback,
+    % option errors, cache consistency (plain/hierarchical/MRF, full and subsetForward colour steps) and
+    % a correlated 2D linear-Gaussian toy with known posterior.
     %
     % Tolerances (stated before running; see each test):
     %   transform round trip        : |x - inv(fwd(x))| <= 1e-10*(ub-lb) (double), 1e-4*(ub-lb) (single)
@@ -72,6 +75,19 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     voxel-dimensioned varargin input (differs / errors / wrong size); the fallback run is
     %     bitwise identical to subsetForward = false (same seed); with the subset, the caches equal a
     %     fresh full-volume recompute within 1e-5 and inactive voxels never move (exactly 0)
+    %   Adaptive covariance:
+    %   chol_batch vs chol(.,'lower') on random SPD [d,d,50], d = 1..8 (double, CPU and GPU):
+    %     max |L - Lref| <= 1e-10 * max|Lref|; indefinite / NaN pages flagged (ok = false)
+    %   welford_update vs mean/cov of a stored sample (d = 4, 30 voxels, 500 states, double): RelTol 1e-10
+    %   acov_refresh: usable voxel == chol of the regularised covariance (RelTol 1e-10); zero-variance voxel
+    %     and voxel with < d+1 acceptances keep their previous factor exactly
+    %   caches with adaptCovariance (checkCache): <= 1e-5; MRF inactive voxels never move (exactly 0);
+    %     subsetForward true vs false with the elementwise ivim_fwd: identical posterior (same seed)
+    %   correlated toy (posterior corr -0.995, 200 voxels, 4000 kept iterations, flat prior, known noise):
+    %     per-voxel posterior mean: mean over voxels of z^2 in [0.5, 2], z = (mean - exact)/sqrt(var/ESS);
+    %     pooled posterior covariance (samples minus the exact per-voxel mean): every entry within
+    %     5 SE of the exact s^2 (A'A)^-1, SE = sqrt(2/sum_voxels ESS) relative;
+    %     median ESS/iteration of u1 >= 5 x that of adaptCovariance = false (same seed and burn-in)
     %
     % Kwok-Shing Chan @ MGH
 
@@ -86,6 +102,7 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             'adaptStepSize',            {{'adaptStepSize', true}}, ...
             'adaptInterval',            {{'adaptInterval', 100}}, ...
             'adaptTarget',              {{'adaptTarget', 0.3}}, ...
+            'adaptCovariance',          {{'adaptCovariance', true}}, ...
             'overdisp',                 {{'overdisp', 0.01}}, ...
             'prior',                    {{'prior', struct('hierarchical', struct())}}, ...
             'fixedParams',              {{'fixedParams', struct('noise', 0.1)}} ...
@@ -1362,6 +1379,228 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyEqual(numel(out.stage1.voxelIndex), ceil(0.5*nnz(mask)));
             testCase.verifyEqual(size(out.posterior.u1, 1), nnz(mask));
         end
+
+        %% Adaptive covariance (fitting.adaptCovariance)
+        function testAcovCholBatch(testCase)
+            rng(61);
+            devs = {@(x) x};
+            if canUseGPU; devs{end+1} = @gpuArray; end
+            for kd = 1:numel(devs)
+                for d = 1:8
+                    N = 50; C = zeros(d, d, N); Lref = zeros(d, d, N);
+                    for n = 1:N
+                        B = randn(d, d+2); C(:,:,n) = B*B.'/(d+2) + 1e-3*eye(d) .* 10.^(2*randn);
+                        Lref(:,:,n) = chol(C(:,:,n), 'lower');
+                    end
+                    [L, ok] = mcmc_bayes.chol_batch(devs{kd}(C));
+                    L = gather(L);
+                    testCase.verifyTrue(all(gather(ok)));
+                    testCase.verifyLessThanOrEqual(max(abs(L - Lref), [], 'all'), 1e-10 * max(abs(Lref), [], 'all'), sprintf('d = %d', d));
+                    testCase.verifyEqual(triu(L(:,:,1), 1), zeros(d));      % lower triangular
+                end
+                % indefinite and NaN pages are flagged, the others are not affected
+                C = repmat(eye(3), 1, 1, 3); C(:,:,2) = [1 2 0; 2 1 0; 0 0 1]; C(1,1,3) = NaN;
+                [L, ok] = mcmc_bayes.chol_batch(devs{kd}(C));
+                testCase.verifyEqual(gather(ok), [true false false]);
+                testCase.verifyEqual(gather(L(:,:,1)), eye(3));
+            end
+        end
+
+        function testAcovWelford(testCase)
+            rng(62); d = 4; Nv = 30; T = 500;
+            A = randn(d); X = 3 + pagemtimes(A, randn(d, T, Nv)) .* reshape(logspace(-3, 2, Nv), 1, 1, Nv);   % [d,T,Nv]
+            m = zeros(d, Nv); M2 = zeros(d, d, Nv); n = 0;
+            for t = 1:T
+                [m, M2, n] = mcmc_bayes.welford_update(m, M2, n, squeeze(X(:,t,:)));
+            end
+            testCase.verifyEqual(n, T);
+            for v = 1:Nv
+                Cref = cov(X(:,:,v).');
+                testCase.verifyEqual(m(:,v), mean(X(:,:,v), 2), 'RelTol', 1e-10);
+                testCase.verifyEqual(M2(:,:,v)/(n-1), Cref, 'AbsTol', 1e-10*max(diag(Cref)));
+            end
+            % single-precision GPU input accumulated in double on the GPU
+            if canUseGPU
+                mG = zeros(d, Nv, 'double', 'gpuArray'); M2G = zeros(d, d, Nv, 'double', 'gpuArray'); nG = 0;
+                Xs = single(X);
+                for t = 1:T; [mG, M2G, nG] = mcmc_bayes.welford_update(mG, M2G, nG, gpuArray(squeeze(Xs(:,t,:)))); end
+                testCase.verifyTrue(isa(M2G, 'gpuArray') && strcmp(underlyingType(M2G), 'double'));
+                Cref = cov(double(Xs(:,:,7)).');
+                testCase.verifyEqual(gather(M2G(:,:,7))/(nG-1), Cref, 'AbsTol', 1e-10*max(diag(Cref)));
+            end
+        end
+
+        function testAcovRefreshFallback(testCase)
+            d = 2; N = 3; n = 50;
+            C = cat(3, [2 0.5; 0.5 1], zeros(2), [1 0.9; 0.9 1]);
+            M2 = C * (n-1);
+            accN  = [10 10 2];                                  % voxel 3: < d+1 acceptances
+            Lprev = repmat(single([0.3 0; 0 0.4]), 1, 1, N);
+            [L, valid] = mcmc_bayes.acov_refresh(M2, n, accN, Lprev, false(1, N), 1e-6, 1e-12);
+            Creg = C(:,:,1) + 1e-6*diag(diag(C(:,:,1))) + (1e-12*2 + realmin('double'))*eye(2);
+            testCase.verifyEqual(double(L(:,:,1)), chol(Creg, 'lower'), 'RelTol', 1e-6);   % single output
+            testCase.verifyEqual(L(:,:,2), Lprev(:,:,2));        % zero variance: previous factor kept
+            testCase.verifyEqual(L(:,:,3), Lprev(:,:,3));        % too few acceptances: previous factor kept
+            testCase.verifyEqual(valid, [true false false]);
+            [~, valid] = mcmc_bayes.acov_refresh(M2, n, accN, Lprev, [false true false], 1e-6, 1e-12);
+            testCase.verifyEqual(valid, [true true false]);      % once valid, stays valid (older factor kept)
+            % the proposal increment is L*z per voxel
+            Lp = randn(3, 3, 4); z = randn(3, 4);
+            s  = mcmc_bayes.acov_step(Lp, z);
+            for v = 1:4; testCase.verifyEqual(s(:,v), Lp(:,:,v)*z(:,v), 'AbsTol', 1e-12); end
+        end
+
+        function testAdaptCovarianceOptionErrors(testCase)
+            f = struct('adaptCovariance', true, 'adaptStepSize', true, 'updateScheme', 'componentwise');
+            testCase.verifyError(@() mcmc_bayes.check_set_default_bayes(f), 'mcmc_bayes:adaptCovariance');
+            testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], f, []), 'mcmc_bayes:adaptCovariance');
+            f = struct('adaptCovariance', true);                 % adaptStepSize defaults to false
+            testCase.verifyError(@() mcmc_bayes.check_set_default_bayes(f), 'mcmc_bayes:adaptCovariance');
+            f = struct('adaptCovariance', true, 'adaptStepSize', false);
+            testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], f, []), 'mcmc_bayes:adaptCovariance');
+            f = struct('adaptCovariance', 'yes', 'adaptStepSize', true);
+            testCase.verifyError(@() mcmc_bayes.check_set_default_bayes(f), 'mcmc_bayes:adaptCovariance');
+            f = struct('adaptCovariance', [1 1], 'adaptStepSize', true);
+            testCase.verifyError(@() mcmc_bayes.check_set_default_bayes(f), 'mcmc_bayes:adaptCovariance');
+            % valid settings and defaults
+            f = mcmc_bayes.check_set_default_bayes(struct('adaptCovariance', 1, 'adaptStepSize', true));
+            testCase.verifyTrue(islogical(f.adaptCovariance) && f.adaptCovariance);
+            f = mcmc_bayes.check_set_default_bayes(struct());
+            testCase.verifyFalse(f.adaptCovariance);
+            testCase.verifyTrue(mcmc_bayes.isLegacy(struct('adaptCovariance', false)));
+        end
+
+        function testAdaptCovarianceCacheConsistency(testCase)
+            % caches with the adaptive-covariance proposal: gaussian + transforms, free hierarchical
+            % prior, MRF (full and subsetForward colour steps)
+            gacelletest.assumeGPU(testCase);
+            [y, mask, w, pars0, fitting, obj] = McmcBayesUnitTest.r2starSetup();
+            g = fitting;
+            g.lb = [0; 0; 0.001]; g.ub = [2; Inf; 0.1]; g.parameterTransform = {'sigmoid','log','linear'};
+            g.adaptStepSize = true; g.adaptInterval = 10; g.adaptCovariance = true; g.checkCache = true;
+            g.iteration = 300; g.burnin = 150; g.repetition = 2; g.overdisp = 0.01;
+            for hierCfg = {[], struct('hyperprior','niw')}
+                g.prior = []; g.ub(2) = 200;                    % 'log' outside the hierarchy: finite ub
+                if ~isempty(hierCfg{1}); g.prior.hierarchical = hierCfg{1}; g.ub(2) = Inf; end
+                out = mcmc_bayes().optimisation(y, mask, w, pars0, g, @obj.FWD, 'mcmc', g);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.Ncheck, g.iteration*g.repetition);
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5);
+                ac  = out.diagnostics.adaptCovariance;
+                testCase.verifyEqual(ac.switchIteration, 50);    % first multiple of 10 with k - 20 >= 30
+                testCase.verifyEqual(size(ac.proposalCov), [size(mask,1:3) 3 3 2]);
+                testCase.verifyEqual(ac.params, {'M0','R2star','noise'});
+                testCase.verifyTrue(out.settings.adaptCovariance);
+                testCase.verifyGreaterThanOrEqual(min(out.posterior.noise(:)), single(g.lb(3)));
+                testCase.verifyLessThanOrEqual(max(out.posterior.noise(:)), single(g.ub(3)));
+                % stepSize = sqrt(diag(proposalCov))
+                P = reshape(ac.proposalCov, [], 3, 3, 2);
+                testCase.verifyEqual(reshape(out.diagnostics.stepSize.R2star, [], 2), reshape(sqrt(P(:,2,2,:)), [], 2), 'RelTol', 1e-6);
+            end
+            % MRF, subsetForward true and false, linear Gaussian grid (joint)
+            [yy, mask, x0, f, ~] = McmcBayesUnitTest.linGaussGrid([6 5 3], 2);
+            rng(3); x0.u1 = 0.5 + 0.3*randn(size(mask)); x0.u2 = 0.5 + 0.3*randn(size(mask));
+            A   = McmcBayesUnitTest.linGaussA(2);
+            fwd = @(p) McmcBayesUnitTest.linGaussFwd(p, A);
+            f.checkCache = true; f.adaptStepSize = true; f.adaptInterval = 10; f.adaptCovariance = true;
+            f.iteration = 200; f.burnin = 100;
+            for sf = [true false]
+                f.prior.mrf = struct('potential','l1','subsetForward', sf);
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+                testCase.verifyEqual(out.settings.mrf.subsetForward.used, sf);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.inactiveMoved, 0, 'a voxel outside the active colour moved');
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5);
+                testCase.verifyEqual(out.diagnostics.adaptCovariance.switchIteration, 40);
+                v = out.diagnostics.adaptCovariance.valid;
+                testCase.verifyGreaterThanOrEqual(mean(double(v(mask))), 0.9);
+            end
+        end
+
+        function testAdaptCovarianceRuns(testCase)
+            % IVIM grid (marginal_S0noise, log/sigmoid rows, fixed hierarchical + MRF): subsetForward on and
+            % off give the same chain for the elementwise ivim_fwd with the covariance proposal
+            gacelletest.assumeGPU(testCase);
+            addpath(fullfile(fileparts(mfilename('fullpath')), 'validation', 'mcmc_bayes'));
+            [y, maskI, x0I, g, fwdI] = McmcBayesUnitTest.ivimGrid();
+            g.adaptCovariance = true; g.adaptInterval = 10; g.burnin = 100; g.iteration = 200; g.checkCache = true;
+            g.prior.mrf = struct('potential','l1','tau',1,'mode','2d','radius',2);
+            rng(11); parallel.gpu.rng(11);
+            outT = mcmc_bayes().optimisation(y, maskI, [], x0I, g, fwdI);
+            testCase.verifyTrue(outT.settings.mrf.subsetForward.used);
+            testCase.verifyEqual(outT.diagnostics.adaptCovariance.switchIteration, 50);   % d = 3 (D, F, Dstar)
+            testCase.verifyEqual(outT.diagnostics.adaptCovariance.params, {'D','F','Dstar'});
+            cc = outT.diagnostics.cacheCheck;
+            testCase.verifyEqual(cc.inactiveMoved, 0);
+            testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5);
+            g.prior.mrf.subsetForward = false;
+            rng(11); parallel.gpu.rng(11);
+            outF = mcmc_bayes().optimisation(y, maskI, [], x0I, g, fwdI);
+            testCase.verifyEqual(outT.posterior, outF.posterior);
+            testCase.verifyEqual(outT.diagnostics.adaptCovariance.proposalCov, outF.diagnostics.adaptCovariance.proposalCov);
+        end
+
+        function testAdaptCovarianceNoSwitch(testCase)
+            % burn-in too short for the switch: warning, diagonal proposal throughout (== adaptCovariance false)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.linGaussSetup(20, 2);
+            f.adaptStepSize = true; f.adaptInterval = 20; f.burnin = 50;     % warm-up 40, steps at 20, 40 only
+            rng(8); parallel.gpu.rng(8);
+            outD = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+            f.adaptCovariance = true;
+            rng(8); parallel.gpu.rng(8);
+            outA = testCase.verifyWarning(@() mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd), 'mcmc_bayes:adaptCovarianceNoSwitch');
+            testCase.verifyEqual(outA.posterior, outD.posterior);
+            testCase.verifyTrue(isnan(outA.diagnostics.adaptCovariance.switchIteration));
+            P = reshape(outA.diagnostics.adaptCovariance.proposalCov, [], 2, 2);
+            testCase.verifyEqual(P(:,1,1), outD.diagnostics.stepSize.u1(:).^2, 'RelTol', 1e-6);
+            testCase.verifyEqual(P(:,1,2), zeros(20, 1, 'single'));
+        end
+
+        function testAdaptCovarianceCorrelatedToy(testCase)
+            % flat prior, known noise: posterior N((A'A)^-1 A'y, s^2 (A'A)^-1), correlation -0.995
+            gacelletest.assumeGPU(testCase);
+            addpath(fullfile(fileparts(mfilename('fullpath')), 'validation', 'mcmc_bayes'));
+            rng(5); Nv = 200; m = 6; s = 0.3; d = 2;
+            A   = [ones(m,1), 1 + 0.15*linspace(-1,1,m).'];
+            P   = s^2 * inv(A.'*A);
+            y   = A*randn(d, Nv) + s*randn(m, Nv);
+            uhat = (A.'*A) \ (A.'*y);
+            yy  = reshape(y.', [Nv 1 1 m]); mask = true(Nv,1);
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf;-Inf;0]; f.ub = [Inf;Inf;10]; f.xStepSize = [0.2;0.2;0.01];
+            f.algorithm = 'MH'; f.iteration = 6000; f.burnin = 2000; f.thinning = 1; f.metric = {'mean'};
+            f.fixedParams = struct('noise', s); f.adaptStepSize = true; f.adaptInterval = 50;
+            x0  = struct('u1', zeros(Nv,1), 'u2', zeros(Nv,1));
+            fwd = @(p) lingauss_fwd(p, A);
+            essIt = zeros(1, 2);
+            for ac = [false true]
+                g = f; g.adaptCovariance = ac;
+                rng(1); parallel.gpu.rng(1);
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+                Ns  = size(out.posterior.u1, 2);
+                E   = [out.diagnostics.ess.u1(:) out.diagnostics.ess.u2(:)].';          % [2,Nv]
+                essIt(ac+1) = median(E(1,:)) / Ns;
+                if ~ac; continue; end
+                mh  = [mean(out.posterior.u1, 2) mean(out.posterior.u2, 2)].';
+                z   = (mh - uhat) ./ sqrt(diag(P) ./ E);
+                testCase.verifyGreaterThanOrEqual(mean(z.^2, 2), [0.5; 0.5]);
+                testCase.verifyLessThanOrEqual(mean(z.^2, 2), [2; 2]);
+                r   = [reshape(double(out.posterior.u1) - uhat(1,:).', 1, []); reshape(double(out.posterior.u2) - uhat(2,:).', 1, [])];
+                Ch  = r*r.' / size(r, 2);
+                se  = sqrt(2 / sum(E(1,:)));
+                testCase.verifyLessThanOrEqual(max(abs(Ch ./ P - 1), [], 'all'), 5*se, sprintf('pooled covariance ./ exact:\n%s', mat2str(Ch./P, 4)));
+                acd = out.diagnostics.adaptCovariance;
+                testCase.verifyEqual(acd.switchIteration, 150);
+                testCase.verifyTrue(all(acd.valid));
+                Pc  = squeeze(median(acd.proposalCov, 1));
+                testCase.verifyEqual(double(Pc(1,2)/sqrt(Pc(1,1)*Pc(2,2))), P(1,2)/sqrt(P(1,1)*P(2,2)), 'AbsTol', 0.01);
+                testCase.verifyGreaterThan(median(out.diagnostics.acceptance(:)), 0.15);
+                testCase.verifyLessThan(median(out.diagnostics.acceptance(:)), 0.4);
+            end
+            gain = essIt(2) / essIt(1);
+            testCase.log(matlab.unittest.Verbosity.Terse, sprintf('correlated toy: ESS/iteration u1 %.4f (diagonal) -> %.4f (adaptCovariance), gain %.1f', essIt(1), essIt(2), gain));
+            testCase.verifyGreaterThanOrEqual(gain, 5);
+        end
     end
 
     methods (Static)
@@ -1592,6 +1831,7 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             fitting.adaptStepSize       = false;
             fitting.adaptInterval       = 50;
             fitting.adaptTarget         = [];
+            fitting.adaptCovariance     = false;
             fitting.overdisp            = 0;
             fitting.prior               = [];
         end
