@@ -406,6 +406,13 @@ classdef mcmc_bayes < mcmc
                 return
             end
 
+            % free hierarchical prior + MRF: two-stage empirical Bayes (run_two_stage), so that
+            % model wrappers can reach it through optimisation
+            if mcmc_bayes.is_two_stage(fitting)
+                out = this.run_two_stage(data, mask, weights, pars0, fitting, FWDfunc, varargin{:});
+                return
+            end
+
             fitting = this.check_set_default_bayes(fitting);
 
             % only Metropolis-Hastings on the new path
@@ -810,6 +817,8 @@ classdef mcmc_bayes < mcmc
                 if isGibbs
                     muPost      = zeros(d, Ns, fitting.repetition);
                     SigmaPost   = zeros(d, d, Ns, fitting.repetition);
+                    muLast      = zeros(d, fitting.repetition);         % final Gibbs state per chain
+                    SigmaLast   = zeros(d, d, fitting.repetition);
                 end
             end
             if fitting.checkCache
@@ -1242,6 +1251,7 @@ classdef mcmc_bayes < mcmc
 
             acceptance(:,:,ii)  = gather(accPost.' ./ (fitting.iteration - Nburnin));
             stepSize(:,:,ii)    = gather(sigma.');
+            if isHier && isGibbs; muLast(:,ii) = mu; SigmaLast(:,:,ii) = Sigma; end
             end
 
             % convert final posterior distribution into structure
@@ -1268,6 +1278,8 @@ classdef mcmc_bayes < mcmc
                 if isGibbs
                     hyper.muPost    = muPost;
                     hyper.SigmaPost = SigmaPost;
+                    hyper.muLast    = muLast;
+                    hyper.SigmaLast = SigmaLast;
                 else
                     hyper.mu        = hier.mu;
                     hyper.Sigma     = hier.Sigma;
@@ -2317,6 +2329,32 @@ classdef mcmc_bayes < mcmc
             end
         end
 
+        % true if prior.mrf is set (non-empty, not false)
+        function tf = has_mrf(fitting)
+            tf = isstruct(fitting) && isfield(fitting,'prior') && isstruct(fitting.prior) && isfield(fitting.prior,'mrf') && ...
+                 ~isempty(fitting.prior.mrf) && ~(islogical(fitting.prior.mrf) && isscalar(fitting.prior.mrf) && ~fitting.prior.mrf);
+        end
+
+        % true if prior.hierarchical is set with free hyperparameters (fixed = false)
+        function tf = has_free_hierarchy(fitting)
+            tf = false;
+            if ~(isstruct(fitting) && isfield(fitting,'prior') && isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical')); return; end
+            h = fitting.prior.hierarchical;
+            if isempty(h) || (islogical(h) && isscalar(h) && ~h); return; end
+            tf = ~(isstruct(h) && isfield(h,'fixed') && ~isempty(h.fixed) && logical(h.fixed));
+        end
+
+        % free hierarchical prior + MRF: dispatched to run_two_stage by optimisation
+        function tf = is_two_stage(fitting)
+            tf = mcmc_bayes.has_mrf(fitting) && mcmc_bayes.has_free_hierarchy(fitting);
+        end
+
+        % true if the prior couples voxels, so the whole volume must be sampled in one call
+        % (free hierarchical prior or MRF); model wrappers must then not segment the data
+        function tf = needs_single_segment(fitting)
+            tf = mcmc_bayes.has_mrf(fitting) || mcmc_bayes.has_free_hierarchy(fitting);
+        end
+
         % forward model output must be [Nm, Nv] (measurements x voxels)
         function check_forward_size(g, Nm, Nv)
             if size(g,1) ~= Nm || size(g,2) ~= Nv || ndims(g) > 2
@@ -2688,8 +2726,9 @@ classdef mcmc_bayes < mcmc
         % x     : samples, [Nv, Ns, Nchains]
         % Output
         % ------
-        % R     : split-R-hat, [Nv, 1]
+        % R     : split-R-hat, [Nv, 1] (NaN with fewer than 4 samples per chain)
         %
+            if size(x,2) < 4; R = nan(size(x,1), 1); return; end
             xs          = mcmc_bayes.split_chains(double(x));
             n           = size(xs,2);
             chainMean   = mean(xs,2);                       % [Nv,1,M]
@@ -2707,8 +2746,9 @@ classdef mcmc_bayes < mcmc
         % x     : samples, [Nv, Ns, Nchains]
         % Output
         % ------
-        % N_eff : effective sample size, [Nv, 1]
+        % N_eff : effective sample size, [Nv, 1] (NaN with fewer than 4 samples per chain)
         %
+            if size(x,2) < 4; N_eff = nan(size(x,1), 1); return; end
             xs          = mcmc_bayes.split_chains(double(x));
             [~, n, M]   = size(xs);
 
@@ -2771,6 +2811,7 @@ classdef mcmc_bayes < mcmc
                 for k = 1:numel(diagnostics.recoveredParams)
                     p   = diagnostics.recoveredParams{k};
                     idx = find(strcmp(fitting.modelParams, p));
+                    if isempty(idx) || isempty(xPosterior.(p)); continue; end   % e.g. no kept samples (burn-in >= iterations)
                     fitting.lb(idx) = min(fitting.lb(idx), double(min(xPosterior.(p)(:))));
                     fitting.ub(idx) = max(fitting.ub(idx), double(max(xPosterior.(p)(:))));
                 end
@@ -2832,6 +2873,14 @@ classdef mcmc_bayes < mcmc
             SigmaF  = reshape(Sigma, d*d, Ns, Nrep);
             H.posterior.mu      = mu;
             H.posterior.Sigma   = Sigma;
+            if Ns == 0 && isfield(hyper,'muLast')
+                % no kept samples (burn-in >= iterations, e.g. a model wrapper's short memory probe):
+                % summarise by the final Gibbs state, averaged over chains, so that run_two_stage can proceed
+                H.mean.mu       = mean(hyper.muLast, 2);        H.mean.Sigma    = mean(hyper.SigmaLast, 3);
+                H.median.mu     = H.mean.mu;                    H.median.Sigma  = H.mean.Sigma;
+                H.summary       = 'no kept samples: mean/median are the final Gibbs state averaged over chains';
+                return
+            end
             H.mean.mu           = mean(reshape(mu, d, []), 2);
             H.mean.Sigma        = reshape(mean(reshape(SigmaF, d*d, []), 2), d, d);
             H.median.mu         = median(reshape(mu, d, []), 2);

@@ -1063,11 +1063,14 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             % mrf without hierarchical
             g = f; g.prior = struct('mrf', struct());
             testCase.verifyError(@() run(g), 'mcmc_bayes:mrfRequiresHierarchical');
-            % mrf with free hyperparameters
+            % mrf with free hyperparameters: optimisation dispatches to run_two_stage (Phase 6a);
+            % setup_mrf itself still rejects the combination
             g = f; g.prior = struct('hierarchical', struct(), 'mrf', struct('tau', 1));
-            testCase.verifyError(@() run(g), 'mcmc_bayes:mrfFreeHyperparameters');
+            testCase.verifyTrue(mcmc_bayes.is_two_stage(g));
+            gs = mcmc_bayes.setup_likelihood(mcmc_bayes.check_set_default_bayes(g));
+            testCase.verifyError(@() mcmc_bayes.setup_mrf(gs, mcmc_bayes.setup_hierarchical(gs)), 'mcmc_bayes:mrfFreeHyperparameters');
             g.prior.mrf = true;
-            testCase.verifyError(@() run(g), 'mcmc_bayes:mrfFreeHyperparameters');
+            testCase.verifyTrue(mcmc_bayes.is_two_stage(g));
             % invalid MRF options
             bad = {struct('potential','tv'), struct('tau',0), struct('tau',[1 2]), struct('W',[1 -1]), struct('W',[1 1 1]), ...
                    struct('mode','1d'), struct('radius',1.5), struct('radius',2,'connectivity','face'), ...
@@ -1138,6 +1141,44 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             loc0 = mcmc_bayes.mrf_local_delta(single(uNew), single(u(i)), single(u), nbrS(:,i), single(w(:,i)), single(1/tau), single(1), 'l1');
             ref0 = sum(w(:,i) .* (abs(uNew - u(nbrS(:,i))') - abs(u(i) - u(nbrS(:,i))'))) / tau;
             testCase.verifyLessThanOrEqual(abs(double(loc0) - ref0), 1e-5*max(1, abs(ref0)));
+        end
+
+        %% Phase 6a: helpers used by the model wrappers (two-stage dispatch, single-segment guard)
+        function testCouplingHelpers(testCase)
+            fixedH = struct('fixed', true, 'mu', 0, 'Sigma', 1);
+            cases = { ...  % prior, has_mrf, has_free_hierarchy, is_two_stage, needs_single_segment
+                [],                                                  false, false, false, false; ...
+                struct(),                                            false, false, false, false; ...
+                struct('hierarchical', struct()),                    false, true,  false, true;  ...
+                struct('hierarchical', true),                        false, true,  false, true;  ...
+                struct('hierarchical', false),                       false, false, false, false; ...
+                struct('hierarchical', fixedH),                      false, false, false, false; ...
+                struct('hierarchical', fixedH, 'mrf', struct()),     true,  false, false, true;  ...
+                struct('hierarchical', struct(), 'mrf', struct()),   true,  true,  true,  true;  ...
+                struct('hierarchical', struct(), 'mrf', false),      false, true,  false, true};
+            for k = 1:size(cases,1)
+                f = struct('prior', {cases{k,1}});
+                testCase.verifyEqual([mcmc_bayes.has_mrf(f) mcmc_bayes.has_free_hierarchy(f) mcmc_bayes.is_two_stage(f) ...
+                                      mcmc_bayes.needs_single_segment(f)], [cases{k,2:5}], sprintf('case %d', k));
+            end
+            testCase.verifyFalse(mcmc_bayes.needs_single_segment(struct()));
+        end
+
+        %% no kept samples (burn-in >= iterations, as in a model wrapper's memory probe) must not error
+        function testZeroKeptSamples(testCase)
+            gacelletest.assumeGPU(testCase);
+            [y, mask, te] = McmcBayesLegacyTest.r2starData();
+            f = struct('solver','mcmc','algorithm','MH','iteration',100,'burnin',10000,'thinning',10,'metric',{{'mean','std'}}, ...
+                       'mcmcClass','mcmc_bayes','likelihood','marginal_S0noise','S0Param','M0', ...
+                       'parameterTransform',{{'linear','sigmoid','linear'}},'adaptStepSize',true,'repetition',2);
+            out = gpuR2starMapping(te).estimate(y, mask, f);                                   % flat
+            testCase.verifyEqual(size(out.posterior.R2star, 2), 0);
+            f.prior = struct('hierarchical', struct('params', {{'R2star'}}));
+            out = gpuR2starMapping(te).estimate(y, mask, f);                                   % free hierarchical
+            testCase.verifyTrue(all(isfinite(out.hyper.mean.mu)));
+            f.prior.mrf = struct('mode','3d');
+            out = gpuR2starMapping(te).estimate(repmat(y,[1 1 2 1]), repmat(mask,[1 1 2]), f); % two-stage
+            testCase.verifyEqual(size(out.posterior.R2star, 2), 0);
         end
 
         %% forward-model output size check

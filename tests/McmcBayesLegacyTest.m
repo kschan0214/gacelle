@@ -24,6 +24,33 @@ classdef McmcBayesLegacyTest < matlab.unittest.TestCase
             testCase.checkBitwiseIdentical(struct());
         end
 
+        function testR2starWrapperHookBitwise(testCase)
+            % Phase 6a: gpuR2starMapping.estimate with fitting.mcmcClass = 'mcmc_bayes' (and no new
+            % option) must be bitwise identical to the default hook ('mcmc')
+            gacelletest.assumeGPU(testCase);
+            [y, mask, te] = McmcBayesLegacyTest.r2starData();
+            f = struct('solver','mcmc', 'algorithm','MH', 'iteration',200, 'thinning',2, 'burnin',0.1, ...
+                       'metric',{{'mean','std'}}, 'start','default');
+            runSeed = 48463;
+            rng(runSeed); parallel.gpu.rng(runSeed);
+            outRef = gpuR2starMapping(te).estimate(y, mask, f);
+            f.mcmcClass = 'mcmc_bayes';
+            rng(runSeed); parallel.gpu.rng(runSeed);
+            outNew = gpuR2starMapping(te).estimate(y, mask, f);
+            testCase.verifyTrue(isequaln(outNew, outRef), 'wrapper output differs between mcmcClass ''mcmc'' and ''mcmc_bayes''');
+        end
+
+        function testR2starWrapperSingleSegmentGuard(testCase)
+            % a voxel-coupling prior with the data divided into segments must error
+            gacelletest.assumeGPU(testCase);
+            [y, mask, te] = McmcBayesLegacyTest.r2starData();
+            y = repmat(y, [1 1 4 1]); mask = repmat(mask, [1 1 4]);
+            f = struct('solver','mcmc', 'algorithm','MH', 'iteration',20, 'mcmcClass','mcmc_bayes', 'NSegmentUser', 2, ...
+                       'likelihood','marginal_S0noise', 'S0Param','M0', 'parameterTransform','sigmoid', ...
+                       'prior', struct('hierarchical', struct('params', {{'R2star'}})));
+            testCase.verifyError(@() gpuR2starMapping(te).estimate(y, mask, f), 'gpuR2starMapping:singleSegment');
+        end
+
         function testExplicitDefaultsBitwiseIdenticalToMcmc(testCase)
             opts.parameterTransform = 'linear';
             opts.likelihood         = 'gaussian';
@@ -35,6 +62,19 @@ classdef McmcBayesLegacyTest < matlab.unittest.TestCase
             opts.overdisp           = 0;
             opts.prior              = [];
             testCase.checkBitwiseIdentical(opts);
+        end
+    end
+
+    methods (Static)
+        function [y, mask, te] = r2starData()
+            % small synthetic multi-echo data, as in SmokeFit_R2starMappingTest
+            rng(1); gpurng(1);
+            te   = linspace(0, 40e-3, 6);
+            pars = struct('M0', 1 + 0.1*rand(1,8), 'R2star', 30 + 5*rand(1,8));
+            s    = gpuR2starMapping(te).FWD(pars);
+            y    = s + mean(pars.M0)/50 * randn(size(s));
+            y    = double(permute(y, [2 3 4 1]));   % [x,y,z,TE]
+            mask = true(size(y, 1:3));
         end
     end
 

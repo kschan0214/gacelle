@@ -126,6 +126,12 @@ classdef gpuR2starMapping < handle
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting);
+            % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
+            if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
+                error('gpuR2starMapping:singleSegment', ...
+                    ['The mcmc_bayes prior couples voxels (free hierarchical or MRF) and needs the whole volume in one ' ...
+                     'GPU call, but the data were divided into %d segments. Reduce the volume or use fixed hyperparameters.'], NSegment);
+            end
 
             % parameter estimation
             out = [];
@@ -240,7 +246,7 @@ classdef gpuR2starMapping < handle
                     fitting.xStepSize = this.step;
 
                     % initial global optimisation
-                    out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver, fitting);
+                    out         = feval(fitting.mcmcClass).optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver, fitting);
                     
             end
 
@@ -469,6 +475,8 @@ classdef gpuR2starMapping < handle
 
                 % mcmc
                 fitting2 = mcmc.check_set_default_basic(fitting);
+                % sampler class: 'mcmc' (default) or the experimental 'mcmc_bayes'
+                if ~isfield(fitting,'mcmcClass');   fitting2.mcmcClass = 'mcmc';    end
 
             else
 
