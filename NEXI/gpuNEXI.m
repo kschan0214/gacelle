@@ -27,7 +27,7 @@ classdef gpuNEXI < handle
     % future solver-conditional parameter should likewise go last.
         modelParams     = {'fa'  ;'Da'  ;'De'   ;'ra'   ;'p2'; 'noise'};
         ub              = [   1  ;   3  ;   3   ;   1   ;  1 ;     0.1];
-        lb              = [ eps  ; eps  ; eps   ;1/250  ; eps;    0.01];
+        lb              = [ eps  ; eps  ; eps   ;1/250  ; eps;    0.001];
         startPoint      = [ 0.4  ;   2  ;   1   ; 0.05  ; 0.2;   0.005];
         step            = [  0.05;  0.15;   0.15;  0.005;0.05;   0.005];
     end

@@ -24,7 +24,7 @@ classdef gpuAxCaliberSMT < handle
     % future solver-conditional parameter should likewise go last.
         modelParams     = {'a';                   'f';'fcsf';                'DeR';'noise'};
         ub              = [ 20;                     1;     1;                    3;    0.1];
-        lb              = [0.1;                     0;     0;                 0.01;   0.01];
+        lb              = [0.1;                     0;     0;                 0.01;   0.001];
         step            = [0.24875;              0.05;  0.05;   0.0393421052631579;  0.005];
         startPoint      = [1.5925;	0.777777777777778;   0.1;    0.482105263157895;	  0.05];
     end
