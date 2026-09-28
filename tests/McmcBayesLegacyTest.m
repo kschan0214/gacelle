@@ -92,6 +92,32 @@ classdef McmcBayesLegacyTest < matlab.unittest.TestCase
             testCase.verifyError(@() obj().estimate(y, mask, [], f), 'gpuSANDI:singleSegment');
         end
 
+        function testMEAxCaliberSMTWrapperHookBitwise(testCase)
+            % gpuMEAxCaliberSMT (sandbox) with fitting.mcmcClass = 'mcmc_bayes' (and no new option)
+            % must be bitwise identical to the default hook ('mcmc')
+            gacelletest.assumeGPU(testCase);
+            [y, mask, obj] = McmcBayesLegacyTest.meaxcaliberData();
+            f = struct('solver','mcmc', 'algorithm','MH', 'iteration',200, 'thinning',2, 'burnin',0.1, ...
+                       'metric',{{'mean','std'}}, 'start','default');
+            runSeed = 48463;
+            rng(runSeed); parallel.gpu.rng(runSeed);
+            outRef = obj().estimate(y, mask, f, []);
+            f.mcmcClass = 'mcmc_bayes';
+            rng(runSeed); parallel.gpu.rng(runSeed);
+            outNew = obj().estimate(y, mask, f, []);
+            testCase.verifyTrue(isequaln(outNew, outRef), 'wrapper output differs between mcmcClass ''mcmc'' and ''mcmc_bayes''');
+        end
+
+        function testMEAxCaliberSMTWrapperSingleSegmentGuard(testCase)
+            gacelletest.assumeGPU(testCase);
+            [y, mask, obj] = McmcBayesLegacyTest.meaxcaliberData();
+            y = repmat(y, [1 1 4 1]); mask = repmat(mask, [1 1 4]);
+            f = struct('solver','mcmc', 'algorithm','MH', 'iteration',20, 'mcmcClass','mcmc_bayes', 'NSegmentUser', 2, ...
+                       'likelihood','marginal_noise', 'parameterTransform','sigmoid', 'start','default', ...
+                       'prior', struct('hierarchical', struct('params', {{'f','fcsf','DeR','r','R2e'}})));
+            testCase.verifyError(@() obj().estimate(y, mask, f, []), 'gpuMEAxCaliberSMT:singleSegment');
+        end
+
         function testR2starWrapperSingleSegmentGuard(testCase)
             % a voxel-coupling prior with the data divided into segments must error
             gacelletest.assumeGPU(testCase);
@@ -118,6 +144,20 @@ classdef McmcBayesLegacyTest < matlab.unittest.TestCase
     end
 
     methods (Static)
+        function [y, mask, obj] = meaxcaliberData()
+            % small synthetic two-TE spherical-mean data for the sandbox gpuMEAxCaliberSMT
+            addpath(fullfile(fileparts(fileparts(mfilename('fullpath'))), 'AxCaliberSMT', 'sandbox'));
+            rng(1); gpurng(1);
+            b0 = [0 0.35 1.5 3.45 6]; b = [b0 b0]; d = 6*ones(size(b)); D = 13*ones(size(b)); te = [0.051*ones(size(b0)) 0.092*ones(size(b0))];
+            obj  = @() gpuMEAxCaliberSMT(b, d, D, te, [], []);
+            pars = struct('f', 0.3 + 0.5*rand(1,8), 'fcsf', 0.1*rand(1,8), 'DeR', 0.3 + 0.8*rand(1,8), ...
+                          'r', 0.5 + 2*rand(1,8), 'R2e', 15 + 20*rand(1,8));
+            s    = obj().FWD(pars);
+            s    = s ./ s(1,:);
+            y    = double(permute(s + randn(size(s))/100, [3 2 4 1]));
+            mask = true(size(y, 1:3));
+        end
+
         function [y, mask, obj] = sandiData()
             % small synthetic spherical-mean data, as in SmokeFit_SANDITest; obj is a constructor handle
             rng(1); gpurng(1);

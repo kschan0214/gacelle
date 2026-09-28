@@ -34,7 +34,7 @@ classdef gpuMEAxCaliberSMT < handle
     % future solver-conditional parameter should likewise go last.
         modelParams     = {'f'; 'fcsf';'DeR';  'r';'R2e';'k2a';'R2a';  'S0';'noise'};
         ub              = [  1;      1;  1.7;    5;   50;    4;   20;    10;   0.1];
-        lb              = [  0;      0;    0;1e-10;    1;    0;    5;     0;  0.01];
+        lb              = [  0;      0;    0;1e-10;    1;    0;    5;     0; 0.001];
         startPoint      = [0.6;   0.05;    1;  0.5;   30;  2.4;    8;     1; 0.005];
         step            = [0.05;   0.1; 0.48;  0.8;  3.5; 0.29; 1.07;   0.1; 0.005];
     end
@@ -93,7 +93,7 @@ classdef gpuMEAxCaliberSMT < handle
     methods
 
         % constructuor
-        function this = gpuMEAxCaliberSMT(b, delta, Delta, te, tissueProperties, model)
+        function this = gpuMEAxCaliberSMT(b, delta, Delta, te, tissueProperties, model, varargin)
         % Estimation of neurite fraction and intrinsic diffusivity using SMT with th eoption of performing compartmental T2 mapping
         % smt = gpuSMT(b, te)
         %       output:
@@ -113,6 +113,9 @@ classdef gpuMEAxCaliberSMT < handle
         %               .R2c:   Intrinsic axonal R2 [1/s] (default:1/126.97e-3)
         %               .rho2:  coeffient of 1/r dependence [um/s] (default:1.16*2)
         %           -model: 'narrow' or 'wide' pulse
+        %           - varargin{1}: (optional) Nav, # averaged volumes (e.g. gradient directions x averages)
+        %                          per unique shell, in the class's sorted shell order (this.b/this.te);
+        %                          used as relative precision weights (default: all ones)
         %
         %  Authors: 
         %  Kwok-Shing Chan (kchan2@mgh.harvard.edu)
@@ -163,6 +166,16 @@ classdef gpuMEAxCaliberSMT < handle
             end
             this.Scsf   = ( single(exp(-this.b*this.Dcsf).*exp(-this.te*this.R2csf)) );
 
+            % number of averaged volumes per unique shell (relative precision weights)
+            if nargin > 6 && ~isempty(varargin{1})
+                this.Nav = single(varargin{1}(:));
+                if numel(this.Nav) ~= numel(this.b)
+                    error('gpuMEAxCaliberSMT:Nav', 'Nav must have one entry per unique shell (%d), in the sorted shell order.', numel(this.b));
+                end
+            else
+                this.Nav = ones(size(this.b), 'single');
+            end
+
         end
 
         % update properties according to lmax
@@ -186,6 +199,7 @@ classdef gpuMEAxCaliberSMT < handle
                     this.lb(idx)            = [];
                     this.ub(idx)            = [];
                     this.startPoint(idx)    = [];
+                    this.step(idx)          = [];
                 end
             end
 
@@ -196,6 +210,7 @@ classdef gpuMEAxCaliberSMT < handle
                 this.lb(idx)                = [];
                 this.ub(idx)                = [];
                 this.startPoint(idx)        = [];
+                this.step(idx)              = [];
             end
 
             % whether fitting CSF compartment or not
@@ -205,6 +220,7 @@ classdef gpuMEAxCaliberSMT < handle
                 this.lb(idx)                = [];
                 this.ub(idx)                = [];
                 this.startPoint(idx)        = [];
+                this.step(idx)              = [];
             end
             % whether fitting CSF compartment or not
             if ~fitting.isFitk2a
@@ -213,6 +229,7 @@ classdef gpuMEAxCaliberSMT < handle
                 this.lb(idx)                = [];
                 this.ub(idx)                = [];
                 this.startPoint(idx)        = [];
+                this.step(idx)              = [];
             end
 
             % whether fitting a per-voxel amplitude S0 (see FWD/
@@ -225,6 +242,7 @@ classdef gpuMEAxCaliberSMT < handle
                 this.lb(idx)                = [];
                 this.ub(idx)                = [];
                 this.startPoint(idx)        = [];
+                this.step(idx)              = [];
             end
 
         end
@@ -311,6 +329,12 @@ classdef gpuMEAxCaliberSMT < handle
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+            % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
+            if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
+                error('gpuMEAxCaliberSMT:singleSegment', ...
+                    ['The mcmc_bayes prior couples voxels (free hierarchical or MRF) and needs the whole volume in one ' ...
+                     'GPU call, but the data were divided into %d segments. Reduce the volume or use fixed hyperparameters.'], NSegment);
+            end
 
             % parameter estimation
             out = [];
@@ -478,7 +502,7 @@ classdef gpuMEAxCaliberSMT < handle
                     case 'mcmc'
                         fitting.xStepSize = this.step;
 
-                        out         = mcmc().optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
+                        out         = feval(fitting.mcmcClass).optimisation(data, mask, w, pars0, fitting, @this.FWD, fitting.solver);
                 end
             end
 
@@ -845,7 +869,7 @@ classdef gpuMEAxCaliberSMT < handle
             w = zeros([dims numel(this.b)*numel(l)],'single');
             for kl = 1:(lmax/2+1)
                 for kb = 1:numel(this.b)
-                    w(:,:,:,(kl-1)*numel(this.b)+kb) = 1/ (2*l(kl)+1);
+                    w(:,:,:,(kl-1)*numel(this.b)+kb) = this.Nav(kb) / (2*l(kl)+1);
                 end
             end
             % if L1 then take square root
@@ -1424,6 +1448,8 @@ classdef gpuMEAxCaliberSMT < handle
                 % mcmc
                 fitting2                = mcmc.check_set_default_basic(fitting);
                 fitting2.lossFunction   = 'l2'; % for computing weights
+                % sampler class: 'mcmc' (default) or the experimental 'mcmc_bayes'
+                if ~isfield(fitting,'mcmcClass');   fitting2.mcmcClass = 'mcmc';    end
 
             else
 
