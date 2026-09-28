@@ -47,7 +47,7 @@ classdef SmokeFit_R2starMappingTest < matlab.unittest.TestCase
             testCase.verifyTrue(isfield(out, 'final'));
             testCase.verifyTrue(isfield(out.final, 'M0'));
             testCase.verifyTrue(isfield(out.final, 'R2star'));
-            testCase.verifyEqual(size(out.final.M0), size(y, 1:3));
+            testCase.verifyEqual(size(out.final.M0, 1:3), size(y, 1:3));
             testCase.verifyTrue(all(isfinite(out.final.M0(:))));
             testCase.verifyTrue(all(isfinite(out.final.R2star(:))));
         end

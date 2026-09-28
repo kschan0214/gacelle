@@ -219,6 +219,12 @@ classdef gpuAxonalT2model < handle
             % to the caller: NSegment == 1 (no splitting) whenever the
             % data already fits, identical to the previous behaviour.
             [seg,NSegment] = utils.find_optimal_segment_3D(this, dwi, mask, fitting, pars0);
+            % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
+            if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
+                error('gpuAxonalT2model:singleSegment', ...
+                    ['The mcmc_bayes prior couples voxels (free hierarchical or MRF) and needs the whole volume in one ' ...
+                     'GPU call, but the data were divided into %d segments. Reduce the volume or use fixed hyperparameters.'], NSegment);
+            end
 
             % parameter estimation
             out = [];
@@ -353,7 +359,7 @@ classdef gpuAxonalT2model < handle
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    out         = mcmc().optimisation(dwi, mask, w, pars0, fitting, @this.FWD);
+                    out         = feval(fitting.mcmcClass).optimisation(dwi, mask, w, pars0, fitting, @this.FWD);
             end
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
@@ -651,6 +657,8 @@ classdef gpuAxonalT2model < handle
 
                 % mcmc
                 fitting2                = mcmc.check_set_default_basic(fitting);
+                % sampler class: 'mcmc' (default) or the experimental 'mcmc_bayes'
+                if ~isfield(fitting,'mcmcClass');   fitting2.mcmcClass = 'mcmc';    end
                 fitting2.lossFunction   = 'l2'; % for computing weights
 
             else

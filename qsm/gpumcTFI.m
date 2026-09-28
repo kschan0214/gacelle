@@ -470,7 +470,15 @@ classdef gpumcTFI < handle
             end
 
             % phi
-            phi0        = data(:,:,:,1) .* conj(exp(1i*2*pi*extraData.fint.*this.te(1)));
+            if isfield(extraData,'fint')
+                fint    = extraData.fint;
+            elseif size(data,4) > 1
+                % no initial field: wrapped estimate from the first two echoes [Hz]
+                fint    = angle(data(:,:,:,2) .* conj(data(:,:,:,1))) / (2*pi*(this.te(2)-this.te(1)));
+            else
+                fint    = 0;
+            end
+            phi0        = data(:,:,:,1) .* conj(exp(1i*2*pi*fint.*this.te(1)));
             phi         = polyfit3D_NthOrder(double(angle(phi0)),mask,4) .* mask;
             pars0.phi   = single(phi);
 
@@ -699,6 +707,7 @@ classdef gpumcTFI < handle
             if ~isfield(fitting,'lambdaCSF');   fitting2.lambdaCSF   = 0;        end
             if ~isfield(fitting,'lambdaTV');    fitting2.lambdaTV    = 0;        end
             if ~isfield(fitting,'precond');     fitting2.precond    = 'none';        end
+            if ~isfield(fitting,'start');       fitting2.start      = 'prior';       end
 
             fitting2.enableComplex      = false;
             fitting2.isMaskedOut        = false;
