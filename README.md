@@ -20,6 +20,7 @@ GACELLE provides two types of solvers to handle parameter estimation prolem:
 | [SANDI](https://gacelle.readthedocs.io/en/latest/supported_models/SANDI.html) (`gpuSANDI`) | Soma radius/fraction, neurite density, extracellular diffusivity | Multi-shell diffusion MRI |
 | [NEXI](https://gacelle.readthedocs.io/en/latest/supported_models/NEXI.html) (`gpuNEXI`) | Neurite volume fraction, compartment diffusivities, inter-compartment exchange rate | Multi-shell, multi-diffusion-time diffusion MRI |
 | [mcmicro](https://gacelle.readthedocs.io/en/latest/supported_models/mcmicro.html) (`gpumcmicro`) | Neurite volume fraction and intrinsic diffusivity (± compartmental R2) | Multi-shell (± multi-echo) diffusion MRI |
+| [IVIM](https://gacelle.readthedocs.io/en/latest/supported_models/IVIM.html) (`gpuIVIM`) | Perfusion fraction, tissue diffusion and pseudo-diffusion coefficients | Multi-b diffusion MRI |
 | [GRE-MWI](https://gacelle.readthedocs.io/en/latest/supported_models/GREMWI.html) (`gpuGREMWI`) | Myelin water fraction and compartmental relaxation/frequency parameters | Multi-echo GRE |
 | [MCR-MWI](https://gacelle.readthedocs.io/en/latest/supported_models/MCRMWI.html) (`gpuMCRMWI`) | Myelin water fraction, compartmental R1/R2*/frequency, myelin water exchange rate | Variable-flip-angle, multi-echo GRE |
 | [JointR1R2star](https://gacelle.readthedocs.io/en/latest/supported_models/JointR1R2star.html) (`gpuJointR1R2starMapping`) | R1 and R2* jointly | Variable-flip-angle, multi-echo GRE |
