@@ -6,13 +6,15 @@ classdef McmcClassHookTest < matlab.unittest.TestCase
     %     the default hook ('mcmc');
     %   - with a mcmc_bayes-only option (likelihood = 'marginal_noise') the hook reaches
     %     mcmc_bayes (out.settings.likelihood is set) and the fit is finite;
-    %   - a prior that couples voxels with NSegmentUser = 2 errors <Class>:singleSegment.
+    %   - a prior that couples voxels with NSegmentUser = 2 errors <Class>:singleSegment;
+    %   - FWD with the legacy ensemble label 'GW' reshapes per walker as with 'ensemble'.
     % Data: the tiny synthetic datasets of the SmokeFit_*Test of each model.
     %
     % Kwok-Shing Chan @ MGH
 
     properties (TestParameter)
         model = {'NEXI','JointR1R2starMapping','GREMWI','mcmicro','IVIM'}
+        ensembleModel = {'JointR1R2starMapping','GREMWI'}
     end
 
     methods (TestClassSetup)
@@ -61,6 +63,38 @@ classdef McmcClassHookTest < matlab.unittest.TestCase
             f.likelihood = 'marginal_noise'; f.parameterTransform = 'sigmoid';
             f.prior = struct('hierarchical', struct('params', {McmcClassHookTest.hierParam(model)}));
             testCase.verifyError(@() obj().estimate(y, mask, extraData, f), ['gpu' model ':singleSegment']);
+        end
+
+        function testEnsembleLegacyLabelFWD(testCase, ensembleModel)
+            % FWD called directly with the legacy label 'GW' reshapes per walker exactly as with
+            % 'ensemble' (estimate() converts the label itself, so this is the direct-call path)
+            gacelletest.assumeGPU(testCase);
+            Nv = 4; Nw = 6; N = Nv*Nw; rng(2);
+            switch ensembleModel
+                case 'JointR1R2starMapping'
+                    obj = gpuJointR1R2starMapping(linspace(1.5e-3, 42e-3, 5), 45e-3, [5 20 50]);
+                    p   = struct('M0', gpuArray(single(1 + rand(1,N))), 'R1', gpuArray(single(0.5 + rand(1,N))), ...
+                                 'R2star', gpuArray(single(20 + 20*rand(1,N))));
+                    x   = struct('b1', gpuArray(ones(1,N,'single')));
+                    fwd = @(alg) obj.FWD(p, x, 'mcmc', struct('algorithm', alg, 'Nwalker', Nw));
+                case 'GREMWI'
+                    obj = gpuGREMWI(linspace(1.5e-3, 42e-3, 6));
+                    B0  = 3;
+                    p   = struct('S0', 1 + rand(1,N), 'MWF', 0.1*rand(1,N), 'IWF', 0.2 + 0.6*rand(1,N), ...
+                                 'R2sMW', 75 + 75*rand(1,N), 'R2sIW', 10 + 20*rand(1,N), 'R2sEW', 20 + 20*rand(1,N), ...
+                                 'freqMW', 10*rand(1,N)/B0/gpuGREMWI.gyro, 'freqIW', -5*rand(1,N)/B0/gpuGREMWI.gyro, ...
+                                 'dfreqBKG', 0.01*rand(1,N), 'dpini', 0.1*rand(1,N));
+                    x   = struct('freqBKG', zeros(1,N), 'pini', zeros(1,N), 'ff', ones(1,N), 'theta', zeros(1,N));
+                    p   = structfun(@(v) gpuArray(single(v)), p, 'UniformOutput', false);    % as passed by mcmc
+                    x   = structfun(@(v) gpuArray(single(v)), x, 'UniformOutput', false);
+                    fs  = struct('isComplex', true, 'solver', 'mcmc', 'Nwalker', Nw, 'DIMWI', ...
+                                 struct('isFitIWF', true, 'isFitFreqMW', true, 'isFitFreqIW', true, 'isFitR2sEW', true));
+                    fwd = @(alg) obj.FWD(p, setfield(fs, 'algorithm', alg), x); %#ok<SFLD>
+            end
+            sE = fwd('ensemble');
+            sG = fwd('GW');
+            testCase.verifyEqual(size(sE, 2:3), [Nv Nw]);
+            testCase.verifyEqual(gather(sG), gather(sE));
         end
     end
 

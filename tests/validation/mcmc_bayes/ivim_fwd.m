@@ -43,7 +43,7 @@ if isfield(pars, 'S0') && ~isempty(pars.S0)
 end
 
 % reshape s for ensemble solver
-if ~isempty(fitting) && isfield(fitting, 'algorithm') && strcmpi(fitting.algorithm, 'ensemble')
+if ~isempty(fitting) && isfield(fitting, 'algorithm') && any(strcmpi(fitting.algorithm, {'ensemble','gw'}))
     s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
 end
 

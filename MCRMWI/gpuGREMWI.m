@@ -577,7 +577,7 @@ classdef gpuGREMWI < handle
             if isfield(fitting,'solver') && strcmpi(fitting.solver, 'mcmc')
                 % reshape s for GW
                 if ~isempty(fitting)
-                    if strcmpi(fitting.algorithm,'ensemble')
+                    if any(strcmpi(fitting.algorithm,{'ensemble','gw'}))     % 'GW': legacy label of 'ensemble'
                         s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
                     end
                 end
