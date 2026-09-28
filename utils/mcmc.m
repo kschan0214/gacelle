@@ -12,9 +12,14 @@ classdef mcmc < handle
 % Date modified: 28 September 2026 (opt-in sampler options for 'MH', moved from mcmc_bayes: parameterTransform,
 %                                   updateScheme, adaptStepSize, adaptCovariance, overdisp, R-hat/ESS diagnostics,
 %                                   forward-model size check; see metropolis_hastings_adaptive)
+% Date modified: 28 September 2026 (parameterTransform for 'ensemble' without global parameters)
 %
-% Opt-in sampler options ('MH' only)
-% -----------------------------------
+% Opt-in sampler options ('MH'; 'ensemble' supports parameterTransform only)
+% ---------------------------------------------------------------------------
+% 'ensemble' ('GW', goodman_weare, no global parameters): with parameterTransform set, the walkers move in
+% u = T(x) (stretch move and affine invariance in u), the log-target gets sum_p log|dx_p/du_p|,
+% the box is enforced by rejection in native space and samples are stored in native space;
+% the output is unchanged otherwise. The other options below are 'MH' only.
 % With none of these fields set (or all at the defaults below), optimisation runs the
 % legacy metropolis_hastings unchanged and the output has no new field. Setting any of them
 % runs metropolis_hastings_adaptive instead (same target: Gaussian likelihood, uniform box
@@ -73,7 +78,7 @@ classdef mcmc < handle
         %   .xStepSize          : step size of model parameter in MCMC proposal, same size and order as 'modelParams' ('MH' only)
         %   .StepSize           : step size for 'GW' in MCMC proposal ('GW' only)
         %   .Nwalker            : # random walkers ('GW' only)
-        %   (opt-in, 'MH' only) .parameterTransform, .updateScheme, .adaptStepSize, .adaptInterval,
+        %   (opt-in, 'MH'; 'ensemble': parameterTransform only) .parameterTransform, .updateScheme, .adaptStepSize, .adaptInterval,
         %                       .adaptTarget, .adaptCovariance, .overdisp, see the class header
         % FWDfunc       : function handle of forward model
         % varargin      : contains additional input requires for FWDfunc
@@ -82,13 +87,20 @@ classdef mcmc < handle
             fitting = this.check_set_default_basic(fitting);
 
             % opt-in sampler options: any of them set -> metropolis_hastings_adaptive (MH only)
+            % ('ensemble': parameterTransform only, handled inside goodman_weare)
             isInfra = mcmc.use_sampler_infra(fitting);
             if isInfra
                 if ~strcmpi(fitting.algorithm,'mh')
-                    error('mcmc:unsupportedAlgorithm', ...
-                        'mcmc: fitting.parameterTransform/updateScheme/adaptStepSize/adaptCovariance/overdisp need fitting.algorithm = ''MH'' (got ''%s'').', fitting.algorithm);
+                    other = setdiff(mcmc.nondefault_options(fitting, mcmc.sampler_infra_defaults()), {'parameterTransform'});
+                    if ~isempty(other)
+                        error('mcmc:unsupportedAlgorithm', ...
+                            'mcmc: fitting.%s need(s) fitting.algorithm = ''MH'' (got ''%s''); ''ensemble'' supports parameterTransform only.', ...
+                            strjoin(other, '/'), fitting.algorithm);
+                    end
+                    isInfra = false;
+                else
+                    fitting = this.check_set_default_infra(fitting);
                 end
-                fitting = this.check_set_default_infra(fitting);
             end
 
             % Step 0: display basic messages
@@ -124,6 +136,10 @@ classdef mcmc < handle
                 if ~isGlobal
                     xPosterior = this.goodman_weare(data, pars0, weights, fitting, FWDfunc ,varargin{:});
                 else
+                    if mcmc.use_sampler_infra(fitting)
+                        error('mcmc:unsupportedAlgorithm', ...
+                            'mcmc: fitting.parameterTransform is not supported by ''ensemble'' with global parameters (goodman_weare_wglobal_constant, experimental).');
+                    end
                     xPosterior = this.goodman_weare_wglobal_constant(data, pars0, weights, fitting, FWDfunc ,varargin{:});
                 end
             end
@@ -681,7 +697,24 @@ classdef mcmc < handle
             x0      = this.array2struct(xCurr,fitting.modelParams);             % convert array back to structure for FWD function
             % compute likelihood at starting points
             logP0   = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0, varargin{:})-y).^2, 1 ), x0.noise, Nm);
-        
+
+            % opt-in parameterTransform: walkers move in u = T(x) (stretch move in u space, affine
+            % invariance in u), log-target logP(x(u)) + sum_p log|dx_p/du_p|, box enforced by
+            % rejection in native space (never triggers for 'sigmoid'); samples stored in native space
+            isTrans = mcmc.use_sampler_infra(fitting);
+            if isTrans
+                method  = mcmc.parse_transform(fitting.parameterTransform, Nvar);
+                mcmc.check_transform_bounds(method, fitting.lb, fitting.ub);
+                lbv     = gpuArray(single(fitting.lb(:)));
+                ubv     = gpuArray(single(fitting.ub(:)));
+                u0      = this.transform_forward(xCurr, method, lbv, ubv);
+                xCurr   = this.transform_inverse(u0, method, lbv, ubv);
+                xCurr   = max(xCurr,lb); xCurr = min(xCurr,ub);
+                x0      = this.array2struct(xCurr,fitting.modelParams);
+                logP0   = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(x0, varargin{:})-y).^2, 1 ), x0.noise, Nm) ...
+                          + sum(this.transform_logjac(u0, method, lbv, ubv), 1);
+            end
+
             disp('-------------------------');
             disp('MCMC optimisation process');
             disp('-------------------------');
@@ -690,8 +723,12 @@ classdef mcmc < handle
             fprintf('Repetition #%i/%i \n',ii,fitting.repetition)
         
             logPCurr= logP0;
-            xCurr   = this.struct2array(x0,fitting.modelParams);
-        
+            if isTrans
+                xCurr   = u0;                                                   % sampled state in u space
+            else
+                xCurr   = this.struct2array(x0,fitting.modelParams);
+            end
+
             counter = 0; start = tic;
             for k = 1:fitting.iteration
 
@@ -706,17 +743,26 @@ classdef mcmc < handle
                     % 1.2. stretch move
                     zz              = ((StepSize-1)*rand(size(logP0),'like',xCurr) + 1).^2 / StepSize;
                     xProposed       = xCurr(:,:,partner) + (xCurr - xCurr(:,:,partner)).*zz;
+                    if isTrans
+                        % u-space proposal: box check and forward model in native space
+                        xNative   = this.transform_inverse(xProposed, method, lbv, ubv);
+                        isOOB     = max(or(xNative<lb, xNative>ub),[],1);
+                        xNative   = max(xNative,lb); xNative = min(xNative,ub);
+                        xProposed_struct = this.array2struct(xNative,fitting.modelParams);
+                    else
                     % find proposal that is out of bound for exclusion
-                    isOOB    = max(or(xProposed<lb, xProposed>ub),[],1);    
+                    isOOB    = max(or(xProposed<lb, xProposed>ub),[],1);
                     % replace boundary values so it does not give error when compting probability
                     xProposed = max(xProposed,lb); xProposed = min(xProposed,ub);
                     % convert the proposal into structure array for FWD function
                     xProposed_struct = this.array2struct(xProposed,fitting.modelParams);
-            
+                    end
+
                     % 2. Metropolis sampling
                     % If the probability ratio of new to old > threshold, we take the new solution.
                     % 2.1 proposal probability
                     logPProposed            = arrayfun(@logP_Gaussian, sum( weights.* (modelFWD(xProposed_struct, varargin{:})-y).^2, 1 ), xProposed_struct.noise, Nm);
+                    if isTrans; logPProposed = logPProposed + sum(this.transform_logjac(xProposed, method, lbv, ubv), 1); end
                     % 2.2 Compute acceptance ratio based on z^(Nd-1)*new/old probability
                     acceptanceRatio         = min(zz.^(Nvar-1).*exp(logPProposed-logPCurr), 1);
                     isAccepted              = acceptanceRatio > rand(1,Nv,Nwalker,'like',xCurr);
@@ -741,15 +787,24 @@ classdef mcmc < handle
                         xProp = xAnch + (xAct - xAnch).*zz;
 
                         lb_a  = lb(:,:,active);  ub_a = ub(:,:,active);
+                        if isTrans
+                            % u-space proposal: box check and forward model in native space
+                            xNat  = this.transform_inverse(xProp, method, lbv, ubv);
+                            isOOB = max(or(xNat<lb_a, xNat>ub_a),[],1);
+                            xNat  = max(xNat,lb_a);  xNat = min(xNat,ub_a);
+                            xProp_s  = this.array2struct(xNat,fitting.modelParams);
+                        else
                         isOOB = max(or(xProp<lb_a, xProp>ub_a),[],1);
                         xProp = max(xProp,lb_a);  xProp = min(xProp,ub_a);
+                        xProp_s  = this.array2struct(xProp,fitting.modelParams);
+                        end
 
                         % proposal likelihood on the active half only
                         % (two half-width evals/iter ~= one full eval: no cost regression)
-                        xProp_s  = this.array2struct(xProp,fitting.modelParams);
                         logPProp = arrayfun(@logP_Gaussian, ...
                                      sum( weights(:,:,active).*(modelFWD(xProp_s,varargin{:})-y).^2, 1 ), ...
                                      xProp_s.noise, Nm);
+                        if isTrans; logPProp = logPProp + sum(this.transform_logjac(xProp, method, lbv, ubv), 1); end
 
                         % acceptance  z^(Nvar-1) * pi(new)/pi(old)
                         logPAct  = logPCurr(:,:,active);
@@ -770,7 +825,11 @@ classdef mcmc < handle
                 % 3.2 keep an iteration every N iterations
                 if ( k > Nburnin ) && mod(k-Nburnin+1, fitting.thinning) == 0 
                     counter = counter+1;
+                    if isTrans
+                        xPosterior(:,:,:,counter,ii) = gather(min(max(this.transform_inverse(xCurr, method, lbv, ubv),lb),ub));
+                    else
                     xPosterior(:,:,:,counter,ii) = gather(xCurr);
+                    end
                 end
         
                 % display message at 1000 ietration and every 2000 iterations

@@ -348,7 +348,7 @@ classdef gpuR2starMapping < handle
                 s = utils.reshape_ND2GD(s,[]);
                 % reshape s for ensemble solver
                 if ~isempty(fitting)
-                    if strcmpi(fitting.algorithm,'ensemble')
+                    if any(strcmpi(fitting.algorithm,{'ensemble','gw'}))     % 'GW': legacy label of 'ensemble'
                         s = reshape(s, [size(s,1) size(s,2)/fitting.Nwalker fitting.Nwalker]);
                     end
                 end
