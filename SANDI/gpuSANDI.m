@@ -182,6 +182,12 @@ classdef gpuSANDI < handle
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
+            % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
+            if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
+                error('gpuSANDI:singleSegment', ...
+                    ['The mcmc_bayes prior couples voxels (free hierarchical or MRF) and needs the whole volume in one ' ...
+                     'GPU call, but the data were divided into %d segments. Reduce the volume or use fixed hyperparameters.'], NSegment);
+            end
 
             % parameter estimation
             out = [];
@@ -290,7 +296,7 @@ classdef gpuSANDI < handle
                 case 'mcmc'
                     fitting.xStepSize = this.step;
 
-                    out         = mcmc().optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
+                    out         = feval(fitting.mcmcClass).optimisation(dwi, mask, w, pars0, fitting, @this.FWD, fitting.pulseType, fitting.solver);
             end
             
 
@@ -740,6 +746,8 @@ classdef gpuSANDI < handle
 
             else
                 fitting2                = mcmc.check_set_default_basic(fitting);
+                % sampler class: 'mcmc' (default) or the experimental 'mcmc_bayes'
+                if ~isfield(fitting,'mcmcClass');   fitting2.mcmcClass = 'mcmc';    end
                 fitting2.lossFunction   = [];
             end
 

@@ -51,14 +51,56 @@ or, from anywhere:
 
 ```matlab
 addpath('/path/to/gacelle'); addpath_gacelle();
-runtests('/path/to/gacelle/tests', 'IncludeSubfolders', true)
+run('/path/to/gacelle/tests/run_tests.m')
 ```
+
+`run_tests` collects every test under `tests/` including subfolders, but
+**excludes `tests/validation/`** (see below). Calling
+`runtests(testsDir, 'IncludeSubfolders', true)` directly would also pick
+up the validation scripts as script-based tests, so prefer `run_tests`.
 
 On a machine/CI runner with no GPU, every `SmokeFit_*Test` reports as
 **Incomplete/filtered**, not failed - that's expected
 (`gacelletest.assumeGPU`, called at the start of each Tier-2 test, uses
 MATLAB's `assumeGreaterThan` so a missing GPU skips the test rather than
 failing it). `ClassAvailabilityTest` always actually runs.
+
+## mcmc_bayes (EXPERIMENTAL) tests
+
+Tests for the experimental `utils/mcmc_bayes.m` subclass of `mcmc`:
+
+- **`McmcBayesUnitTest.m`** (mostly Tier 1, no GPU) - option detection
+  (`isLegacy`), the not-implemented guard for later-phase options, the
+  parameter transforms (round trip, log-Jacobian vs finite differences,
+  stability at large |u|, per-parameter cell parsing) and the R-hat/ESS
+  diagnostics on synthetic iid and AR(1) chains. A few dispatch tests
+  that actually start the sampler call `gacelletest.assumeGPU`.
+- **`McmcBayesLegacyTest.m`** (Tier 2, GPU) - with all new options absent
+  or at their defaults, `mcmc_bayes` output must be bitwise identical to
+  `mcmc` for the same seeds.
+
+### Validation scripts (hand-run, not part of `run_tests`)
+
+`tests/validation/mcmc_bayes/` holds long statistical validation scripts
+(one per test ID, e.g. `test_T1_2_transform_equivalence.m`). Each states
+its criterion up front, prints PASS/FAIL and the seeds used. They take
+minutes each on a GPU and are **excluded from `run_tests`**; run them by
+hand from the repository root:
+
+```matlab
+addpath(pwd); addpath_gacelle(pwd);
+addpath(fullfile(pwd,'tests','validation','mcmc_bayes'));
+test_T1_2_transform_equivalence
+```
+
+### MATLAB version note (MGH linen/virtuoso hosts)
+
+On the MGH hosts used for development, the default `/usr/local/bin/matlab`
+(R2026a) cannot see the GPU, so every Tier-2 test is skipped. Use R2024b:
+
+```bash
+/usr/pubsw/common/matlab/24.2/bin/matlab -batch "cd tests; run_tests"
+```
 
 ## Adding a new model's smoke test
 

@@ -5,7 +5,7 @@
 %   cd tests; run_tests
 %
 % Adds GACELLE (and the tests/ folder itself) to the path, runs every
-% test in tests/, and prints a summary. Tier-2 (GPU-dependent) tests
+% test in tests/ (excluding tests/validation/), and prints a summary. Tier-2 (GPU-dependent) tests
 % report as "Incomplete"/filtered rather than failed on machines with no
 % GPU - that's expected, not a problem.
 %
@@ -18,7 +18,14 @@ addpath(projectRoot);
 addpath_gacelle(projectRoot);
 addpath(testsDir);
 
-results = runtests(testsDir, 'IncludeSubfolders', true);
+% build the suite from tests/ and its subfolders, but exclude anything
+% under tests/validation/ (long, hand-run statistical scripts, see
+% tests/validation/*/README.md)
+suite   = matlab.unittest.TestSuite.fromFolder(testsDir, 'IncludingSubfolders', true);
+isValidation = contains({suite.BaseFolder}, [filesep 'validation']);
+suite   = suite(~isValidation);
+
+results = run(suite);
 
 disp(table(results));
 
