@@ -11,7 +11,7 @@ gpuIVIM fits the bi-exponential intravoxel incoherent motion (IVIM) model to mul
 
     S(b) = S_0 \left[ f\,e^{-b D^*} + (1-f)\,e^{-b D} \right]
 
-with perfusion fraction :math:`f`, tissue diffusion coefficient :math:`D` and pseudo-diffusion coefficient :math:`D^*`. b-values are in ms/µm² (1000 s/mm² = 1 ms/µm²), as in GACELLE's other diffusion models, so D and D* are in µm²/ms.
+with perfusion fraction :math:`f`, tissue diffusion coefficient :math:`D` and pseudo-diffusion coefficient :math:`D^*`. b-values are in ms/µm² (1000 s/mm² = 1 ms/µm²), as in GACELLE's other diffusion models, so D and D* are in µm²/ms. The default bounds follow BayesIVIM (D in [0, 2.5], D* in [0, 50] µm²/ms) and suit brain IVIM; D* > D is not enforced, so set ``fitting.lb``/``fitting.ub`` (order S0, f, D, Dstar, plus noise for mcmc) to constrain it, e.g. for body imaging.
 
 Reference: `Le Bihan, D., Breton, E., Lallemand, D., Aubin, M.L., Vignaud, J., Laval-Jeantet, M., 1988. Separation of diffusion and perfusion in intravoxel incoherent motion MR imaging. Radiology 168, 497-505. <https://doi.org/10.1148/radiology.168.2.3393671>`_
 
@@ -28,7 +28,7 @@ Model parameters
 
 .. literalinclude:: ../../IVIM/gpuIVIM.m
     :language: matlab
-    :lines: 8-12,22-26
+    :lines: 8-12,23-27
 
 I/O overview
 ^^^^^^^^^^^^
