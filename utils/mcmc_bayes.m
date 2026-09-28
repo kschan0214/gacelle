@@ -41,6 +41,12 @@ classdef mcmc_bayes < mcmc
 %           .subsetFraction : 1             fraction of voxels for stage 1 (estimate_hyper_subset only)
 %           .maxGPUMemory   : []            bytes available for the coupled free-hyperparameter run,
 %                                           [] -> gpuDevice().AvailableMemory
+%           .K              : 1             # Gaussian-mixture groups (Phase 7), positive integer; K = 1 is the
+%                                           single-Normal prior above (bitwise identical to before Phase 7)
+%           .alpha          : 1             symmetric Dirichlet concentration of the group weights pi (K > 1)
+%           .init           : 'kmeans'      initial z, mu_k, Sigma_k, pi of the free mode (K > 1), see Phase 7
+%           .pi             : []            fixed group weights [K,1] (fixed = true and K > 1; then .mu is
+%                                           [d,K] and .Sigma is [d,d,K])
 %       .mrf            : []            MRF prior on the hierarchical parameters (Phase 4), a structure
 %                                       (struct() or true for all defaults) with the fields below.
 %                                       Requires .hierarchical with fixed = true (use run_two_stage
@@ -48,9 +54,11 @@ classdef mcmc_bayes < mcmc
 %           .potential      : 'l1'          'l1' | 'huber' | 'quadratic'
 %           .tau            : 1             temperature, > 0 (coupling strength 1/tau)
 %           .W              : []            [d,1] per-parameter weights W_p > 0, [] -> 1./sqrt(diag(Sigma))
-%                                           of the fixed Sigma (fixed for the whole run)
+%                                           of the fixed Sigma (fixed for the whole run); K > 1: Sigma is
+%                                           replaced by the mixture's marginal covariance (Phase 7)
 %           .huberDelta     : 1             Huber threshold in units of sqrt(Sigma_pp): delta_p =
-%                                           huberDelta * sqrt(Sigma_pp) (scalar or [d,1]; 'huber' only)
+%                                           huberDelta * sqrt(Sigma_pp) (scalar or [d,1]; 'huber' only;
+%                                           K > 1: the same mixture scale as W)
 %           .edgeWeights    : []            [K,Nv] fixed symmetric edge weights w_ij >= 0 in the layout of
 %                                           build_neighbours (entries of absent neighbours ignored), [] -> 1
 %           .mode           : '3d'          '3d' | '2d' (in-plane only: dims 1-2 of the same slice)
@@ -419,6 +427,61 @@ classdef mcmc_bayes < mcmc
 %   .switchIteration; out.diagnostics.stepSize is sqrt(diag(proposalCov)); out.settings.adaptCovariance
 %   (logical) and .adaptCovarianceRule.
 %
+% Phase 7 (Gaussian-mixture hierarchical prior, prior.hierarchical.K > 1)
+% -----------------------------------------------------------------------
+% Target. Per voxel i, u_i the [d,1] hierarchical parameters, z_i in {1..K} its group:
+%       z_i ~ Categorical(pi),  u_i | z_i = k ~ N(mu_k, Sigma_k),  pi ~ Dirichlet(alpha,...,alpha),
+%       (mu_k, Sigma_k) ~ NIW(m0, kappa0, Psi0, nu0) independently, the same resolved hyperprior for every k.
+%   K = 1 is exactly Phase 3 (and runs the Phase 3 code unchanged). 'jeffreys_half' is not allowed
+%   with K > 1 (improper per group; error mcmc_bayes:hierarchicalMixture).
+% One sweep (free mode), a partially collapsed Gibbs sampler (van Dyk & Park 2008):
+%   1. MH block on u | theta with z COLLAPSED, unchanged except the prior term, which is the full mixture
+%      density (u-dependent part, the (2 pi)^(-d/2) constant dropped):
+%          lp_i = log sum_k exp(log pi_k - log|Sigma_k|/2 - (u_i-mu_k)' Sigma_k^-1 (u_i-mu_k)/2),
+%      a stable log-sum-exp (max over k subtracted) on the GPU in single precision; it does not depend on
+%      z. All update paths (joint, componentwise, adaptive covariance, MRF colour steps, subsetForward)
+%      and the cache logic are as before.
+%   2. z-step, exact Gibbs, independent over voxels: log w_ik = log pi_k - log|Sigma_k|/2
+%      - (u_i-mu_k)' Sigma_k^-1 (u_i-mu_k)/2 (GPU, double); normalised stably (max subtracted); one uniform
+%      r_i per voxel (GPU stream): z_i = 1 + #{k < K : cumsum_k(w_i) < r_i * sum(w_i)}.
+%   3. Per-group NIW: n_k, ubar_k, S_k of the voxels with z = k (GPU, double), then the exact conjugate
+%      draw of Phase 3 per group, k = 1..K in order (host rng). An empty group (n_k = 0) draws from the
+%      hyperprior NIW(m0, kappa0, Psi0, nu0) (the conjugate update with n = 0); with the default vague
+%      kappa0 its mu is far from the data, so an emptied group is rarely re-populated.
+%   4. pi ~ Dirichlet(alpha + n_1, ..., alpha + n_K): G_k ~ Gamma(alpha + n_k) (randg, host), pi = G/sum(G).
+%   5. The per-voxel log-prior cache is recomputed.
+%   Why the order matters: step 1 draws u from p(u | theta, y) (z integrated out) and step 2 then draws
+%   z from p(z | u, theta), so steps 1-2 together are a blocked draw of (u, z) | theta, y; steps 3-4 are the
+%   ordinary conditionals of theta given (u, z). Moving the z draw elsewhere (e.g. after theta, or skipping
+%   it before the NIW step) would break the stationary distribution of a partially collapsed sampler.
+% Fixed mode (fixed = true, .mu [d,K], .Sigma [d,d,K], .pi [K,1]; also stage 2 of run_two_stage): the
+%   u updates use the collapsed mixture log-prior and z is never drawn (steps 2-4 skipped); voxels are
+%   conditionally independent (they may be segmented).
+% Membership (free and fixed mode): Rao-Blackwellised, the average over the kept samples of the exact
+%   responsibilities P(z_i = k | u_i, theta) (theta of that sample, rows permuted to the ordered labels),
+%   which has lower variance than counting z draws.
+% Initialisation of the free mode (.init = 'kmeans', every repetition): k-means on the starting u of the
+%   hierarchical parameters, each dimension standardised (mean 0, SD 1 over voxels). k-means++ seeding
+%   (host rand, so deterministic given the rng seed), then Lloyd iterations (at most 100, until the labels
+%   do not change; an emptied cluster is reseeded at the point farthest from its centre). Then (the
+%   k-means labels are not kept: z is first drawn in step 2 of the first sweep) mu_k = mean of cluster k, Sigma_k = diag(max(var_k(u), floorVar)) (the Phase 3
+%   variance floor, diagonal as for K = 1), pi_k = max(n_k,1) / sum_j max(n_j,1). No Statistics toolbox.
+%   Needs K <= # voxels (error mcmc_bayes:hierarchicalMixture).
+% Label switching. The kept samples of (mu_k, Sigma_k, pi_k) are stored after ordering the groups of each
+%   kept sample by mu_k of the FIRST hierarchical parameter, ascending (sort, ties keep the lower label).
+%   The same permutation reorders the membership rows of that sample. Summaries (mean/median), ESS and R-hat use the ordered
+%   samples. Fixed mode keeps the user's labels (no switching possible).
+% Output (K > 1): out.hyper.K, .posterior.mu [d,K,Ns,Nrep], .posterior.Sigma [d,d,K,Ns,Nrep],
+%   .posterior.pi [K,Ns,Nrep]; .mean/.median .mu [d,K], .Sigma [d,d,K], .pi [K,1]; .ess/.rhat of the same
+%   shapes; .membership [x,y,z,K] = Rao-Blackwellised P(z_i = k | y), the mean over the kept samples (all
+%   repetitions) of P(z_i = k | u_i, theta) in the ordered labelling (fixed mode: user labels; final state
+%   if there is no kept sample); .mapLabel [x,y,z] = argmax_k membership (0 outside the mask).
+% Two-stage (run_two_stage, estimate_hyper_subset) with K > 1: stage 2 fixes the ordered stage-1 posterior
+%   means of mu_k, Sigma_k and pi (fixed mode: collapsed log-prior, no z draws). The MRF weight default is W_p = 1/sqrt(V_pp), with
+%   V the mixture's marginal covariance
+%       V = sum_k pi_k (Sigma_k + mu_k mu_k') - mubar mubar',  mubar = sum_k pi_k mu_k,
+%   and the Huber threshold is delta_p = huberDelta * sqrt(V_pp) (K = 1: V = Sigma, as before).
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
@@ -426,6 +489,7 @@ classdef mcmc_bayes < mcmc
 % Date modified: 26 September 2026 (Phase 4: MRF prior, chromatic updates, two-stage empirical Bayes)
 % Date modified: 26 September 2026 (Phase 4b: forward model on the active colour only, subsetForward)
 % Date modified: 27 September 2026 (adaptive-covariance joint proposal, adaptCovariance)
+% Date modified: 27 September 2026 (Phase 7: Gaussian-mixture hierarchical prior, K > 1)
 %
 
     methods
@@ -493,7 +557,7 @@ classdef mcmc_bayes < mcmc
 
         end
 
-        function [muHat, SigmaHat, fittingFixed, outSub, idxSub] = estimate_hyper_subset(this, data, mask, weights, pars0, fitting, FWDfunc, varargin)
+        function [muHat, SigmaHat, fittingFixed, outSub, idxSub, piHat] = estimate_hyper_subset(this, data, mask, weights, pars0, fitting, FWDfunc, varargin)
         % Stage 1 of the two-stage scheme: run the free-hyperparameter sampler
         % on a random subset of the masked voxels and return the posterior
         % means of mu and Sigma, for use in fixed mode on the whole volume.
@@ -508,12 +572,13 @@ classdef mcmc_bayes < mcmc
         %
         % Output
         % ------
-        % muHat         : [d,1] posterior mean of mu (u space)
-        % SigmaHat      : [d,d] posterior mean of Sigma (u space)
+        % muHat         : [d,1] posterior mean of mu (u space); K > 1: [d,K], ordered groups (Phase 7)
+        % SigmaHat      : [d,d] posterior mean of Sigma (u space); K > 1: [d,d,K]
         % fittingFixed  : fitting with prior.hierarchical.fixed = true, .mu = muHat,
-        %                 .Sigma = SigmaHat, .subsetFraction = 1 (stage 2 input)
+        %                 .Sigma = SigmaHat, .subsetFraction = 1 (stage 2 input); K > 1: also .pi = piHat
         % outSub        : mcmc_bayes output of the subset run (image dims [Nsub,1,1])
         % idxSub        : linear indices (into mask) of the subset voxels
+        % piHat         : posterior mean of the group weights [K,1] (1 for K = 1)
         %
             if ~isstruct(fitting) || ~isfield(fitting,'prior') || ~isstruct(fitting.prior) || ...
                     ~isfield(fitting.prior,'hierarchical') || isempty(fitting.prior.hierarchical) || ...
@@ -554,9 +619,11 @@ classdef mcmc_bayes < mcmc
 
             muHat    = outSub.hyper.mean.mu;
             SigmaHat = outSub.hyper.mean.Sigma;
+            if isfield(outSub.hyper.mean, 'pi'); piHat = outSub.hyper.mean.pi; else; piHat = 1; end
 
             fittingFixed = fitting;
             h.fixed = true; h.mu = muHat; h.Sigma = SigmaHat; h.subsetFraction = 1;
+            if numel(piHat) > 1; h.pi = piHat; end
             fittingFixed.prior.hierarchical = h;
         end
 
@@ -565,7 +632,8 @@ classdef mcmc_bayes < mcmc
         %   Stage 1: free hierarchical prior (Gibbs block), NO MRF, on all voxels or, with
         %            prior.hierarchical.subsetFraction < 1, on a random voxel subset
         %            (estimate_hyper_subset).
-        %   Stage 2: mu, Sigma fixed at their stage-1 posterior means, hierarchical + MRF prior,
+        %   Stage 2: mu, Sigma (K > 1: mu_k, Sigma_k, pi of the ordered groups; z is still sampled)
+        %            fixed at their stage-1 posterior means, hierarchical + MRF prior,
         %            same likelihood, on all voxels (single call). Start: per voxel, the stage-1
         %            posterior mean of u of every sampled parameter (mapped back to native space);
         %            voxels outside the stage-1 subset start from pars0.
@@ -606,13 +674,14 @@ classdef mcmc_bayes < mcmc
             if isfield(f1,'mrfUpdate'); f1 = rmfield(f1, 'mrfUpdate'); end
             mask_idx = find(mask>0);
             if frac < 1
-                [muHat, SigmaHat, ~, out1, idxSub] = this.estimate_hyper_subset(data, mask, weights, pars0, f1, FWDfunc, varargin{:});
+                [muHat, SigmaHat, ~, out1, idxSub, piHat] = this.estimate_hyper_subset(data, mask, weights, pars0, f1, FWDfunc, varargin{:});
             else
                 h1 = h; h1.fixed = false; h1.subsetFraction = 1;
                 f1.prior.hierarchical = h1;
                 out1    = this.optimisation(data, mask, weights, pars0, f1, FWDfunc, varargin{:});
                 muHat   = out1.hyper.mean.mu;
                 SigmaHat= out1.hyper.mean.Sigma;
+                if isfield(out1.hyper.mean, 'pi'); piHat = out1.hyper.mean.pi; else; piHat = 1; end
                 idxSub  = mask_idx;
             end
 
@@ -637,7 +706,9 @@ classdef mcmc_bayes < mcmc
             % stage 2: fixed mu, Sigma at the stage-1 posterior means, plus the MRF
             f2 = fitting;
             h2 = h; h2.fixed = true; h2.mu = muHat; h2.Sigma = SigmaHat; h2.subsetFraction = 1;
-            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0'}));
+            isMixEB = numel(piHat) > 1;
+            if isMixEB; h2.pi = piHat; end
+            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0','alpha','init'}));
             f2.prior.hierarchical = h2;
             out = this.optimisation(data, mask, weights, pars2, f2, FWDfunc, varargin{:});
 
@@ -654,6 +725,11 @@ classdef mcmc_bayes < mcmc
                 'SigmaHat',     SigmaHat, ...
                 'Nstage1',      numel(idxSub), ...
                 'subsetFraction', frac);
+            if isMixEB
+                out.settings.empiricalBayes.piHat  = piHat;
+                out.settings.empiricalBayes.stage2 = ['mu_k, Sigma_k, pi fixed at the stage-1 posterior means of the ordered groups ' ...
+                                                      '(z still sampled); hierarchical mixture + MRF prior; same likelihood'];
+            end
         end
 
         function [xPosterior, diagnostics] = metropolis_hastings_bayes(this,y,x0,weights,fitting,geom,FWDfunc,varargin)
@@ -689,6 +765,8 @@ classdef mcmc_bayes < mcmc
             hier            = this.setup_hierarchical(fitting);
             isHier          = hier.on;
             isGibbs         = isHier && ~hier.fixed;
+            % Gaussian-mixture prior (Phase 7), K > 1 only; K = 1 runs the Phase 3 code unchanged
+            isMix           = isHier && hier.K > 1;
             % MRF prior on the hierarchical parameters (fixed mu/Sigma only)
             mrf             = this.setup_mrf(fitting, hier);
             isMRF           = mrf.on;
@@ -723,6 +801,10 @@ classdef mcmc_bayes < mcmc
                 if strcmp(hier.hyperprior,'jeffreys_half') && Nv <= 2*hier.d - 1
                     error('mcmc_bayes:hierarchicalTooFewVoxels', ...
                         'mcmc_bayes: hyperprior ''jeffreys_half'' needs more than 2d-1 = %d voxels (got %d).', 2*hier.d-1, Nv);
+                end
+                if isMix && hier.K > Nv
+                    error('mcmc_bayes:hierarchicalMixture', ...
+                        'mcmc_bayes: prior.hierarchical.K = %d groups need at least K voxels (got %d).', hier.K, Nv);
                 end
             end
 
@@ -877,13 +959,27 @@ classdef mcmc_bayes < mcmc
                 d       = hier.d;
                 floorVar = (10 .* median(double(gather(sigmaStart(hIdx,:))), 2)).^2;   % [d,1]
                 hp      = this.resolve_hyperprior(hier, double(gather(uStart(hIdx,:))), floorVar);
-                if isGibbs
+                if isMix
+                    % mixture (Phase 7): ordered kept samples, final state, membership counts
+                    Kmix        = hier.K;
+                    if isGibbs
+                        muPost      = zeros(d, Kmix, Ns, fitting.repetition);
+                        SigmaPost   = zeros(d, d, Kmix, Ns, fitting.repetition);
+                        piPost      = zeros(Kmix, Ns, fitting.repetition);
+                        muLast      = zeros(d, Kmix, fitting.repetition);
+                        SigmaLast   = zeros(d, d, Kmix, fitting.repetition);
+                        piLast      = zeros(Kmix, fitting.repetition);
+                    end
+                    memCount    = zeros(Kmix, Nv, 'gpuArray');      % sum over kept samples of P(z_i = k | u_i, theta) (ordered labels)
+                    memLast     = zeros(Kmix, Nv, 'gpuArray');      % same at the final state (fallback without kept samples)
+                elseif isGibbs
                     muPost      = zeros(d, Ns, fitting.repetition);
                     SigmaPost   = zeros(d, d, Ns, fitting.repetition);
                     muLast      = zeros(d, fitting.repetition);         % final Gibbs state per chain
                     SigmaLast   = zeros(d, d, fitting.repetition);
                 end
             end
+            lpC   = [];     % mixture log-prior constants log pi_k - log|Sigma_k|/2 (K > 1 only; [] selects the single-Normal log-prior)
             if fitting.checkCache
                 cacheErr = struct('loglik', 0, 'logprior', 0, 'logjac', 0, 'Ncheck', 0);
                 if isMRF; cacheErr.inactiveMoved = 0; end
@@ -990,7 +1086,18 @@ classdef mcmc_bayes < mcmc
             end
 
             % hyperparameters and cached per-voxel log-prior
-            if isHier
+            if isMix
+                % mixture (Phase 7): free mode from k-means on the current u, fixed mode from the user values
+                % with z = the most probable group of the current u
+                if isGibbs
+                    [~, mu, Sigma, piW] = this.mixture_init(double(uCurr(hIdx,:)), Kmix, floorVar);
+                else
+                    mu = hier.mu; Sigma = hier.Sigma; piW = hier.pi;
+                end
+                [muG, PG, mixD] = this.mixture_to_gpu(mu, Sigma, piW);
+                lpC         = mixD.cG;
+                lpCurr      = this.logprior_mix(uCurr(hIdx,:), lpC, muG, PG);
+            elseif isHier
                 if isGibbs
                     % initial hyperparameters: moments of the current u (variance floored)
                     uH0     = double(gather(uCurr(hIdx,:)));
@@ -1067,7 +1174,7 @@ classdef mcmc_bayes < mcmc
 
                     % forward model and likelihood on the active voxels only
                     if isMarginal; [logLProposed, statsProposed] = loglikC{kc}(xProposed); else; logLProposed = loglikC{kc}(xProposed); end
-                    lpProposed  = this.logprior_normal(uProposed(hIdx,:), muG, PG);     % the MRF requires the hierarchical prior
+                    lpProposed  = this.logprior_mix(uProposed(hIdx,:), lpC, muG, PG);   % the MRF requires the hierarchical prior
                     dPhi        = this.mrf_local_delta(uProposed(hIdx,:), uA(hIdx,:), uCurr(hIdx,:), ...
                                                        mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential, mrf.stateWeight);
                     if hasJac
@@ -1121,7 +1228,7 @@ classdef mcmc_bayes < mcmc
                         if isHierRow(kp)
                             uProposedH          = uA(hIdx,:);
                             uProposedH(hIdx==kp,:) = uProposed_p;
-                            lpProposed          = this.logprior_normal(uProposedH, muG, PG);
+                            lpProposed          = this.logprior_mix(uProposedH, lpC, muG, PG);
                             logRatio            = logRatio + (lpProposed - lpA);
                             pH                  = find(hIdx==kp);
                             dPhi                = this.mrf_local_delta(uProposed_p, uA(kp,:), uCurr(kp,:), ...
@@ -1175,7 +1282,7 @@ classdef mcmc_bayes < mcmc
                     % 2. Metropolis sampling
                     % 2.1 proposal probability (+ log-Jacobian of the transform, + hierarchical log-prior)
                     if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
-                    if isHier; lpProposed = this.logprior_normal(uProposed(hIdx,:), muG, PG); end
+                    if isHier; lpProposed = this.logprior_mix(uProposed(hIdx,:), lpC, muG, PG); end
                     % MRF: change of the local term of the active voxels, current neighbours (never cached)
                     if isMRF
                         dPhi = this.mrf_local_delta(uProposed(hIdx,act), uCurr(hIdx,act), uCurr(hIdx,:), ...
@@ -1238,7 +1345,7 @@ classdef mcmc_bayes < mcmc
                         if isHierRow(kp)
                             uProposedH          = uCurr(hIdx,:);
                             uProposedH(hIdx==kp,:) = uProposed_p;
-                            lpProposed          = this.logprior_normal(uProposedH, muG, PG);
+                            lpProposed          = this.logprior_mix(uProposedH, lpC, muG, PG);
                             logRatio            = logRatio + (lpProposed - lpCurr);
                             % MRF: change of the local term of parameter kp of the active voxels
                             if isMRF
@@ -1273,7 +1380,23 @@ classdef mcmc_bayes < mcmc
                 if isMRF && ~isComponent; isAccepted = isAccSweep; end
 
                 % 3. Gibbs block: exact conditional draws of (mu, Sigma), then refresh the log-prior cache
-                if isGibbs
+                if isMix && isGibbs
+                    % mixture (Phase 7, partially collapsed Gibbs): the MH block above moved u given theta with
+                    % z collapsed; now z | u, theta (exact, all voxels), per-group NIW | u, z, pi | z, then the
+                    % collapsed log-prior cache. Fixed mode: no z at all (u updates do not need it)
+                    uH          = uCurr(hIdx,:);
+                    zCurr       = this.mixture_zstep(this.mixture_logweights(uH, mixD), rand(1, Nv, 'double', 'gpuArray'));
+                    [nk, ubarK, SK] = this.hyper_suffstats_groups(uH, zCurr, Kmix);
+                    for kk = 1:Kmix
+                        [mu(:,kk), Sigma(:,:,kk)] = this.gibbs_hyper(ubarK(:,kk), SK(:,:,kk), nk(kk), mu(:,kk), Sigma(:,:,kk), hp);
+                    end
+                    piW         = this.draw_dirichlet(hier.alpha + nk);
+                    [muG, PG, mixD] = this.mixture_to_gpu(mu, Sigma, piW);
+                    lpC         = mixD.cG;
+                    lpCurr      = this.logprior_mix(uH, lpC, muG, PG);
+                elseif isMix
+                    % fixed mode: nothing to update
+                elseif isGibbs
                     [ubar, S]   = this.hyper_suffstats(uCurr(hIdx,:));
                     [mu, Sigma] = this.gibbs_hyper(ubar, S, Nv, mu, Sigma, hp);
                     [muG, PG]   = this.prior_to_gpu(mu, Sigma);
@@ -1287,7 +1410,7 @@ classdef mcmc_bayes < mcmc
                     cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(lFresh, logLCurr));
                     if isMarginal; cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(sFresh, statsCurr)); end
                     if isHier
-                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_normal(uCurr(hIdx,:), muG, PG), lpCurr));
+                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_mix(uCurr(hIdx,:), lpC, muG, PG), lpCurr));
                     end
                     if hasJac
                         jFresh = this.transform_logjac(uCurr, method, lb, ub);
@@ -1344,7 +1467,16 @@ classdef mcmc_bayes < mcmc
                     counter = counter+1;
                     if hasJac; xPosterior(:,:,counter,ii) = gather(xCurr); else; xPosterior(:,:,counter,ii) = gather(uCurr); end
                     if isMarginal; statsPost(:,:,counter,ii) = gather(statsCurr); end
-                    if isGibbs; muPost(:,counter,ii) = mu; SigmaPost(:,:,counter,ii) = Sigma; end
+                    if isMix
+                        % ordered groups (label switching); Rao-Blackwellised membership P(z_i = k | u_i, theta)
+                        % of this kept state, rows in the ordered labelling
+                        ord = this.mixture_order(mu, isGibbs);
+                        if isGibbs
+                            muPost(:,:,counter,ii) = mu(:,ord); SigmaPost(:,:,:,counter,ii) = Sigma(:,:,ord); piPost(:,counter,ii) = piW(ord);
+                        end
+                        Rk       = this.mixture_responsibilities(uCurr(hIdx,:), mixD);
+                        memCount = memCount + Rk(ord,:);
+                    elseif isGibbs; muPost(:,counter,ii) = mu; SigmaPost(:,:,counter,ii) = Sigma; end
                 end
 
                 % display message at 1000 iteration and every 10000 iteration
@@ -1373,7 +1505,12 @@ classdef mcmc_bayes < mcmc
                 acLambda(:,ii)      = gather(acLam(:));
                 acValidOut(:,ii)    = gather(acValid(:));
             end
-            if isHier && isGibbs; muLast(:,ii) = mu; SigmaLast(:,:,ii) = Sigma; end
+            if isMix
+                ord = this.mixture_order(mu, isGibbs);
+                if isGibbs; muLast(:,:,ii) = mu(:,ord); SigmaLast(:,:,:,ii) = Sigma(:,:,ord); piLast(:,ii) = piW(ord); end
+                Rk      = this.mixture_responsibilities(uCurr(hIdx,:), mixD);
+                memLast = memLast + Rk(ord,:);
+            elseif isHier && isGibbs; muLast(:,ii) = mu; SigmaLast(:,:,ii) = Sigma; end
             end
 
             % convert final posterior distribution into structure
@@ -1415,7 +1552,30 @@ classdef mcmc_bayes < mcmc
                 hyper = struct('params', {hier.params}, ...
                                'transform', {this.transform_description(method(hIdx), fitting.lb(hIdx), fitting.ub(hIdx))}, ...
                                'hyperprior', hier.hyperprior, 'fixed', hier.fixed);
-                if isGibbs
+                if isMix
+                    % mixture (Phase 7): ordered samples, membership frequency [Nv,K] over the kept samples
+                    % of all repetitions (final z if there is none)
+                    hyper.K         = Kmix;
+                    hyper.alpha     = hier.alpha;
+                    hyper.ordering  = this.mixture_ordering_rule(isGibbs);
+                    if isGibbs
+                        hyper.muPost    = muPost;
+                        hyper.SigmaPost = SigmaPost;
+                        hyper.piPost    = piPost;
+                        hyper.muLast    = muLast;
+                        hyper.SigmaLast = SigmaLast;
+                        hyper.piLast    = piLast;
+                    else
+                        hyper.mu        = hier.mu;
+                        hyper.Sigma     = hier.Sigma;
+                        hyper.pi        = hier.pi;
+                    end
+                    if Ns > 0
+                        hyper.membership = gather(memCount.' ./ (Ns * fitting.repetition));
+                    else
+                        hyper.membership = gather(memLast.' ./ fitting.repetition);
+                    end
+                elseif isGibbs
                     hyper.muPost    = muPost;
                     hyper.SigmaPost = SigmaPost;
                     hyper.muLast    = muLast;
@@ -1595,7 +1755,10 @@ classdef mcmc_bayes < mcmc
             if isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical') && ~isempty(fitting.prior.hierarchical) && ...
                     ~(islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
                 h = fitting.prior.hierarchical;
-                if isstruct(h) && isfield(h,'fixed') && ~isempty(h.fixed) && h.fixed
+                if isstruct(h) && isfield(h,'K') && ~isempty(h.K) && isnumeric(h.K) && isscalar(h.K) && h.K > 1
+                    disp(['Prior             : hierarchical Gaussian mixture on u, K = ', num2str(h.K), ...
+                          ', fixed = ', num2str(isfield(h,'fixed') && ~isempty(h.fixed) && logical(h.fixed))]);
+                elseif isstruct(h) && isfield(h,'fixed') && ~isempty(h.fixed) && h.fixed
                     disp( 'Prior             : hierarchical Normal on u, fixed mu/Sigma');
                 elseif isstruct(h) && isfield(h,'hyperprior') && ~isempty(h.hyperprior)
                     disp(['Prior             : hierarchical Normal on u, hyperprior ', char(h.hyperprior)]);
@@ -1916,12 +2079,15 @@ classdef mcmc_bayes < mcmc
         %   .d              : # hierarchical parameters
         %   .hyperprior     : 'niw' | 'jeffreys_half'
         %   .m0, .kappa0, .Psi0, .nu0 : NIW hyperprior ([] -> resolved at the start of sampling)
-        %   .fixed, .mu, .Sigma       : fixed mode and its hyperparameters (mu [d,1], Sigma [d,d])
+        %   .fixed, .mu, .Sigma       : fixed mode and its hyperparameters (mu [d,1], Sigma [d,d];
+        %                               K > 1: mu [d,K], Sigma [d,d,K])
         %   .subsetFraction, .maxGPUMemory
+        %   .K, .alpha, .init, .pi    : mixture (Phase 7): # groups, Dirichlet concentration, free-mode
+        %                               initialisation, fixed group weights [K,1] (K > 1 only, else [])
         %
             hier = struct('on', false, 'params', {{}}, 'idx', [], 'd', 0, 'hyperprior', '', ...
                           'm0', [], 'kappa0', [], 'Psi0', [], 'nu0', [], 'fixed', false, 'mu', [], 'Sigma', [], ...
-                          'subsetFraction', 1, 'maxGPUMemory', []);
+                          'subsetFraction', 1, 'maxGPUMemory', [], 'K', 1, 'alpha', 1, 'init', 'kmeans', 'pi', []);
             if ~isfield(fitting,'prior') || isempty(fitting.prior); return; end
             prior = fitting.prior;
             if ~isstruct(prior) || ~isscalar(prior)
@@ -1940,7 +2106,8 @@ classdef mcmc_bayes < mcmc
             if ~isstruct(h) || ~isscalar(h)
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: fitting.prior.hierarchical must be a structure (or true).');
             end
-            valid = {'hyperprior','m0','kappa0','Psi0','nu0','fixed','mu','Sigma','params','subsetFraction','maxGPUMemory'};
+            valid = {'hyperprior','m0','kappa0','Psi0','nu0','fixed','mu','Sigma','params','subsetFraction','maxGPUMemory', ...
+                     'K','alpha','init','pi'};
             bad   = setdiff(fieldnames(h), valid);
             if ~isempty(bad)
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior.hierarchical: %s (valid: %s).', ...
@@ -2013,11 +2180,52 @@ classdef mcmc_bayes < mcmc
                 m0 = double(m0(:));
             end
 
+            % mixture (Phase 7)
+            K       = field_or_default(h, 'K', 1);
+            if ~(isnumeric(K) && isscalar(K) && isfinite(K) && K >= 1 && K == round(K))
+                error('mcmc_bayes:hierarchicalMixture', 'mcmc_bayes: prior.hierarchical.K must be a positive integer.');
+            end
+            K       = double(K);
+            alpha   = field_or_default(h, 'alpha', 1);
+            if ~(isnumeric(alpha) && isscalar(alpha) && isfinite(alpha) && alpha > 0)
+                error('mcmc_bayes:hierarchicalMixture', 'mcmc_bayes: prior.hierarchical.alpha must be a positive finite scalar.');
+            end
+            init    = lower(char(field_or_default(h, 'init', 'kmeans')));
+            if ~strcmp(init, 'kmeans')
+                error('mcmc_bayes:hierarchicalMixture', 'mcmc_bayes: prior.hierarchical.init must be ''kmeans'' (got ''%s'').', init);
+            end
+            if K > 1 && strcmp(hyperprior, 'jeffreys_half')
+                error('mcmc_bayes:hierarchicalMixture', ...
+                    ['mcmc_bayes: hyperprior ''jeffreys_half'' is not supported with K > 1 (improper per group: an empty or ' ...
+                     'small group has no proper conditional). Use ''niw''.']);
+            end
+
             % fixed mode
             fixed   = logical(field_or_default(h, 'fixed', false));
             mu      = field_or_default(h, 'mu', []);
             Sigma   = field_or_default(h, 'Sigma', []);
-            if fixed
+            piFix   = field_or_default(h, 'pi', []);
+            if ~isempty(piFix) && (~fixed || (K == 1 && ~isequal(double(piFix), 1)))
+                error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: prior.hierarchical.pi is only used with fixed = true and K > 1.');
+            end
+            if fixed && K > 1
+                if ~(isnumeric(mu) && isequal(size(mu), [d K]) && all(isfinite(mu(:))))
+                    error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode with K = %d needs prior.hierarchical.mu [d,K] = [%d,%d], finite (u space).', K, d, K);
+                end
+                mu      = double(mu);
+                if ~(isnumeric(Sigma) && size(Sigma,1) == d && size(Sigma,2) == d && size(Sigma,3) == K && ndims(Sigma) <= 3)
+                    error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode with K = %d needs prior.hierarchical.Sigma [d,d,K] = [%d,%d,%d].', K, d, d, K);
+                end
+                SigmaK  = zeros(d, d, K);
+                for k = 1:K
+                    SigmaK(:,:,k) = mcmc_bayes.check_spd(double(Sigma(:,:,k)), d, 'mcmc_bayes:hierarchicalFixed', sprintf('prior.hierarchical.Sigma(:,:,%d)', k));
+                end
+                Sigma   = SigmaK;
+                if ~(isnumeric(piFix) && numel(piFix) == K && all(isfinite(piFix(:))) && all(piFix(:) > 0) && abs(sum(piFix(:)) - 1) <= 1e-6)
+                    error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode with K = %d needs prior.hierarchical.pi [K,1], positive, summing to 1.', K);
+                end
+                piFix   = double(piFix(:)) ./ sum(double(piFix(:)));
+            elseif fixed
                 if ~(isnumeric(mu) && numel(mu) == d && all(isfinite(mu)))
                     error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode needs prior.hierarchical.mu with %d finite entries (u space).', d);
                 end
@@ -2046,6 +2254,10 @@ classdef mcmc_bayes < mcmc
             hier.Sigma          = Sigma;
             hier.subsetFraction = subsetFraction;
             hier.maxGPUMemory   = field_or_default(h, 'maxGPUMemory', []);
+            hier.K              = K;
+            hier.alpha          = double(alpha);
+            hier.init           = init;
+            if K > 1; hier.pi = piFix; else; hier.pi = []; end
         end
 
         % symmetric positive definite d x d check (returns the symmetrised matrix)
@@ -2161,6 +2373,203 @@ classdef mcmc_bayes < mcmc
             x = m(:) + chol(C, 'lower') * randn(numel(m), 1);
         end
 
+        %% Gaussian-mixture hierarchical prior (Phase 7), see the class header
+        % per-voxel log-prior (u-dependent part). K > 1: the collapsed mixture density (z summed out),
+        %   lp = log sum_k exp(c_k - (u-mu_k)' P_k (u-mu_k)/2),  c_k = log pi_k - log|Sigma_k|/2   [1,Nv],
+        % as a stable log-sum-exp (max subtracted), in the class of uH (single on the GPU).
+        % c = [] or a single group: exactly logprior_normal (K = 1 path)
+        function lp = logprior_mix(uH, c, mu, P)
+            if isempty(c) || size(mu, 2) == 1
+                lp = mcmc_bayes.logprior_normal(uH, mu, P);
+                return
+            end
+            K   = size(mu, 2);
+            q   = zeros(K, size(uH, 2), 'like', uH);
+            for k = 1:K
+                q(k,:) = c(k) + mcmc_bayes.logprior_normal(uH, mu(:,k), P(:,:,k));
+            end
+            qm  = max(q, [], 1);
+            lp  = qm + log(sum(exp(q - qm), 1));
+        end
+
+        % exact responsibilities P(z_i = k | u_i, theta), [K,Nv] double (normalised mixture_logweights)
+        function R = mixture_responsibilities(uH, mixD)
+            lw  = mcmc_bayes.mixture_logweights(uH, mixD);
+            R   = exp(lw - max(lw, [], 1));
+            R   = R ./ sum(R, 1);
+        end
+
+        % group hyperparameters on the GPU: single mu [d,K] and precision [d,d,K] for the MH log-prior
+        % (per group exactly prior_to_gpu), and the double quantities of the z-step
+        % (mixD.mu [d,K], .P [d,d,K], .c [K,1] = log pi_k - log|Sigma_k|/2), and .cG = single(c) on the GPU
+        % (the constants of the collapsed MH log-prior)
+        function [muG, PG, mixD] = mixture_to_gpu(mu, Sigma, piW)
+            [d, K]  = size(mu);
+            muG     = zeros(d, K, 'single', 'gpuArray');
+            PG      = zeros(d, d, K, 'single', 'gpuArray');
+            PD      = zeros(d, d, K);
+            c       = zeros(K, 1);
+            for k = 1:K
+                [muG(:,k), PG(:,:,k)] = mcmc_bayes.prior_to_gpu(mu(:,k), Sigma(:,:,k));
+                R           = chol(Sigma(:,:,k));
+                Ri          = R \ eye(d);
+                Pk          = Ri * Ri.';
+                PD(:,:,k)   = (Pk + Pk.')/2;
+                c(k)        = log(piW(k)) - sum(log(diag(R)));
+            end
+            mixD = struct('mu', gpuArray(double(mu)), 'P', gpuArray(PD), 'c', gpuArray(c), 'cG', gpuArray(single(c)));
+        end
+
+        % unnormalised log responsibilities [K,Nv] (double): log pi_k - log|Sigma_k|/2 - (u-mu_k)'P_k(u-mu_k)/2
+        function lw = mixture_logweights(uH, mixD)
+            ud  = double(uH);
+            K   = size(mixD.mu, 2);
+            lw  = zeros(K, size(ud, 2), 'like', ud);
+            for k = 1:K
+                r       = ud - mixD.mu(:,k);
+                lw(k,:) = mixD.c(k) - 0.5 .* sum(r .* (mixD.P(:,:,k) * r), 1);
+            end
+        end
+
+        % exact z draw from the log weights lw [K,Nv] with one uniform r [1,Nv] per voxel (log-sum-exp
+        % stable): z = 1 + #{k < K : cumsum_k(w) < r * sum(w)}, w = exp(lw - max_k lw); z [1,Nv] double
+        function z = mixture_zstep(lw, r)
+            K   = size(lw, 1);
+            w   = exp(lw - max(lw, [], 1));
+            cw  = cumsum(w, 1);
+            z   = 1 + sum(cw(1:K-1,:) < r .* cw(K,:), 1);
+        end
+
+        % per-group n_k [K,1], ubar_k [d,K] and scatter S_k [d,d,K] (double, on the GPU for gpuArray input),
+        % gathered; an empty group has n_k = 0, ubar_k = 0, S_k = 0
+        function [n, ubar, S] = hyper_suffstats_groups(uH, z, K)
+            ud      = double(uH);
+            d       = size(ud, 1);
+            n       = zeros(K, 1, 'like', ud);
+            ubar    = zeros(d, K, 'like', ud);
+            S       = zeros(d, d, K, 'like', ud);
+            for k = 1:K
+                mk          = double(z == k);                    % [1,Nv]
+                n(k)        = sum(mk);
+                ubar(:,k)   = (ud * mk.') ./ max(n(k), 1);
+                rc          = (ud - ubar(:,k)) .* mk;
+                S(:,:,k)    = rc * rc.';
+            end
+            [n, ubar, S] = gather(n, ubar, S);
+            S       = (S + permute(S, [2 1 3]))/2;
+        end
+
+        % Dirichlet draw (host): G_k ~ Gamma(a_k, 1) (randg), p = G/sum(G)
+        function p = draw_dirichlet(a)
+            g = randg(a(:));
+            p = g ./ sum(g);
+        end
+
+        % marginal covariance of a Gaussian mixture: sum_k pi_k (Sigma_k + mu_k mu_k') - mubar mubar'
+        function V = mixture_marginal_cov(mu, Sigma, piW)
+            [d, K]  = size(mu);
+            piW     = piW(:);
+            mubar   = mu * piW;
+            V       = -mubar * mubar.';
+            for k = 1:K
+                V = V + piW(k) .* (Sigma(:,:,k) + mu(:,k) * mu(:,k).');
+            end
+            V = (V + V.')/2;
+            if d == 1; V = max(V, 0); end
+        end
+
+        % label ordering of one state: ord = groups sorted by mu(1,:) ascending (free mode) or 1:K (fixed),
+        % rnk(ord) = 1:K maps an old label to its ordered label
+        function [ord, rnk] = mixture_order(mu, doSort)
+            K = size(mu, 2);
+            if doSort; [~, ord] = sort(mu(1,:), 'ascend'); else; ord = 1:K; end
+            rnk = zeros(1, K); rnk(ord) = 1:K;
+        end
+
+        function r = mixture_ordering_rule(isFree)
+            if isFree
+                r = ['groups of every kept sample ordered by mu_k of the first hierarchical parameter, ascending ' ...
+                     '(sort; ties keep the lower label); membership rows reordered with the same permutation'];
+            else
+                r = 'fixed mode: the user''s group labels (no ordering)';
+            end
+        end
+
+        % free-mode initialisation from k-means (see Phase 7 in the class header)
+        function [z, mu, Sigma, piW] = mixture_init(uH, K, floorVar)
+        % uH [d,Nv] double (CPU or GPU); floorVar [d,1]; z [1,Nv] (class of uH), mu [d,K], Sigma [d,d,K], piW [K,1] host
+            d       = size(uH, 1);
+            mX      = mean(uH, 2);
+            sX      = std(uH, 0, 2);
+            sX(~(sX > 0)) = 1;
+            [z, C]  = mcmc_bayes.kmeans_pp((uH - mX) ./ sX, K, 100);
+            C       = double(gather(C .* sX + mX));
+            mu      = zeros(d, K); Sigma = zeros(d, d, K); nk = zeros(K, 1);
+            for k = 1:K
+                mk      = (z == k);
+                nk(k)   = gather(sum(mk));
+                if nk(k) > 0
+                    uk      = uH(:, mk);
+                    mu(:,k) = double(gather(mean(uk, 2)));
+                else
+                    mu(:,k) = C(:,k);
+                end
+                if nk(k) > 1; v = double(gather(var(uH(:, mk), 0, 2))); else; v = zeros(d, 1); end
+                Sigma(:,:,k) = diag(max(v, floorVar(:)));
+            end
+            piW     = max(nk, 1) ./ sum(max(nk, 1));
+        end
+
+        % k-means with k-means++ seeding and Lloyd iterations (no Statistics toolbox)
+        function [z, C, nIter] = kmeans_pp(X, K, maxIter)
+        % X [d,N] points as columns (CPU or GPU, double); the seeding uses the host rng (rand), so the
+        % result is deterministic given the seed. z [1,N] labels 1..K (class of X), C [d,K] centres.
+        % Lloyd: assign to the nearest centre (lowest label on ties), recompute the means; an emptied
+        % cluster is reseeded at the point farthest from its nearest centre; stop when the labels no
+        % longer change or after maxIter iterations.
+            if nargin < 3 || isempty(maxIter); maxIter = 100; end
+            [d, N]  = size(X);
+            C       = zeros(d, K, 'like', X);
+            idx     = min(N, floor(rand * N) + 1);
+            C(:,1)  = X(:, idx);
+            D2      = sum((X - C(:,1)).^2, 1);
+            for k = 2:K
+                tot = double(gather(sum(D2)));
+                if tot > 0
+                    cs  = double(gather(cumsum(D2)));
+                    idx = find(cs >= rand * tot, 1);
+                    if isempty(idx); idx = N; end
+                else
+                    idx = min(N, floor(rand * N) + 1);
+                end
+                C(:,k)  = X(:, idx);
+                D2      = min(D2, sum((X - C(:,k)).^2, 1));
+            end
+            z = zeros(1, N, 'like', X);
+            nIter = 0;
+            for it = 1:maxIter
+                nIter   = it;
+                D       = zeros(K, N, 'like', X);
+                for k = 1:K; D(k,:) = sum((X - C(:,k)).^2, 1); end
+                [Dmin, zNew] = min(D, [], 1);
+                zNew    = cast(zNew, 'like', X);
+                for k = 1:K
+                    mk  = (zNew == k);
+                    nk  = gather(sum(mk));
+                    if nk > 0
+                        C(:,k) = sum(X .* mk, 2) ./ nk;
+                    else
+                        [~, j]      = max(Dmin);
+                        C(:,k)      = X(:, j);
+                        Dmin(j)     = 0;
+                        zNew(j)     = k;
+                    end
+                end
+                if isequal(gather(zNew), gather(z)); z = zNew; break; end
+                z = zNew;
+            end
+        end
+
         % heuristic GPU memory (bytes) of one sampler call, see the class header
         function bytes = estimate_gpu_memory(Nm, Nv, Nvar)
             bytes = 2 * 4 * Nv * (8*Nm + 24*Nvar + 16);
@@ -2222,6 +2631,30 @@ classdef mcmc_bayes < mcmc
                 end
                 s.hierarchical.init     = 'every repetition: mu = mean(u), Sigma = diag(max(var(u), floorVar))';
                 s.hierarchical.floorVar = hp.floorVar;
+            end
+            % mixture (Phase 7): fields added for K > 1 only
+            if hier.K > 1
+                s.hierarchical.K        = hier.K;
+                s.hierarchical.space    = ['u_i | z_i = k ~ N(mu_k, Sigma_k), z_i ~ Categorical(pi) on the transformed parameters; ' ...
+                                           'no log-Jacobian and no bound rejection for these parameters'];
+                s.hierarchical.mhPrior  = ['collapsed mixture: log sum_k exp(log pi_k - log|Sigma_k|/2 - (u-mu_k)''Sigma_k^-1(u-mu_k)/2) ' ...
+                                           '(z summed out; stable log-sum-exp, GPU single)'];
+                s.hierarchical.membership = 'Rao-Blackwellised: mean over kept samples of P(z_i = k | u_i, theta)';
+                s.hierarchical.ordering = mcmc_bayes.mixture_ordering_rule(~hier.fixed);
+                if hier.fixed
+                    s.hierarchical.pi       = hier.pi;
+                    s.hierarchical.zStep    = 'none (fixed mode: z is not needed for the collapsed u updates)';
+                else
+                    s.hierarchical.alpha    = hier.alpha;
+                    s.hierarchical.zStep    = ['partially collapsed Gibbs (van Dyk & Park 2008): after the MH block on u | theta (z collapsed), ' ...
+                                               'z_i | u_i, theta ~ Categorical(w_i), log w_ik = log pi_k - log|Sigma_k|/2 - (u_i-mu_k)''Sigma_k^-1(u_i-mu_k)/2, ' ...
+                                               'one uniform per voxel (GPU); then theta | u, z']; 
+                    s.hierarchical.gibbs    = ['after the z-step: per group k, Sigma_k|u,z ~ IW(Psi_n, nu_n), mu_k|Sigma_k,u,z ~ N(m_n, Sigma_k/kappa_n) ' ...
+                                               'from the voxels with z = k (empty group: the hyperprior); pi|z ~ Dirichlet(alpha + n_k)'];
+                    s.hierarchical.init     = ['every repetition: k-means (k-means++ seeding, Lloyd, standardised dimensions) on the starting u; ' ...
+                                               'mu_k = cluster mean, Sigma_k = diag(max(var_k(u), floorVar)), pi_k = max(n_k,1)/sum max(n_j,1)'];
+                    s.hierarchical.emptyGroup = 'n_k = 0: (mu_k, Sigma_k) drawn from the hyperprior NIW(m0, kappa0, Psi0, nu0)';
+                end
             end
             s.mrf = [];
         end
@@ -2292,10 +2725,18 @@ classdef mcmc_bayes < mcmc
             if ~(isnumeric(tau) && isscalar(tau) && isfinite(tau) && tau > 0)
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.tau must be a positive finite scalar.');
             end
-            sdPrior = sqrt(diag(hier.Sigma));
+            if hier.K > 1
+                % mixture (Phase 7): marginal covariance of the fixed mixture
+                sdPrior = sqrt(diag(mcmc_bayes.mixture_marginal_cov(hier.mu, hier.Sigma, hier.pi)));
+                WruleDefault = ['1./sqrt(diag(V)), V = sum_k pi_k (Sigma_k + mu_k mu_k'') - mubar mubar'' ' ...
+                                '(marginal covariance of the fixed mixture)'];
+            else
+                sdPrior = sqrt(diag(hier.Sigma));
+                WruleDefault = '1./sqrt(diag(Sigma)) of the fixed Sigma';
+            end
             W = field_or_default(m, 'W', []);
             if isempty(W)
-                W = 1 ./ sdPrior; Wrule = '1./sqrt(diag(Sigma)) of the fixed Sigma';
+                W = 1 ./ sdPrior; Wrule = WruleDefault;
             else
                 if ~(isnumeric(W) && any(numel(W) == [1 d]) && all(isfinite(W(:))) && all(W(:) > 0))
                     error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.W must be positive and finite, a scalar or %d entries.', d);
@@ -3083,6 +3524,13 @@ classdef mcmc_bayes < mcmc
             % hierarchical prior: hyperparameter samples and summaries (u space)
             if isfield(diagnostics,'hyper') && ~isempty(diagnostics.hyper)
                 out.hyper = mcmc_bayes.hyper2out(diagnostics.hyper);
+                % mixture (Phase 7): membership probabilities [x,y,z,K] and MAP label [x,y,z] (0 outside the mask)
+                if isfield(diagnostics.hyper, 'membership')
+                    memb = diagnostics.hyper.membership;                % [Nv,K]
+                    [~, lab] = max(memb, [], 2);
+                    out.hyper.membership = mcmc_bayes.vec2image(memb, mask);
+                    out.hyper.mapLabel   = mcmc_bayes.vec2image(lab, mask);
+                end
             end
 
             out.settings = diagnostics.settings;
@@ -3090,6 +3538,10 @@ classdef mcmc_bayes < mcmc
 
         % out.hyper from the hyperparameter samples, see the class header
         function H = hyper2out(hyper)
+            if isfield(hyper, 'K') && hyper.K > 1
+                H = mcmc_bayes.hyper2out_mixture(hyper);
+                return
+            end
             H.params        = hyper.params;
             H.transform     = hyper.transform;
             H.hyperprior    = hyper.hyperprior;
@@ -3123,6 +3575,57 @@ classdef mcmc_bayes < mcmc
                 if Nrep > 1
                     H.rhat.mu       = mcmc_bayes.rhat(mu);
                     H.rhat.Sigma    = reshape(mcmc_bayes.rhat(SigmaF), d, d);
+                end
+            end
+        end
+
+        % out.hyper of the mixture prior (K > 1), ordered groups, see Phase 7 in the class header
+        function H = hyper2out_mixture(hyper)
+            H.params        = hyper.params;
+            H.transform     = hyper.transform;
+            H.hyperprior    = hyper.hyperprior;
+            H.fixed         = hyper.fixed;
+            H.K             = hyper.K;
+            H.ordering      = hyper.ordering;
+            if hyper.fixed
+                H.mean.mu   = hyper.mu;     H.mean.Sigma    = hyper.Sigma;      H.mean.pi   = hyper.pi;
+                H.median    = H.mean;
+                return
+            end
+            H.alpha         = hyper.alpha;
+            mu      = hyper.muPost;                     % [d, K, Ns, Nrep]
+            Sigma   = hyper.SigmaPost;                  % [d, d, K, Ns, Nrep]
+            piP     = hyper.piPost;                     % [K, Ns, Nrep]
+            d       = size(mu, 1); K = hyper.K;
+            Ns      = size(piP, 2); Nrep = size(piP, 3);
+            muF     = reshape(mu, d*K, Ns, Nrep);
+            SigmaF  = reshape(Sigma, d*d*K, Ns, Nrep);
+            H.posterior.mu      = mu;
+            H.posterior.Sigma   = Sigma;
+            H.posterior.pi      = piP;
+            if Ns == 0
+                % no kept samples: final Gibbs state (ordered), averaged over chains
+                H.mean.mu       = mean(hyper.muLast, 3);
+                H.mean.Sigma    = mean(hyper.SigmaLast, 4);
+                H.mean.pi       = mean(hyper.piLast, 2);
+                H.median        = H.mean;
+                H.summary       = 'no kept samples: mean/median are the final Gibbs state (ordered groups) averaged over chains';
+                return
+            end
+            H.mean.mu           = reshape(mean(reshape(muF, d*K, []), 2), d, K);
+            H.mean.Sigma        = reshape(mean(reshape(SigmaF, d*d*K, []), 2), d, d, K);
+            H.mean.pi           = mean(reshape(piP, K, []), 2);
+            H.median.mu         = reshape(median(reshape(muF, d*K, []), 2), d, K);
+            H.median.Sigma      = reshape(median(reshape(SigmaF, d*d*K, []), 2), d, d, K);
+            H.median.pi         = median(reshape(piP, K, []), 2);
+            if Ns >= 4
+                H.ess.mu        = reshape(mcmc_bayes.ess(muF), d, K);
+                H.ess.Sigma     = reshape(mcmc_bayes.ess(SigmaF), d, d, K);
+                H.ess.pi        = mcmc_bayes.ess(piP);
+                if Nrep > 1
+                    H.rhat.mu       = reshape(mcmc_bayes.rhat(muF), d, K);
+                    H.rhat.Sigma    = reshape(mcmc_bayes.rhat(SigmaF), d, d, K);
+                    H.rhat.pi       = mcmc_bayes.rhat(piP);
                 end
             end
         end

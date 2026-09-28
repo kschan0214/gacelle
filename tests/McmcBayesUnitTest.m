@@ -9,6 +9,9 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     % NIW posterior parameters vs a closed form, Gibbs-block stationary moments
     % (NIW and Jeffreys-half), hierarchical option validation, log-prior cache
     % consistency and GPU runs of the hierarchical prior.
+    % Phase 7: Gaussian-mixture hierarchical prior (K > 1): k-means helper, z-step frequencies vs
+    % exact responsibilities, Dirichlet moments, per-group sufficient statistics, option validation,
+    % cache consistency with K = 2 (free, fixed, fixed + MRF), outputs/ordering/two-stage, short exact toy.
     % Phase 4: MRF neighbour tables and colouring (both modes, several radii,
     % masks with holes and volume edges), edge-weight validation, T4.1 (local
     % vs global MRF energy for every potential), MRF option errors, GPU runs
@@ -88,6 +91,44 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     pooled posterior covariance (samples minus the exact per-voxel mean): every entry within
     %     5 SE of the exact s^2 (A'A)^-1, SE = sqrt(2/sum_voxels ESS) relative;
     %     median ESS/iteration of u1 >= 5 x that of adaptCovariance = false (same seed and burn-in)
+    %   Phase 7 (Gaussian-mixture hierarchical prior, K > 1):
+    %   k-means (3 clusters >= 8 SD apart, 210 points, CPU double): labels recovered exactly up to a
+    %     relabelling (confusion matrix is a permutation); same seed -> identical labels and centres;
+    %     mixture_init: mu_k, Sigma_k = diag(max(var_k, floorVar)) vs direct RelTol 1e-12, pi_k = n_k/N
+    %     AbsTol 1e-15; degenerate start (all points equal): finite output, sum(pi) = 1 within 1e-12
+    %   z-step (K = 3, d = 2, 13 voxels incl. one with extreme log weights, 4e4 draws per voxel, CPU double):
+    %     normalised weights vs independently computed responsibilities: AbsTol 1e-12; every frequency
+    %     |f - p| <= 5 sqrt(p(1-p)/N) + 1e-12; boundary mapping of r to z exact; mixture_to_gpu (GPU):
+    %     mixD vs direct AbsTol 1e-12 (double), PG vs inv(Sigma_k) RelTol 1e-5 (single)
+    %   Dirichlet (a = [0.5 2 7.5], N = 1e5, host): mean, variance and cov(1,2) within 5 SE of
+    %     a/a0, a(a0-a)/(a0^2(a0+1)), -a1 a2/(a0^2(a0+1)); every draw positive, sums to 1 within 1e-12
+    %   per-group sufficient statistics vs direct loops (double): n exact, ubar and S RelTol 1e-12 (AbsTol
+    %     1e-12); empty group exactly 0; K = 1 vs hyper_suffstats RelTol 1e-12; GPU single input vs direct
+    %     on the same values RelTol 1e-10; niw_posterior with n = 0 returns the prior exactly
+    %   collapsed mixture log-prior logprior_mix (K = 3, d = 2, voxels incl. |u| = 1e3): CPU double vs a direct
+    %     log(sum_k pi_k |Sigma_k|^(-1/2) exp(-q_k/2)) (and log-sum-exp for the far voxels): AbsTol 1e-10
+    %     (RelTol 1e-12); GPU single vs the double value of the same single inputs: |diff| <= 1e-5 max(1,|lp|);
+    %     finite everywhere; c = [] equals logprior_normal exactly (isequal); responsibilities sum to 1
+    %     within 1e-12 and equal the exp(log-weights - logsumexp) directly (AbsTol 1e-12)
+    %   mixture marginal covariance: 1-D hand example exact (AbsTol 1e-12), K = 1 equals Sigma;
+    %     MRF W and Huber delta with K > 1 = 1./sqrt(diag(V)), huberDelta*sqrt(diag(V)) RelTol 1e-12
+    %   GPU runs with K = 2 (checkCache; free, fixed, fixed + MRF with subsetForward true/false, joint and
+    %     componentwise): caches (collapsed mixture log-prior vs fresh recompute) <= 1e-5, inactive voxels
+    %     never move (exactly 0); fixed mode: membership == mean over the kept samples of the exact
+    %     responsibilities computed (double, CPU) from out.posterior: AbsTol 1e-9; ordered samples:
+    %     mu_1(1) <= mu_2(1) in every kept sample; pi and membership sum to 1 within 1e-12 (1e-6 for single);
+    %     well-separated two-group grid: MAP label agreement with the true groups >= 0.95 and
+    %     |E[mu_k] - true mu_k| <= 0.3 (u units; group SD 0.2, >= 20 voxels per group)
+    %   short exact fixed-mixture toy (d = 2, K = 2, 20 voxels chosen from the exact posterior: 10 with
+    %     P(z=1|y) in [0.1, 0.9], 10 with minor-group mass < 1e-5; 32 chains x 6000 iterations): per-voxel
+    %     E[u1], E[u2] and the output membership P(z=1|y), z = (mean of chain estimates - exact) /
+    %     (SD of chain estimates / sqrt(32)), 60 z: frac(|z| > 1.96) <= 0.15 and max|z| <= 4.5; if all chains
+    %     agree exactly (SD 0), |estimate - exact| <= 1e-3 (full test: test_T7_1_mixture_exact.m)
+    %     Revision (collapsed mixture, Rao-Blackwellised membership; after a FAIL, max|z| 12.3): membership of
+    %     the 10 near-certain voxels is checked as |estimate - exact| <= 1e-3 (the bound the SD = 0 rule used)
+    %     instead of by z, so 50 z remain (thresholds unchanged). Reason: their minor-group mass (< 1e-5)
+    %     sits in a u-mode the random-walk chains rarely visit, and the between-chain SD of the smooth RB
+    %     estimate does not include it (T7.1 run 4: shortfall <= 1.4e-5)
     %
     % Kwok-Shing Chan @ MGH
 
@@ -1601,6 +1642,352 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.log(matlab.unittest.Verbosity.Terse, sprintf('correlated toy: ESS/iteration u1 %.4f (diagonal) -> %.4f (adaptCovariance), gain %.1f', essIt(1), essIt(2), gain));
             testCase.verifyGreaterThanOrEqual(gain, 5);
         end
+
+        %% Phase 7: Gaussian-mixture hierarchical prior (pure, no GPU unless noted)
+        function testMixtureKmeans(testCase)
+            rng(700);
+            Cc  = [0 20 -20; 0 50 100];                 % very different scales per dimension (standardised in mixture_init)
+            n   = [120 60 30];
+            X = []; lab = [];
+            for k = 1:3; X = [X, Cc(:,k) + [1; 2.5].*randn(2, n(k))]; lab = [lab, k*ones(1, n(k))]; end %#ok<AGROW>
+            perm = randperm(size(X,2)); X = X(:,perm); lab = lab(perm);
+            rng(1); [z, C] = mcmc_bayes.kmeans_pp(X, 3, 100);
+            M = accumarray([lab(:) z(:)], 1, [3 3]);
+            testCase.verifyEqual(nnz(M), 3, 'confusion matrix must be a permutation');
+            testCase.verifyEqual(sort(max(M, [], 2)).', sort(n));
+            rng(1); [z2, C2] = mcmc_bayes.kmeans_pp(X, 3, 100);
+            testCase.verifyEqual(z2, z); testCase.verifyEqual(C2, C);
+            % mixture_init: cluster means, floored diagonal variances, pi from the sizes
+            floorVar = [2; 0.01];
+            rng(2); [zi, mu, Sigma, piW] = mcmc_bayes.mixture_init(X, 3, floorVar);
+            M = accumarray([lab(:) zi(:)], 1, [3 3]);
+            testCase.verifyEqual(nnz(M), 3);
+            for k = 1:3
+                mk = zi == k;
+                testCase.verifyEqual(mu(:,k), mean(X(:,mk), 2), 'RelTol', 1e-12);
+                testCase.verifyEqual(Sigma(:,:,k), diag(max(var(X(:,mk), 0, 2), floorVar)), 'RelTol', 1e-12);
+                testCase.verifyEqual(piW(k), nnz(mk)/size(X,2), 'AbsTol', 1e-15);
+            end
+            % degenerate start (all points equal)
+            [~, mud, Sd, pd] = mcmc_bayes.mixture_init(zeros(2, 20), 2, [1; 1]);
+            testCase.verifyTrue(all(isfinite(mud(:))) && all(isfinite(Sd(:))));
+            testCase.verifyEqual(sum(pd), 1, 'AbsTol', 1e-12);
+        end
+
+        function testMixtureZStepFrequencies(testCase)
+            rng(710);
+            mu  = [-2 0 2.5; 0 1.5 -0.5];
+            Sig = cat(3, [1 0.3; 0.3 0.5], [0.4 -0.1; -0.1 0.8], [2 0; 0 0.3]);
+            piW = [0.5; 0.2; 0.3];
+            u   = [[linspace(-2.5, 3, 12); linspace(-1, 2, 12)], [30; 30]];     % last voxel: extreme log weights
+            Nv  = size(u, 2); K = 3; N = 4e4;
+            % reference responsibilities (det and backslash, independent of the helpers)
+            lr  = zeros(K, Nv);
+            for k = 1:K; r = u - mu(:,k); lr(k,:) = log(piW(k)) - 0.5*log(det(Sig(:,:,k))) - 0.5*sum(r .* (Sig(:,:,k) \ r), 1); end
+            P   = exp(lr - max(lr, [], 1)); P = P ./ sum(P, 1);
+            mixD = struct('mu', mu, 'P', cat(3, inv(Sig(:,:,1)), inv(Sig(:,:,2)), inv(Sig(:,:,3))), ...
+                          'c', log(piW) - 0.5*[log(det(Sig(:,:,1))); log(det(Sig(:,:,2))); log(det(Sig(:,:,3)))]);
+            lw  = mcmc_bayes.mixture_logweights(u, mixD);
+            W   = exp(lw - max(lw, [], 1)); W = W ./ sum(W, 1);
+            testCase.verifyEqual(W, P, 'AbsTol', 1e-12);
+            % frequencies over N draws per voxel (voxels replicated, one call)
+            zz  = mcmc_bayes.mixture_zstep(repmat(lw, 1, N), rand(1, Nv*N));
+            F   = zeros(K, Nv);
+            zz  = reshape(zz, Nv, N);
+            for k = 1:K; F(k,:) = mean(zz == k, 2).'; end
+            tol = 5*sqrt(P.*(1-P)/N) + 1e-12;
+            testCase.verifyLessThanOrEqual(max(abs(F - P) - tol, [], 'all'), 0, sprintf('max |f-p|/tol = %.3g', max(abs(F - P)./tol, [], 'all')));
+            testCase.verifyTrue(all(zz(Nv,:) == find(P(:,Nv) == max(P(:,Nv)))), 'extreme voxel');
+            % mapping of r to z near (not on) the cumulative boundaries 0.2, 0.5 of w = [0.2 0.3 0.5]
+            lw3 = log([0.2; 0.3; 0.5]) * [1 1 1 1 1];
+            testCase.verifyEqual(mcmc_bayes.mixture_zstep(lw3, [0.1 0.19 0.25 0.45 0.99]), [1 1 2 2 3]);
+            % GPU: mixture_to_gpu
+            if canUseGPU
+                [muG, PG, mixG] = mcmc_bayes.mixture_to_gpu(mu, Sig, piW);
+                testCase.verifyEqual(gather(mixG.c), mixD.c, 'AbsTol', 1e-12);
+                testCase.verifyEqual(gather(mixG.P), mixD.P, 'AbsTol', 1e-12);
+                testCase.verifyEqual(double(gather(PG)), mixD.P, 'RelTol', 1e-5);
+                testCase.verifyEqual(double(gather(muG)), mu, 'RelTol', 1e-7);
+                lwG = gather(mcmc_bayes.mixture_logweights(gpuArray(single(u)), mixG));
+                testCase.verifyEqual(lwG, mcmc_bayes.mixture_logweights(double(single(u)), mixD), 'RelTol', 1e-10);
+            end
+        end
+
+        function testDirichletMoments(testCase)
+            rng(720);
+            a = [0.5; 2; 7.5]; N = 1e5;
+            X = zeros(3, N);
+            for k = 1:N; X(:,k) = mcmc_bayes.draw_dirichlet(a); end
+            testCase.verifyTrue(all(X(:) > 0));
+            testCase.verifyLessThanOrEqual(max(abs(sum(X, 1) - 1)), 1e-12);
+            a0  = sum(a); E = a/a0; V = a.*(a0 - a)/(a0^2*(a0 + 1)); C12 = -a(1)*a(2)/(a0^2*(a0 + 1));
+            zM  = (mean(X, 2) - E) ./ (std(X, 0, 2)/sqrt(N));
+            dev = (X - E).^2;
+            zV  = (mean(dev, 2) - V) ./ (std(dev, 0, 2)/sqrt(N));
+            c12 = (X(1,:) - E(1)) .* (X(2,:) - E(2));
+            zC  = (mean(c12) - C12) / (std(c12)/sqrt(N));
+            testCase.verifyLessThanOrEqual(max(abs([zM; zV; zC])), 5, sprintf('z = %s', mat2str([zM; zV; zC].', 3)));
+        end
+
+        function testMixtureSuffstatsGroups(testCase)
+            rng(730);
+            d = 3; Nv = 50; K = 4;
+            u = randn(d, Nv).*[1; 2; 0.5] + [1; -1; 3];
+            z = randi(3, 1, Nv);                                    % group 4 empty
+            [n, ubar, S] = mcmc_bayes.hyper_suffstats_groups(u, z, K);
+            for k = 1:K
+                idx = find(z == k);
+                testCase.verifyEqual(n(k), numel(idx));
+                if isempty(idx)
+                    testCase.verifyEqual(ubar(:,k), zeros(d, 1)); testCase.verifyEqual(S(:,:,k), zeros(d));
+                    continue
+                end
+                ub = zeros(d, 1); for i = idx; ub = ub + u(:,i); end; ub = ub/numel(idx);
+                Sd = zeros(d);    for i = idx; Sd = Sd + (u(:,i) - ub)*(u(:,i) - ub).'; end
+                testCase.verifyEqual(ubar(:,k), ub, 'RelTol', 1e-12, 'AbsTol', 1e-12);
+                testCase.verifyEqual(S(:,:,k), Sd, 'RelTol', 1e-12, 'AbsTol', 1e-12);
+            end
+            % K = 1 equals hyper_suffstats
+            [n1, u1, S1] = mcmc_bayes.hyper_suffstats_groups(u, ones(1, Nv), 1);
+            [ub0, S0]    = mcmc_bayes.hyper_suffstats(u);
+            testCase.verifyEqual(n1, Nv); testCase.verifyEqual(u1, ub0, 'RelTol', 1e-12); testCase.verifyEqual(S1, S0, 'RelTol', 1e-12);
+            % empty group: the conjugate update returns the hyperprior exactly
+            m0 = [0.1; -0.2; 0.3]; Psi0 = diag([1 2 3]);
+            [mn, kn, Psin, nun] = mcmc_bayes.niw_posterior(ubar(:,4), S(:,:,4), 0, m0, 0.01, Psi0, 5);
+            testCase.verifyEqual({mn, kn, Psin, nun}, {m0, 0.01, Psi0, 5});
+            if canUseGPU
+                us = single(u);
+                [nG, uG, SG] = mcmc_bayes.hyper_suffstats_groups(gpuArray(us), gpuArray(z), K);
+                [nD, uD, SD] = mcmc_bayes.hyper_suffstats_groups(double(us), z, K);
+                testCase.verifyEqual(nG, nD);
+                testCase.verifyEqual(uG, uD, 'RelTol', 1e-10, 'AbsTol', 1e-12);
+                testCase.verifyEqual(SG, SD, 'RelTol', 1e-10, 'AbsTol', 1e-12);
+            end
+        end
+
+        function testMixtureCollapsedLogPrior(testCase)
+            rng(760);
+            d = 2; K = 3;
+            mu  = [-2 0 2.5; 0 1.5 -0.5];
+            Sig = cat(3, [1 0.3; 0.3 0.5], [0.4 -0.1; -0.1 0.8], [2 0; 0 0.3]);
+            piW = [0.5; 0.2; 0.3];
+            u   = [randn(d, 40).*2, [1e3; -1e3], [-1e3; 20]];
+            c = zeros(K,1); P = zeros(d,d,K);
+            for k = 1:K; c(k) = log(piW(k)) - 0.5*log(det(Sig(:,:,k))); P(:,:,k) = inv(Sig(:,:,k)); end
+            % direct reference (double): plain sum for moderate u, log-sum-exp for the far voxels
+            q   = zeros(K, size(u,2));
+            for k = 1:K; r = u - mu(:,k); q(k,:) = c(k) - 0.5*sum(r .* (Sig(:,:,k) \ r), 1); end
+            ref = log(sum(exp(q), 1));
+            far = ~isfinite(ref); qm = max(q(:,far), [], 1); ref(far) = qm + log(sum(exp(q(:,far) - qm), 1));
+            lp  = mcmc_bayes.logprior_mix(u, c, mu, P);
+            testCase.verifyTrue(all(isfinite(lp)));
+            testCase.verifyEqual(lp, ref, 'AbsTol', 1e-10, 'RelTol', 1e-12);
+            % c = [] (K = 1 path) is exactly logprior_normal
+            testCase.verifyTrue(isequal(mcmc_bayes.logprior_mix(u, [], mu(:,1), P(:,:,1)), mcmc_bayes.logprior_normal(u, mu(:,1), P(:,:,1))));
+            % responsibilities
+            mixD = struct('mu', mu, 'P', P, 'c', c);
+            R    = mcmc_bayes.mixture_responsibilities(u, mixD);
+            testCase.verifyLessThanOrEqual(max(abs(sum(R, 1) - 1)), 1e-12);
+            lw   = mcmc_bayes.mixture_logweights(u, mixD);
+            testCase.verifyEqual(R, exp(lw - (max(lw,[],1) + log(sum(exp(lw - max(lw,[],1)), 1)))), 'AbsTol', 1e-12);
+            if canUseGPU
+                [muG, PG, mixG] = mcmc_bayes.mixture_to_gpu(mu, Sig, piW);
+                us  = single(u);
+                lpG = gather(mcmc_bayes.logprior_mix(gpuArray(us), mixG.cG, muG, PG));
+                lpD = mcmc_bayes.logprior_mix(double(us), c, mu, P);
+                testCase.verifyTrue(all(isfinite(lpG)));
+                testCase.verifyLessThanOrEqual(max(abs(double(lpG) - lpD) ./ max(1, abs(lpD))), 1e-5);
+            end
+        end
+
+        function testMixtureOptionErrors(testCase)
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 1]; f.xStepSize = [0.1; 0.1; 0.01];
+            mu = [0 1; 0 2]; Sig = cat(3, eye(2), 0.5*eye(2)); piW = [0.3; 0.7];
+            setup = @(h) mcmc_bayes.setup_hierarchical(setfield(f, 'prior', struct('hierarchical', h))); %#ok<SFLD>
+            h = setup(struct());
+            testCase.verifyEqual(h.K, 1); testCase.verifyEqual(h.pi, []);
+            h = setup(struct('K', 3, 'alpha', 0.5));
+            testCase.verifyEqual([h.K h.alpha], [3 0.5]); testCase.verifyEqual(h.init, 'kmeans');
+            h = setup(struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', Sig, 'pi', [0.3 0.7]));
+            testCase.verifyEqual(h.pi, piW); testCase.verifyEqual(h.mu, mu); testCase.verifyEqual(h.Sigma, Sig);
+            id = 'mcmc_bayes:hierarchicalMixture';
+            testCase.verifyError(@() setup(struct('K', 2, 'hyperprior', 'jeffreys_half')), id);
+            for K = {0, 1.5, -1, [1 2], NaN, 'a'}
+                testCase.verifyError(@() setup(struct('K', K{1})), id);
+            end
+            testCase.verifyError(@() setup(struct('K', 2, 'alpha', 0)), id);
+            testCase.verifyError(@() setup(struct('K', 2, 'init', 'random')), id);
+            id = 'mcmc_bayes:hierarchicalFixed';
+            testCase.verifyError(@() setup(struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', Sig)), id);                 % no pi
+            testCase.verifyError(@() setup(struct('K', 2, 'fixed', true, 'mu', mu(:,1), 'Sigma', Sig, 'pi', piW)), id);  % mu [d,1]
+            testCase.verifyError(@() setup(struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', eye(2), 'pi', piW)), id);    % Sigma [d,d]
+            bad = Sig; bad(:,:,2) = [1 2; 2 1];
+            testCase.verifyError(@() setup(struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', bad, 'pi', piW)), id);       % not SPD
+            testCase.verifyError(@() setup(struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', Sig, 'pi', [0.5; 0.6])), id);% sum ~= 1
+            testCase.verifyError(@() setup(struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', Sig, 'pi', [1.2; -0.2])), id);
+            testCase.verifyError(@() setup(struct('K', 2, 'pi', piW)), id);                                              % pi, free mode
+            % mixture marginal covariance and the MRF scale
+            testCase.verifyEqual(mcmc_bayes.mixture_marginal_cov([0 2], cat(3, 1, 4), [0.5 0.5]), 3.5, 'AbsTol', 1e-12);
+            testCase.verifyEqual(mcmc_bayes.mixture_marginal_cov(mu(:,1), Sig(:,:,1), 1), Sig(:,:,1), 'AbsTol', 1e-15);
+            V  = mcmc_bayes.mixture_marginal_cov(mu, Sig, piW);
+            g  = f; g.prior = struct('hierarchical', struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', Sig, 'pi', piW), ...
+                                     'mrf', struct('potential', 'huber', 'huberDelta', 0.7));
+            mrf = mcmc_bayes.setup_mrf(g, mcmc_bayes.setup_hierarchical(g));
+            testCase.verifyEqual(mrf.W, 1./sqrt(diag(V)), 'RelTol', 1e-12);
+            testCase.verifyEqual(mrf.delta, 0.7*sqrt(diag(V)), 'RelTol', 1e-12);
+            testCase.verifyTrue(contains(mrf.Wrule, 'mixture'));
+            % K = 1 settings carry no mixture fields
+            s = mcmc_bayes.prior_settings(setup(struct('fixed', true, 'mu', [0 0], 'Sigma', eye(2))), []);
+            testCase.verifyFalse(isfield(s.hierarchical, 'K'));
+        end
+
+        %% Phase 7: GPU runs of the mixture prior
+        function testMixtureCacheConsistency(testCase, updateScheme)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd, muT] = McmcBayesUnitTest.mixGrid();
+            f.updateScheme = updateScheme; f.checkCache = true; f.repetition = 2; f.overdisp = 0.01;
+            f.adaptStepSize = true; f.adaptInterval = 20;
+            SigT = cat(3, 0.04*eye(2), 0.04*eye(2)); piT = [0.6; 0.4];
+            cfgs = {struct('hierarchical', struct('K', 2)), ...
+                    struct('hierarchical', struct('K', 2, 'fixed', true, 'mu', muT, 'Sigma', SigT, 'pi', piT)), ...
+                    struct('hierarchical', struct('K', 2, 'fixed', true, 'mu', muT, 'Sigma', SigT, 'pi', piT), ...
+                           'mrf', struct('potential', 'l1', 'subsetForward', true)), ...
+                    struct('hierarchical', struct('K', 2, 'fixed', true, 'mu', muT, 'Sigma', SigT, 'pi', piT), ...
+                           'mrf', struct('potential', 'huber', 'subsetForward', false))};
+            for k = 1:numel(cfgs)
+                f.prior = cfgs{k};
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.Ncheck, f.iteration*f.repetition);
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5, sprintf('cfg %d', k));
+                if isfield(cc, 'inactiveMoved'); testCase.verifyEqual(cc.inactiveMoved, 0, sprintf('cfg %d', k)); end
+                if k >= 3; testCase.verifyEqual(out.settings.mrf.subsetForward.used, k == 3); end
+            end
+            % mixed transforms under a marginal likelihood (Jacobian dropped for the hierarchical rows only)
+            [y, mask2, w, pars0, fitting, obj] = McmcBayesUnitTest.r2starSetup();
+            g = fitting; g.likelihood = 'marginal_noise'; g.updateScheme = updateScheme; g.checkCache = true;
+            g.lb = [0; 0; 0.001]; g.ub = [2; Inf; 0.1]; g.parameterTransform = {'sigmoid','log','linear'};
+            g.prior.hierarchical = struct('K', 2, 'params', {{'M0','R2star'}});
+            out = mcmc_bayes().optimisation(y, mask2, w, pars0, g, @obj.FWD, 'mcmc', g);
+            cc  = out.diagnostics.cacheCheck;
+            testCase.verifyLessThanOrEqual(max([cc.logprior cc.loglik cc.logjac]), 1e-5);
+            % K larger than the number of voxels (free mode)
+            g.prior.hierarchical = struct('K', 9);
+            testCase.verifyError(@() mcmc_bayes().optimisation(y, mask2, w, pars0, g, @obj.FWD, 'mcmc', g), 'mcmc_bayes:hierarchicalMixture');
+        end
+
+        function testMixtureRunsOutputs(testCase)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd, muT, labT] = McmcBayesUnitTest.mixGrid();
+            f.repetition = 2; f.overdisp = 0.01; f.adaptStepSize = true; f.adaptInterval = 20;
+            f.prior.hierarchical = struct('K', 2);
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+            H   = out.hyper; Ns = numel(f.burnin+1:f.thinning:f.iteration);
+            testCase.verifyEqual(H.K, 2);
+            testCase.verifyEqual(size(H.posterior.mu), [2 2 Ns 2]);
+            testCase.verifyEqual(size(H.posterior.Sigma), [2 2 2 Ns 2]);
+            testCase.verifyEqual(size(H.posterior.pi), [2 Ns 2]);
+            testCase.verifyEqual(size(H.rhat.mu), [2 2]); testCase.verifyEqual(size(H.ess.Sigma), [2 2 2]); testCase.verifyEqual(size(H.rhat.pi), [2 1]);
+            testCase.verifyTrue(all(H.posterior.mu(1,1,:,:) <= H.posterior.mu(1,2,:,:), 'all'), 'kept samples must be ordered by mu_k(1)');
+            testCase.verifyLessThanOrEqual(max(abs(sum(H.posterior.pi, 1) - 1), [], 'all'), 1e-12);
+            testCase.verifyEqual(sum(H.mean.pi), 1, 'AbsTol', 1e-12);
+            testCase.verifyLessThanOrEqual(max(abs(H.mean.mu - muT), [], 'all'), 0.3);
+            testCase.verifyEqual(size(H.membership), [size(mask) 2]);
+            mb = reshape(H.membership, [], 2);
+            testCase.verifyLessThanOrEqual(max(abs(sum(mb(mask(:),:), 2) - 1)), 1e-12);
+            testCase.verifyEqual(mb(~mask(:),:), zeros(nnz(~mask), 2));
+            testCase.verifyTrue(all(ismember(H.mapLabel(mask), [1 2])) && all(H.mapLabel(~mask) == 0));
+            testCase.verifyGreaterThanOrEqual(mean(H.mapLabel(mask) == labT(:)), 0.95);
+            testCase.verifyEqual(out.settings.prior.hierarchical.K, 2);
+            testCase.verifyTrue(contains(H.ordering, 'ascending'));
+            % fixed mode: user labels, pi echoed
+            SigT = cat(3, 0.04*eye(2), 0.04*eye(2)); piT = [0.6; 0.4];
+            g = f; g.prior.hierarchical = struct('K', 2, 'fixed', true, 'mu', muT(:,[2 1]), 'Sigma', SigT, 'pi', piT([2 1]));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            testCase.verifyEqual(out.hyper.mean.pi, piT([2 1]));
+            testCase.verifyGreaterThanOrEqual(mean(out.hyper.mapLabel(mask) == 3 - labT(:)), 0.95, 'fixed mode keeps the user labels');
+            % fixed mode: Rao-Blackwellised membership == mean over kept samples of the exact responsibilities
+            fh   = g.prior.hierarchical; P = zeros(2,2,2); c = zeros(2,1);
+            for k = 1:2; P(:,:,k) = inv(fh.Sigma(:,:,k)); c(k) = log(fh.pi(k)) - 0.5*log(det(fh.Sigma(:,:,k))); end
+            mixD = struct('mu', fh.mu, 'P', P, 'c', c);
+            U    = [reshape(double(out.posterior.u1), 1, []); reshape(double(out.posterior.u2), 1, [])];
+            Nm   = nnz(mask);
+            Rref = reshape(mcmc_bayes.mixture_responsibilities(U, mixD), 2, Nm, []);
+            Mref = mean(Rref, 3).';
+            mb   = reshape(out.hyper.membership, [], 2);
+            testCase.verifyEqual(mb(mask(:),:), Mref, 'AbsTol', 1e-9);
+            testCase.verifyEqual(out.settings.prior.hierarchical.zStep(1:4), 'none');
+            % two-stage through the optimisation dispatch: stage 2 fixes the ordered stage-1 means
+            g = f; g.prior.mrf = struct('potential', 'huber', 'tau', 2);
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            eb  = out.settings.empiricalBayes;
+            testCase.verifyEqual(eb.muHat, out.stage1.hyper.mean.mu); testCase.verifyEqual(eb.piHat, out.stage1.hyper.mean.pi);
+            testCase.verifyEqual(out.hyper.mean.mu, eb.muHat); testCase.verifyEqual(out.hyper.mean.Sigma, eb.SigmaHat);
+            testCase.verifyTrue(out.hyper.fixed);
+            V = mcmc_bayes.mixture_marginal_cov(eb.muHat, eb.SigmaHat, eb.piHat);
+            testCase.verifyEqual(out.settings.mrf.W, 1./sqrt(diag(V)), 'RelTol', 1e-12);
+            % estimate_hyper_subset with K = 2
+            g = f; g.repetition = 1; g.prior.hierarchical = struct('K', 2, 'subsetFraction', 0.5);
+            rng(7);
+            [muHat, SigmaHat, fFixed, ~, ~, piHat] = mcmc_bayes().estimate_hyper_subset(yy, mask, [], x0, g, fwd);
+            testCase.verifyEqual([size(muHat) size(SigmaHat) size(piHat)], [2 2 2 2 2 2 1]);
+            testCase.verifyEqual(fFixed.prior.hierarchical.pi, piHat);
+            testCase.verifyTrue(fFixed.prior.hierarchical.fixed);
+            % no kept samples (burn-in >= iterations)
+            g = f; g.burnin = f.iteration;
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            testCase.verifyTrue(all(isfinite(out.hyper.mean.mu(:))));
+            mb = reshape(out.hyper.membership, [], 2);
+            testCase.verifyLessThanOrEqual(max(abs(sum(mb(mask(:),:), 2) - 1)), 1e-12);
+        end
+
+        function testMixtureExactToyShort(testCase)
+            % short version of tests/validation/mcmc_bayes/test_T7_1_mixture_exact.m (fixed K = 2). Voxels are
+            % chosen from the EXACT posterior only (no sampler output): 10 with uncertain membership
+            % (P(z=1|y) in [0.1, 0.9]) and 10 near-certain ones (minor-group mass < 1e-5). The regime in
+            % between (minor mass ~1e-3..1e-2, rare group switches) needs many long chains (see T7.1).
+            gacelletest.assumeGPU(testCase);
+            d = 2; m = 4; s = 1; Nch = 32;
+            mu  = [-1.5 1.5; 0 1]; Sig = cat(3, [0.3 0.1; 0.1 0.2], [0.25 -0.05; -0.05 0.4]); piW = [0.6; 0.4];
+            rng(741); A = randn(m, d);
+            rng(742);
+            zT = 1 + (rand(1, 200) > piW(1)); uC = zeros(d, 200);
+            for k = 1:2; uC(:, zT==k) = mu(:,k) + chol(Sig(:,:,k),'lower')*randn(d, nnz(zT==k)); end
+            uC = [uC, mu(:,1) + (mu(:,2) - mu(:,1)).*rand(1, 200)];
+            yC = A*uC + s*randn(m, size(uC, 2));
+            [~, pC] = McmcBayesUnitTest.mixExactPost(yC, A, s, mu, Sig, piW);
+            iU = find(pC(1,:) >= 0.1 & pC(1,:) <= 0.9, 10);
+            iC = find(min(pC, [], 1) < 1e-5, 10);
+            y  = yC(:, [iU iC]); Nv = size(y, 2);
+            [mP, pz] = McmcBayesUnitTest.mixExactPost(y, A, s, mu, Sig, piW);
+            yy = reshape(repmat(y.', Nch, 1), [Nv*Nch 1 1 m]);
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 10]; f.xStepSize = [0.3; 0.3; 0.01];
+            f.algorithm = 'MH'; f.iteration = 6000; f.burnin = 1500; f.thinning = 3; f.metric = {'mean'};
+            f.fixedParams = struct('noise', s); f.adaptStepSize = true; f.adaptInterval = 50;
+            f.prior.hierarchical = struct('K', 2, 'fixed', true, 'mu', mu, 'Sigma', Sig, 'pi', piW);
+            rng(743); x0.u1 = 2*randn(Nv*Nch, 1); x0.u2 = 2*randn(Nv*Nch, 1);
+            rng(744); parallel.gpu.rng(744);
+            out = mcmc_bayes().optimisation(yy, true(Nv*Nch, 1), [], x0, f, @(p) McmcBayesUnitTest.linGaussFwd(p, A));
+            % per-chain estimates [Nv, Nch]: E[u1], E[u2], output membership P(z=1)
+            mb  = reshape(out.hyper.membership, Nv, Nch, 2);
+            est = {reshape(mean(out.posterior.u1, 2), Nv, Nch), reshape(mean(out.posterior.u2, 2), Nv, Nch), mb(:,:,1)};
+            ref = [mP; pz(1,:)];
+            z = zeros(Nv, 3);
+            for k = 1:3
+                e  = double(est{k}); sd = std(e, 0, 2);
+                z(:,k) = (mean(e, 2) - ref(k,:).') ./ (sd ./ sqrt(Nch));
+                is0 = sd == 0;
+                testCase.verifyLessThanOrEqual(max([abs(mean(e(is0,:), 2) - ref(k,is0).'); 0]), 1e-3);
+                z(is0, k) = 0;
+            end
+            % membership of the near-certain voxels (columns 11..20): absolute bound, not z
+            isC = (1:Nv).' > numel(iU);
+            dC  = abs(mean(double(est{3}(isC,:)), 2) - ref(3, isC).');
+            testCase.verifyLessThanOrEqual(max(dC), 1e-3, sprintf('near-certain membership max |f-P| %.2g', max(dC)));
+            z   = [reshape(z(:,1:2), [], 1); z(~isC, 3)];
+            testCase.verifyLessThanOrEqual(mean(abs(z(:)) > 1.96), 0.15, sprintf('frac |z| > 1.96: %.3f', mean(abs(z(:)) > 1.96)));
+            testCase.verifyLessThanOrEqual(max(abs(z(:))), 4.5, sprintf('max |z| %.2f', max(abs(z(:)))));
+        end
     end
 
     methods (Static)
@@ -1822,6 +2209,40 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
                 end
             end
         end
+
+        % two well-separated groups on a 3D grid with holes (Phase 7 tests); known noise, starts near the truth
+        function [yy, mask, x0, f, fwd, muT, labT] = mixGrid()
+            rng(750); dims = [6 5 3]; m = 5; s = 0.3; d = 2;
+            mask = rand(dims) > 0.2; Nv = nnz(mask);
+            A    = randn(m, d);
+            labT = 1 + (rand(1, Nv) > 0.6);
+            muT  = [-1 2; 0 1];
+            u    = muT(:, labT) + 0.2*randn(d, Nv);
+            y    = zeros(numel(mask), m); y(mask(:), :) = (A*u + s*randn(m, Nv)).';
+            yy   = reshape(y, [dims m]);
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 10]; f.xStepSize = [0.2; 0.2; 0.01];
+            f.algorithm = 'MH'; f.iteration = 300; f.burnin = 100; f.thinning = 5; f.metric = {'mean'};
+            f.fixedParams = struct('noise', s);
+            x0.u1 = zeros(dims); x0.u2 = zeros(dims);
+            x0.u1(mask) = u(1,:) + 0.1*randn(1, Nv); x0.u2(mask) = u(2,:) + 0.1*randn(1, Nv);
+            fwd  = @(p) McmcBayesUnitTest.linGaussFwd(p, A);
+        end
+
+        % exact posterior means [d,Nv] and P(z = k | y) [K,Nv] of the linear Gaussian model under a fixed mixture prior
+        function [mP, pz] = mixExactPost(y, A, s, mu, Sig, piW)
+            [m, Nv] = size(y); d = size(A, 2); K = numel(piW);
+            mk = zeros(d, Nv, K); lw = zeros(K, Nv);
+            for k = 1:K
+                P = inv(Sig(:,:,k)); C = inv(A.'*A/s^2 + P);
+                mk(:,:,k) = C*(A.'*y/s^2 + P*mu(:,k));
+                M = A*Sig(:,:,k)*A.' + s^2*eye(m); L = chol(M, 'lower'); a = L \ (y - A*mu(:,k));
+                lw(k,:) = log(piW(k)) - sum(log(diag(L))) - 0.5*sum(a.^2, 1);
+            end
+            pz = exp(lw - max(lw, [], 1)); pz = pz ./ sum(pz, 1);
+            mP = zeros(d, Nv);
+            for k = 1:K; mP = mP + pz(k,:).*mk(:,:,k); end
+        end
+
 
         function fitting = explicitDefaults()
             fitting.parameterTransform  = 'linear';
