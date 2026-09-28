@@ -47,6 +47,11 @@ classdef mcmc_bayes < mcmc
 %           .init           : 'kmeans'      initial z, mu_k, Sigma_k, pi of the free mode (K > 1), see Phase 7
 %           .pi             : []            fixed group weights [K,1] (fixed = true and K > 1; then .mu is
 %                                           [d,K] and .Sigma is [d,d,K])
+%           .shiftMove      : false         *** EXPERIMENTAL *** joint location-shift move of (u, mu) after the
+%                                           Gibbs block, free mode only (fixed = true: error mcmc_bayes:shiftMove);
+%                                           see "Joint location-shift move" below (validation status there)
+%           .shiftEvery     : 1             run the shift move every shiftEvery iterations
+%           .shiftScale     : []            initial proposal scale s, [] -> 2.38/sqrt(d)
 %       .mrf            : []            MRF prior on the hierarchical parameters (Phase 4), a structure
 %                                       (struct() or true for all defaults) with the fields below.
 %                                       Requires .hierarchical with fixed = true (use run_two_stage
@@ -482,6 +487,59 @@ classdef mcmc_bayes < mcmc
 %       V = sum_k pi_k (Sigma_k + mu_k mu_k') - mubar mubar',  mubar = sum_k pi_k mu_k,
 %   and the Huber threshold is delta_p = huberDelta * sqrt(V_pp) (K = 1: V = Sigma, as before).
 %
+% Joint location-shift move (prior.hierarchical.shiftMove = true, free mode, K >= 1) *** EXPERIMENTAL ***
+% --------------------------------------------------------------------------------
+% Status (28 Sep 2026). Exact by construction (unit-tested acceptance terms; bitwise-identical when off).
+%   On linear-Gaussian toys it raises the ESS of mu 10-30x at ~1.6x cost per iteration, but the formal
+%   correctness test T8.1 was INCONCLUSIVE (Sigma mixes slowly, ESS ~40, with or without the move), and
+%   for K > 1 there is no conclusive test. On the SANDI phantom it did NOT help: the adapted step shrank
+%   to ~6% of its start value (many voxels make the joint likelihood very sensitive to a common shift),
+%   and mu/Sigma R-hat stayed 1.1-2.1 because the voxel chains themselves do not converge there. It
+%   helps only when voxel posteriors mix well but the population location drifts. Use with care.
+% Why. In the centred parameterisation mu is drawn from mu | u, whose spread is Sigma/n, while every
+%   u_i moves only locally. When the per-voxel likelihood is much wider than Sigma, the population
+%   location drifts slowly (autocorrelation of mu ~ V_L/(V_L + Sigma), V_L the likelihood width).
+% Move. After the Gibbs block of every shiftEvery-th sweep, per group k (K = 1: one group, all voxels):
+%       u_i' = u_i + delta_k  for every voxel with z_i = k   (hierarchical rows only),
+%       mu_k' = mu_k + delta_k,   Sigma_k, z, pi unchanged,
+%   delta_k ~ N(0, s_k^2 Sigma_k / n_k) (host), n_k = # voxels with z_i = k (group skipped if n_k = 0).
+%   The proposal depends only on (Sigma_k, n_k), which the move does not change, so it is symmetric;
+%   the map is a translation (unit Jacobian). One MH decision per group (host uniform):
+%       log r_k = sum_{z_i = k} [logL(y_i | x(u_i')) - logL(y_i | x(u_i))]           (double sum, GPU)
+%               + log p(mu_k' | Sigma_k) - log p(mu_k | Sigma_k)                     (shift_hyper_delta)
+%   niw: p(mu|Sigma) = N(m0, Sigma/kappa0); jeffreys_half: flat, 0. Terms that are exactly zero:
+%     - the conditional prior N(u_i | mu_{z_i}, Sigma_{z_i}): u_i - mu_{z_i} is unchanged;
+%     - log-Jacobian and bound rejection of the non-hierarchical rows: they do not move (the
+%       hierarchical rows carry neither);
+%     - MRF: a common shift leaves neighbour differences unchanged (and free mode has no MRF anyway;
+%       run_two_stage uses the move in stage 1 only and strips it for the fixed stage 2).
+%   The likelihood is the model's (gaussian or marginal) through the loop's cached loglik handle:
+%   one forward evaluation of all voxels per attempt (all groups at once, groups are disjoint).
+% K > 1 target. The move acts on the joint (u, z, theta), with z the draw of this sweep's z-step:
+%   after the per-group NIW and pi steps the state (u, z, theta) is a draw of the joint posterior, so a
+%   kernel that leaves the joint invariant can be inserted there; the next sweep's MH block collapses z
+%   again and the z-step redraws it (the partially collapsed order is kept). Under the joint the
+%   conditional prior is shift invariant, so no prior term enters. The COLLAPSED mixture log-prior of
+%   the shifted voxels is not invariant (mu_k moves relative to the other groups), and it also changes for
+%   the unshifted voxels; used with z fixed it would need the z-conditional correction
+%   sum_i [log p(z_i | u_i', theta') - log p(z_i | u_i, theta)] over all voxels, which cancels it exactly
+%   (unit test testShiftMixturePriorDifference). The collapsed log-prior cache is recomputed for all
+%   voxels after an accepted shift.
+% Update. Accepted group k: u, x, logL, marginal statistics of its voxels and mu_k are replaced, then the
+%   log-prior cache is recomputed for all voxels (fresh, so checkCache stays exact). Rejected: nothing
+%   changes.
+% Scale. s_k starts at shiftScale (default 2.38/sqrt(d): the right size if the per-voxel likelihood width
+%   is comparable to Sigma). In the slow regime the ideal step is ~ (2.38/sqrt(d)) sqrt(V_L/n), larger
+%   than Sigma/n; the scale is adapted during burn-in only (Robbins-Monro on log s_k per attempt j:
+%   log s_k += j^(-0.6) (min(1, exp(log r_k)) - 0.3), clamped to log(shiftScale) +/- 10) and frozen
+%   afterwards, so the kept chain uses a fixed symmetric proposal. Only the scale adapts; the shape is
+%   the current Sigma_k (V_L of a different shape limits the gain).
+% Random numbers: host randn(d,K) and rand(K,1) per attempt (only when the move is on; with shiftMove
+%   false or absent nothing changes, bitwise).
+% Output: out.diagnostics.shiftMove with .acceptance/.attempts (after burn-in) and .acceptanceBurnin/
+%   .attemptsBurnin [K,Nrep], .scale (frozen s_k) [K,Nrep], .scaleInit, .target, .every (K > 1: rows are
+%   internal group labels); out.settings.prior.hierarchical.shiftMove describes the move.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
@@ -490,6 +548,7 @@ classdef mcmc_bayes < mcmc
 % Date modified: 26 September 2026 (Phase 4b: forward model on the active colour only, subsetForward)
 % Date modified: 27 September 2026 (adaptive-covariance joint proposal, adaptCovariance)
 % Date modified: 27 September 2026 (Phase 7: Gaussian-mixture hierarchical prior, K > 1)
+% Date modified: 28 September 2026 (joint location-shift move, prior.hierarchical.shiftMove)
 %
 
     methods
@@ -624,6 +683,9 @@ classdef mcmc_bayes < mcmc
             fittingFixed = fitting;
             h.fixed = true; h.mu = muHat; h.Sigma = SigmaHat; h.subsetFraction = 1;
             if numel(piHat) > 1; h.pi = piHat; end
+            % the location-shift move is a free-mode option (error in fixed mode): not passed on
+            shiftF = intersect(fieldnames(h), {'shiftMove','shiftEvery','shiftScale'});
+            if ~isempty(shiftF); h = rmfield(h, shiftF); end
             fittingFixed.prior.hierarchical = h;
         end
 
@@ -708,7 +770,8 @@ classdef mcmc_bayes < mcmc
             h2 = h; h2.fixed = true; h2.mu = muHat; h2.Sigma = SigmaHat; h2.subsetFraction = 1;
             isMixEB = numel(piHat) > 1;
             if isMixEB; h2.pi = piHat; end
-            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0','alpha','init'}));
+            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0','alpha','init', ...
+                                                        'shiftMove','shiftEvery','shiftScale'}));    % shift move: stage 1 only (free mode)
             f2.prior.hierarchical = h2;
             out = this.optimisation(data, mask, weights, pars2, f2, FWDfunc, varargin{:});
 
@@ -767,6 +830,8 @@ classdef mcmc_bayes < mcmc
             isGibbs         = isHier && ~hier.fixed;
             % Gaussian-mixture prior (Phase 7), K > 1 only; K = 1 runs the Phase 3 code unchanged
             isMix           = isHier && hier.K > 1;
+            % joint location-shift move of (u, mu) after the Gibbs block (free mode only, opt-in)
+            isShift         = isGibbs && hier.shiftMove;
             % MRF prior on the hierarchical parameters (fixed mu/Sigma only)
             mrf             = this.setup_mrf(fitting, hier);
             isMRF           = mrf.on;
@@ -979,6 +1044,17 @@ classdef mcmc_bayes < mcmc
                     SigmaLast   = zeros(d, d, fitting.repetition);
                 end
             end
+            % location-shift move: per group k (K = 1: one group), attempts/acceptances in and after burn-in,
+            % final (frozen) proposal scale s_k per repetition
+            if isShift
+                Ksh         = hier.K;
+                shTarget    = 0.3;                              % Robbins-Monro target acceptance
+                shLogS0     = log(hier.shiftScale);             % default 2.38/sqrt(d)
+                shLogMax    = 10;                               % |log s - log s0| <= 10 (burn-in safeguard)
+                shAttB      = zeros(Ksh, fitting.repetition);  shAccB = zeros(Ksh, fitting.repetition);
+                shAttP      = zeros(Ksh, fitting.repetition);  shAccP = zeros(Ksh, fitting.repetition);
+                shScale     = zeros(Ksh, fitting.repetition);
+            end
             lpC   = [];     % mixture log-prior constants log pi_k - log|Sigma_k|/2 (K > 1 only; [] selects the single-Normal log-prior)
             if fitting.checkCache
                 cacheErr = struct('loglik', 0, 'logprior', 0, 'logjac', 0, 'Ncheck', 0);
@@ -1121,6 +1197,10 @@ classdef mcmc_bayes < mcmc
             accWin  = zeros(Nblock, Nv, 'like', uCurr);     % acceptance counts in the current adaptation window
             accPost = zeros(Nblock, Nv, 'like', uCurr);     % acceptance counts after burn-in
             jAdapt  = 0;
+            if isShift
+                shLogS  = shLogS0 .* ones(Ksh, 1);          % log proposal scale per group
+                shJ     = zeros(Ksh, 1);                    % # adaptation steps per group
+            end
 
             % adaptive covariance: running moments (double), acceptances since the accumulation start,
             % and the proposal factor lambda.*L (used once acPhase is true)
@@ -1403,6 +1483,84 @@ classdef mcmc_bayes < mcmc
                     lpCurr      = this.logprior_normal(uCurr(hIdx,:), muG, PG);
                 end
 
+                % 3b. joint location-shift move (prior.hierarchical.shiftMove, see the class header): per group k,
+                %     u_i <- u_i + delta_k (z_i = k; K = 1: all voxels) and mu_k <- mu_k + delta_k, one MH decision
+                %     per group; Sigma, z, pi unchanged. One forward evaluation of all voxels.
+                if isShift && mod(k, hier.shiftEvery) == 0
+                    SigSh   = reshape(Sigma, d, d, Ksh);
+                    muSh    = reshape(mu, d, Ksh);
+                    if isMix; nSh = nk(:); else; nSh = Nv; end
+                    zN      = randn(d, Ksh);                    % host rng
+                    rSh     = rand(Ksh, 1);
+                    delSh   = zeros(d, Ksh);
+                    for kk = 1:Ksh
+                        if nSh(kk) > 0
+                            delSh(:,kk) = exp(shLogS(kk)) .* (chol(SigSh(:,:,kk) ./ nSh(kk), 'lower') * zN(:,kk));
+                        end
+                    end
+                    % proposed state: hierarchical rows moved, all other rows (and their Jacobian/bounds) unchanged
+                    uP      = uCurr;
+                    if isMix
+                        dG  = gpuArray(single(delSh));
+                        uP(hIdx,:) = uCurr(hIdx,:) + dG(:, zCurr);
+                    else
+                        uP(hIdx,:) = uCurr(hIdx,:) + gpuArray(single(delSh));
+                    end
+                    if hasJac
+                        xP  = xCurr;
+                        xH  = this.transform_inverse_logjac_fused(uP(hIdx,:), code(hIdx), lb(hIdx), ub(hIdx));
+                        xH  = max(xH, lb(hIdx)); xH = min(xH, ub(hIdx));
+                        xP(hIdx,:) = xH;
+                    else
+                        xP  = uP;                               % all linear: x == u
+                    end
+                    if isMarginal; [lP, sP] = loglik(xP); else; lP = loglik(xP); end
+                    % log ratio per group: likelihood change of its voxels (double sum) + hyperprior change
+                    dLL     = double(lP) - double(logLCurr);
+                    if isMix
+                        dSum = zeros(Ksh, 1);
+                        for kk = 1:Ksh; dSum(kk) = gather(sum(dLL(zCurr == kk))); end
+                    else
+                        dSum = gather(sum(dLL));
+                    end
+                    logRSh  = dSum + this.shift_hyper_delta(muSh, delSh, SigSh, hp);
+                    attSh   = nSh(:) > 0;
+                    accSh   = attSh & (log(rSh) < logRSh);      % NaN is rejected
+                    if any(accSh)
+                        if isMix
+                            accG = gpuArray(accSh(:).');
+                            sel = accG(zCurr);                  % voxels of the accepted groups
+                            uCurr(:,sel)    = uP(:,sel);
+                            xCurr(:,sel)    = xP(:,sel);
+                            logLCurr(sel)   = lP(sel);
+                            if isMarginal; statsCurr(:,sel) = sP(:,sel); end
+                            mu(:,accSh)     = mu(:,accSh) + delSh(:,accSh);
+                            [muG, PG, mixD] = this.mixture_to_gpu(mu, Sigma, piW);
+                            lpC             = mixD.cG;
+                        else
+                            uCurr = uP; xCurr = xP; logLCurr = lP;
+                            if isMarginal; statsCurr = sP; end
+                            mu              = mu + delSh;
+                            [muG, PG]       = this.prior_to_gpu(mu, Sigma);
+                        end
+                        % log-prior cache recomputed (the collapsed mixture prior changes for every voxel)
+                        lpCurr = this.logprior_mix(uCurr(hIdx,:), lpC, muG, PG);
+                    end
+                    clear uP xP lP sP dLL
+                    if k <= Nburnin
+                        shAttB(:,ii) = shAttB(:,ii) + attSh;
+                        shAccB(:,ii) = shAccB(:,ii) + accSh;
+                        % Robbins-Monro on log s_k with the acceptance probability, burn-in only
+                        aSh = min(1, exp(logRSh)); aSh(isnan(aSh)) = 0;
+                        shJ(attSh)    = shJ(attSh) + 1;
+                        shLogS(attSh) = shLogS(attSh) + shJ(attSh).^(-0.6) .* (aSh(attSh) - shTarget);
+                        shLogS  = min(max(shLogS, shLogS0 - shLogMax), shLogS0 + shLogMax);
+                    else
+                        shAttP(:,ii) = shAttP(:,ii) + attSh;
+                        shAccP(:,ii) = shAccP(:,ii) + accSh;
+                    end
+                end
+
                 % test only: compare the caches with a fresh computation of the current state
                 if fitting.checkCache
                     if hasJac; xNow = xCurr; else; xNow = uCurr; end
@@ -1511,6 +1669,7 @@ classdef mcmc_bayes < mcmc
                 Rk      = this.mixture_responsibilities(uCurr(hIdx,:), mixD);
                 memLast = memLast + Rk(ord,:);
             elseif isHier && isGibbs; muLast(:,ii) = mu; SigmaLast(:,:,ii) = Sigma; end
+            if isShift; shScale(:,ii) = exp(shLogS); end
             end
 
             % convert final posterior distribution into structure
@@ -1530,6 +1689,15 @@ classdef mcmc_bayes < mcmc
             diagnostics.sampledParams   = fitting.modelParams(:).';
             diagnostics.recoveredParams = lik.recoveredParams;
             if fitting.checkCache; diagnostics.cacheCheck = cacheErr; end
+            if isShift
+                % K > 1: rows are the INTERNAL group labels (not the ordered labels of out.hyper)
+                diagnostics.shiftMove = struct('params', {hier.params}, 'K', Ksh, 'every', hier.shiftEvery, ...
+                    'acceptance', shAccP ./ shAttP, 'attempts', shAttP, ...
+                    'acceptanceBurnin', shAccB ./ shAttB, 'attemptsBurnin', shAttB, ...
+                    'scale', shScale, 'scaleInit', hier.shiftScale, 'target', shTarget, ...
+                    'proposal', 'delta_k ~ N(0, scale_k^2 Sigma_k / n_k); scale adapted in burn-in only, frozen after', ...
+                    'labels', 'K > 1: rows are internal group labels (not the ordered labels of out.hyper)');
+            end
             if isACov
                 diagnostics.adaptCovariance = struct('params', {fitting.modelParams(:).'}, ...
                     'proposalCov', acPropCov, 'lambda', acLambda, 'condition', acCond, 'valid', acValidOut, ...
@@ -1764,6 +1932,9 @@ classdef mcmc_bayes < mcmc
                     disp(['Prior             : hierarchical Normal on u, hyperprior ', char(h.hyperprior)]);
                 else
                     disp( 'Prior             : hierarchical Normal on u, hyperprior niw');
+                end
+                if isstruct(h) && isfield(h,'shiftMove') && ~isempty(h.shiftMove) && isscalar(h.shiftMove) && logical(h.shiftMove)
+                    disp(['Shift move        : joint location shift of (u, mu), every ', num2str(field_or_default(h,'shiftEvery',1)), ' iteration(s)']);
                 end
             end
             if isstruct(fitting.prior) && isfield(fitting.prior,'mrf') && ~isempty(fitting.prior.mrf) && ...
@@ -2087,7 +2258,8 @@ classdef mcmc_bayes < mcmc
         %
             hier = struct('on', false, 'params', {{}}, 'idx', [], 'd', 0, 'hyperprior', '', ...
                           'm0', [], 'kappa0', [], 'Psi0', [], 'nu0', [], 'fixed', false, 'mu', [], 'Sigma', [], ...
-                          'subsetFraction', 1, 'maxGPUMemory', [], 'K', 1, 'alpha', 1, 'init', 'kmeans', 'pi', []);
+                          'subsetFraction', 1, 'maxGPUMemory', [], 'K', 1, 'alpha', 1, 'init', 'kmeans', 'pi', [], ...
+                          'shiftMove', false, 'shiftEvery', 1, 'shiftScale', []);
             if ~isfield(fitting,'prior') || isempty(fitting.prior); return; end
             prior = fitting.prior;
             if ~isstruct(prior) || ~isscalar(prior)
@@ -2107,7 +2279,7 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: fitting.prior.hierarchical must be a structure (or true).');
             end
             valid = {'hyperprior','m0','kappa0','Psi0','nu0','fixed','mu','Sigma','params','subsetFraction','maxGPUMemory', ...
-                     'K','alpha','init','pi'};
+                     'K','alpha','init','pi','shiftMove','shiftEvery','shiftScale'};
             bad   = setdiff(fieldnames(h), valid);
             if ~isempty(bad)
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior.hierarchical: %s (valid: %s).', ...
@@ -2240,6 +2412,25 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:subsetFraction', 'mcmc_bayes: prior.hierarchical.subsetFraction must be in (0,1].');
             end
 
+            % joint location-shift move (free mode only), see the class header
+            shiftMove  = field_or_default(h, 'shiftMove', false);
+            if ~((islogical(shiftMove) || isnumeric(shiftMove)) && isscalar(shiftMove) && any(double(shiftMove) == [0 1]))
+                error('mcmc_bayes:shiftMove', 'mcmc_bayes: prior.hierarchical.shiftMove must be true or false.');
+            end
+            shiftMove  = logical(shiftMove);
+            if shiftMove && fixed
+                error('mcmc_bayes:shiftMove', ['mcmc_bayes: prior.hierarchical.shiftMove = true needs free hyperparameters ' ...
+                    '(fixed = false): it moves mu together with u. Remove it in fixed mode.']);
+            end
+            shiftEvery = field_or_default(h, 'shiftEvery', 1);
+            if ~(isnumeric(shiftEvery) && isscalar(shiftEvery) && isfinite(shiftEvery) && shiftEvery >= 1 && shiftEvery == round(shiftEvery))
+                error('mcmc_bayes:shiftMove', 'mcmc_bayes: prior.hierarchical.shiftEvery must be a positive integer.');
+            end
+            shiftScale = field_or_default(h, 'shiftScale', 2.38/sqrt(d));
+            if ~(isnumeric(shiftScale) && isscalar(shiftScale) && isfinite(shiftScale) && shiftScale > 0)
+                error('mcmc_bayes:shiftMove', 'mcmc_bayes: prior.hierarchical.shiftScale must be a positive finite scalar (or []).');
+            end
+
             hier.on             = true;
             hier.params         = params(idx);
             hier.idx            = idx;
@@ -2258,6 +2449,9 @@ classdef mcmc_bayes < mcmc
             hier.alpha          = double(alpha);
             hier.init           = init;
             if K > 1; hier.pi = piFix; else; hier.pi = []; end
+            hier.shiftMove      = shiftMove;
+            hier.shiftEvery     = double(shiftEvery);
+            hier.shiftScale     = double(shiftScale);
         end
 
         % symmetric positive definite d x d check (returns the symmetrised matrix)
@@ -2656,7 +2850,37 @@ classdef mcmc_bayes < mcmc
                     s.hierarchical.emptyGroup = 'n_k = 0: (mu_k, Sigma_k) drawn from the hyperprior NIW(m0, kappa0, Psi0, nu0)';
                 end
             end
+            % joint location-shift move: field added only when it is on
+            if isfield(hier, 'shiftMove') && hier.shiftMove
+                s.hierarchical.shiftMove = struct( ...
+                    'every',    hier.shiftEvery, ...
+                    'scaleInit',hier.shiftScale, ...
+                    'move',     ['after the Gibbs block, per group k (K = 1: all voxels): u_i <- u_i + delta_k for the voxels with ' ...
+                                 'z_i = k and mu_k <- mu_k + delta_k (hierarchical rows only; Sigma, z, pi unchanged)'], ...
+                    'proposal', 'delta_k ~ N(0, s_k^2 Sigma_k / n_k) (host), symmetric; unit Jacobian', ...
+                    'logRatio', ['sum_{z_i = k} [logL(u_i + delta_k) - logL(u_i)] + log p(mu_k + delta_k | Sigma_k) - log p(mu_k | Sigma_k) ' ...
+                                 '(niw: N(m0, Sigma_k/kappa0); jeffreys_half: 0); the conditional prior N(u_i | mu_{z_i}, Sigma_{z_i}) is ' ...
+                                 'invariant (target: u, z, theta jointly, z from the z-step of this sweep)'], ...
+                    'adapt',    'burn-in only: log s_k += j^(-0.6) (min(1, exp(logRatio_k)) - 0.3) per attempt j; frozen afterwards');
+            end
             s.mrf = [];
+        end
+
+        % hyperprior part of the log ratio of the location-shift move, per group [K,1]:
+        %   log p(mu_k + delta_k | Sigma_k) - log p(mu_k | Sigma_k)
+        %   'niw'           : N(mu | m0, Sigma/kappa0), i.e. -kappa0/2 [(b-m0)'Sigma^-1(b-m0) - (a-m0)'Sigma^-1(a-m0)]
+        %   'jeffreys_half' : flat p(mu), 0
+        function dH = shift_hyper_delta(mu, delta, Sigma, hp)
+        % mu, delta [d,K]; Sigma [d,d,K] (host, double); hp.hyperprior, hp.m0, hp.kappa0
+            K  = size(mu, 2);
+            dH = zeros(K, 1);
+            if ~strcmp(hp.hyperprior, 'niw'); return; end
+            for k = 1:K
+                R     = chol(Sigma(:,:,k));                 % Sigma = R'R
+                a     = R.' \ (mu(:,k) - hp.m0(:));
+                b     = R.' \ (mu(:,k) + delta(:,k) - hp.m0(:));
+                dH(k) = -0.5 * hp.kappa0 * (sum(b.^2) - sum(a.^2));
+            end
         end
 
         %% MRF prior (Phase 4), see the derivation in the class header
@@ -3509,6 +3733,9 @@ classdef mcmc_bayes < mcmc
 
             % test-only cache check
             if isfield(diagnostics,'cacheCheck'); out.diagnostics.cacheCheck = diagnostics.cacheCheck; end
+
+            % joint location-shift move (prior.hierarchical.shiftMove): acceptance and frozen scales
+            if isfield(diagnostics,'shiftMove'); out.diagnostics.shiftMove = diagnostics.shiftMove; end
 
             % adaptive covariance: final proposal covariance [x,y,z,d,d,Nrep], lambda/condition/valid [x,y,z,Nrep]
             if isfield(diagnostics,'adaptCovariance')

@@ -129,6 +129,20 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     instead of by z, so 50 z remain (thresholds unchanged). Reason: their minor-group mass (< 1e-5)
     %     sits in a u-mode the random-walk chains rarely visit, and the between-chain SD of the smooth RB
     %     estimate does not include it (T7.1 run 4: shortfall <= 1.4e-5)
+    %   Joint location-shift move (prior.hierarchical.shiftMove):
+    %   options: defaults (false, 1, 2.38/sqrt(d)) exact; invalid shiftMove/shiftEvery/shiftScale and shiftMove = true in
+    %     fixed mode (K = 1, K = 2, and fixed + MRF through optimisation) error mcmc_bayes:shiftMove
+    %   K = 1 prior invariance: per voxel |log N(u+delta | mu+delta) - log N(u | mu)| <= 1e-10 (CPU double),
+    %     <= 1e-5 max(1,|lp|) (GPU single); shift_hyper_delta vs direct NIW formula RelTol 1e-10 (AbsTol 1e-12),
+    %     jeffreys_half exactly 0
+    %   K > 1 (K = 3, CPU double): conditional prior sum invariant within 1e-9; logprior_mix vs direct log-sum-exp
+    %     AbsTol 1e-10; collapsed prior NOT invariant (|sum over shifted voxels| > 1e-2, unshifted voxels change > 1e-3);
+    %     collapsed difference + z-conditional correction == conditional difference within 1e-8
+    %   caches with shiftMove (checkCache; K = 1 and K = 2; gaussian, marginal_noise, marginal_S0noise; joint,
+    %     componentwise, adaptive covariance): loglik and logprior exactly 0; logjac <= 1e-5 (revised from 0 after the
+    %     first run: 6e-8 = 1 ulp between the fused kernel and transform_logjac on a non-hierarchical sigmoid row, the
+    %     same with shiftMove = false); attempt counts exact (K = 1); both accept and reject occur
+    %   two-stage: shift used in stage 1 only; estimate_hyper_subset's fixed fitting carries no shift field
     %
     % Kwok-Shing Chan @ MGH
 
@@ -1988,9 +2002,268 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyLessThanOrEqual(mean(abs(z(:)) > 1.96), 0.15, sprintf('frac |z| > 1.96: %.3f', mean(abs(z(:)) > 1.96)));
             testCase.verifyLessThanOrEqual(max(abs(z(:))), 4.5, sprintf('max |z| %.2f', max(abs(z(:)))));
         end
+
+        %% joint location-shift move (prior.hierarchical.shiftMove)
+        function testShiftMoveOptionErrors(testCase)
+            f.modelParams = {'u1';'u2';'u3';'noise'}; f.lb = [-Inf; -Inf; -Inf; 0]; f.ub = [Inf; Inf; Inf; 1];
+            f.xStepSize = [0.1; 0.1; 0.1; 0.01];
+            setup = @(h) mcmc_bayes.setup_hierarchical(setfield(f, 'prior', struct('hierarchical', h))); %#ok<SFLD>
+            % defaults
+            h = setup(struct());
+            testCase.verifyEqual([h.shiftMove h.shiftEvery], [false 1]);
+            testCase.verifyEqual(h.shiftScale, 2.38/sqrt(3), 'AbsTol', 1e-15);
+            h = setup(struct('shiftMove', 1, 'shiftEvery', 4, 'shiftScale', 0.2, 'K', 2));
+            testCase.verifyTrue(islogical(h.shiftMove) && h.shiftMove);
+            testCase.verifyEqual([h.shiftEvery h.shiftScale], [4 0.2]);
+            h = setup(struct('shiftScale', []));
+            testCase.verifyEqual(h.shiftScale, 2.38/sqrt(3), 'AbsTol', 1e-15);
+            % no hierarchy: default fields, off
+            h = mcmc_bayes.setup_hierarchical(f);
+            testCase.verifyFalse(h.on); testCase.verifyFalse(h.shiftMove);
+            % invalid values
+            id = 'mcmc_bayes:shiftMove';
+            for v = {'yes', [true true], 2, NaN}
+                testCase.verifyError(@() setup(struct('shiftMove', v{1})), id);
+            end
+            for v = {0, 1.5, -1, Inf, [1 2], 'a'}
+                testCase.verifyError(@() setup(struct('shiftEvery', v{1})), id);
+            end
+            for v = {0, -1, Inf, NaN, [1 2], 'a'}
+                testCase.verifyError(@() setup(struct('shiftScale', v{1})), id);
+            end
+            % fixed mode (K = 1 and K = 2): error when on, allowed when false
+            hf = struct('fixed', true, 'mu', [0 0 0], 'Sigma', eye(3));
+            testCase.verifyError(@() setup(setfield(hf, 'shiftMove', true)), id); %#ok<SFLD>
+            testCase.verifyFalse(getfield(setup(setfield(hf, 'shiftMove', false)), 'shiftMove')); %#ok<SFLD,GFLD>
+            hk = struct('K', 2, 'fixed', true, 'mu', zeros(3,2), 'Sigma', cat(3, eye(3), eye(3)), 'pi', [0.5 0.5], 'shiftMove', true);
+            testCase.verifyError(@() setup(hk), id);
+            % through optimisation (errors before any GPU work): fixed mode, and fixed + MRF
+            g = f; g.algorithm = 'MH'; g.prior.hierarchical = setfield(hf, 'shiftMove', true); %#ok<SFLD>
+            testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], g, []), id);
+            g.prior.mrf = struct('potential', 'l1');
+            testCase.verifyError(@() mcmc_bayes().optimisation([], [], [], [], g, []), id);
+            % settings describe the move only when it is on
+            s = mcmc_bayes.prior_settings(setup(struct('shiftMove', true)), struct('m0', [0;0;0], 'kappa0', 1e-3, ...
+                'Psi0', eye(3), 'nu0', 5, 'rules', struct(), 'floorVar', [1;1;1]));
+            testCase.verifyTrue(isfield(s.hierarchical, 'shiftMove'));
+            s = mcmc_bayes.prior_settings(setup(struct()), struct('m0', [0;0;0], 'kappa0', 1e-3, ...
+                'Psi0', eye(3), 'nu0', 5, 'rules', struct(), 'floorVar', [1;1;1]));
+            testCase.verifyFalse(isfield(s.hierarchical, 'shiftMove'));
+        end
+
+        function testShiftK1PriorInvariance(testCase)
+            % K = 1: sum_i log N(u_i + delta | mu + delta, Sigma) == sum_i log N(u_i | mu, Sigma)
+            % (CPU double: per voxel AbsTol 1e-10; GPU single: per voxel |diff| <= 1e-5 max(1,|lp|));
+            % shift_hyper_delta vs a direct NIW computation with inv(): RelTol 1e-10 (AbsTol 1e-12); 'jeffreys_half' 0
+            rng(801);
+            d = 3; n = 500;
+            Ar = randn(d); Sigma = Ar*Ar.' + 0.5*eye(d); mu = randn(d, 1);
+            u  = mu + chol(Sigma, 'lower')*randn(d, n);
+            delta = 0.7*randn(d, 1);
+            P  = inv(Sigma); P = (P + P.')/2;
+            lp0 = mcmc_bayes.logprior_normal(u, mu, P);
+            lp1 = mcmc_bayes.logprior_normal(u + delta, mu + delta, P);
+            testCase.verifyEqual(lp1, lp0, 'AbsTol', 1e-10);
+            testCase.verifyLessThanOrEqual(abs(sum(lp1) - sum(lp0)), 1e-10 * n);
+            if canUseGPU
+                [muG, PG] = mcmc_bayes.prior_to_gpu(mu, Sigma);
+                uG  = gpuArray(single(u)); dG = gpuArray(single(delta));
+                a   = double(gather(mcmc_bayes.logprior_normal(uG, muG, PG)));
+                b   = double(gather(mcmc_bayes.logprior_normal(uG + dG, muG + dG, PG)));
+                testCase.verifyLessThanOrEqual(max(abs(b - a) ./ max(1, abs(a))), 1e-5);
+            end
+            % hyperprior term
+            hp  = struct('hyperprior', 'niw', 'm0', randn(d,1), 'kappa0', 0.3);
+            ref = -0.5*hp.kappa0*((mu + delta - hp.m0).'*inv(Sigma)*(mu + delta - hp.m0) - (mu - hp.m0).'*inv(Sigma)*(mu - hp.m0)); %#ok<MINV>
+            testCase.verifyEqual(mcmc_bayes.shift_hyper_delta(mu, delta, Sigma, hp), ref, 'RelTol', 1e-10, 'AbsTol', 1e-12);
+            % per group (K = 2) and the flat 'jeffreys_half'
+            S2  = cat(3, Sigma, 2*eye(d)); m2 = [mu, -mu]; d2 = [delta, 0.1*delta];
+            ref2 = zeros(2,1);
+            for k = 1:2
+                a = m2(:,k) - hp.m0; b = a + d2(:,k);
+                ref2(k) = -0.5*hp.kappa0*(b.'*(S2(:,:,k)\b) - a.'*(S2(:,:,k)\a));
+            end
+            testCase.verifyEqual(mcmc_bayes.shift_hyper_delta(m2, d2, S2, hp), ref2, 'RelTol', 1e-10, 'AbsTol', 1e-12);
+            testCase.verifyEqual(mcmc_bayes.shift_hyper_delta(m2, d2, S2, struct('hyperprior', 'jeffreys_half')), zeros(2,1));
+        end
+
+        function testShiftMixturePriorDifference(testCase)
+            % K > 1 (K = 3, d = 2, 300 voxels, CPU double). z drawn from p(z | u, theta); the move shifts the voxels
+            % of group k and mu_k by delta_k. Checks, all against direct recomputes (independent formulas):
+            %   (a) the conditional prior sum_i [log pi_{z_i} + log N(u_i | mu_{z_i}, Sigma_{z_i})] is invariant:
+            %       |diff| <= 1e-9 (the move's ratio has no prior term)
+            %   (b) the collapsed mixture log-prior logprior_mix after the shift == direct log-sum-exp: AbsTol 1e-10
+            %   (c) the collapsed log-prior is NOT invariant: |sum over shifted voxels| > 1e-2 and the unshifted voxels
+            %       change too (max |diff| > 1e-3)
+            %   (d) collapsed difference over ALL voxels + sum_i [log p(z_i | u_i', theta') - log p(z_i | u_i, theta)]
+            %       == conditional difference (0): |diff| <= 1e-8
+            %   for every single-group shift and for all groups shifted at once
+            rng(802);
+            d = 2; K = 3; n = 300;
+            mu  = [-1.5 0.5 2; 0 1 -0.5]; Sig = cat(3, [0.5 0.1; 0.1 0.3], [0.4 -0.1; -0.1 0.6], [0.3 0; 0 0.2]);
+            piW = [0.3; 0.5; 0.2];
+            zT  = 1 + (rand(1, n) > piW(1)) + (rand(1, n) > piW(1) + piW(2));
+            u   = zeros(d, n);
+            for k = 1:K; u(:, zT==k) = mu(:,k) + chol(Sig(:,:,k), 'lower')*randn(d, nnz(zT==k)); end
+            th0 = McmcBayesUnitTest.mixTheta(mu, Sig, piW);
+            R0  = mcmc_bayes.mixture_responsibilities(u, th0);
+            z   = 1 + sum(cumsum(R0, 1) < rand(1, n), 1); z = min(z, K);
+            delta = [0.4 -0.3 0.25; -0.2 0.5 0.35];
+            for shiftSet = {1, 2, 3, 1:3}
+                ks  = shiftSet{1};
+                dK  = zeros(d, K); dK(:, ks) = delta(:, ks);
+                u1  = u + dK(:, z); mu1 = mu + dK;
+                th1 = McmcBayesUnitTest.mixTheta(mu1, Sig, piW);
+                % (a) conditional prior, direct
+                cond0 = McmcBayesUnitTest.condLogPrior(u, z, mu, Sig, piW);
+                cond1 = McmcBayesUnitTest.condLogPrior(u1, z, mu1, Sig, piW);
+                testCase.verifyLessThanOrEqual(abs(sum(cond1) - sum(cond0)), 1e-9, sprintf('shift %s', mat2str(ks)));
+                % (b) collapsed log-prior vs a direct log-sum-exp
+                col0 = mcmc_bayes.logprior_mix(u, th0.c, mu, th0.P);
+                col1 = mcmc_bayes.logprior_mix(u1, th1.c, mu1, th1.P);
+                testCase.verifyEqual(col1, McmcBayesUnitTest.directMixLogPrior(u1, mu1, Sig, piW), 'AbsTol', 1e-10);
+                testCase.verifyEqual(col0, McmcBayesUnitTest.directMixLogPrior(u, mu, Sig, piW), 'AbsTol', 1e-10);
+                % (c) not invariant
+                isS = ismember(z, ks);
+                testCase.verifyGreaterThan(abs(sum(col1(isS) - col0(isS))), 1e-2);
+                if numel(ks) < K
+                    testCase.verifyGreaterThan(max(abs(col1(~isS) - col0(~isS))), 1e-3);
+                end
+                % (d) collapsed + z-conditional correction == conditional (0)
+                R1  = mcmc_bayes.mixture_responsibilities(u1, th1);
+                lz0 = log(R0(sub2ind([K n], z, 1:n))); lz1 = log(R1(sub2ind([K n], z, 1:n)));
+                tot = sum(col1 - col0) + sum(lz1 - lz0);
+                testCase.verifyLessThanOrEqual(abs(tot - (sum(cond1) - sum(cond0))), 1e-8, sprintf('shift %s', mat2str(ks)));
+            end
+        end
+
+        function testShiftMoveCacheConsistency(testCase)
+            % checkCache with shiftMove on: caches (log-likelihood incl. marginal statistics, log-prior, log-Jacobian)
+            % == a fresh recompute EXACTLY (0) after every sweep for loglik (incl. marginal statistics) and logprior;
+            % logjac <= 1e-5 (revised after the first run: a 1-ulp fused-kernel vs helper difference on a sigmoid row
+            % outside the hierarchy, identical with shiftMove = false); K = 1: attempts == # sweeps with mod(k, shiftEvery)
+            % == 0 (burn-in / kept split); K = 2: at most that (an empty group is skipped), and > 0 after burn-in;
+            % at least one accepted and one rejected shift per configuration (so both branches run); final
+            % scale finite and > 0
+            gacelletest.assumeGPU(testCase);
+            cfg = {}; name = {};
+            % K = 1, gaussian (known noise), joint and componentwise
+            [yy, mk, x0, f, fwd] = McmcBayesUnitTest.linGaussSetup(40, 2);
+            f.checkCache = true; f.repetition = 2; f.overdisp = 0.01; f.adaptStepSize = true; f.adaptInterval = 20;
+            f.prior.hierarchical = struct('shiftMove', true);
+            cfg{end+1} = {yy, mk, [], x0, f, fwd, {}}; name{end+1} = 'K1 gaussian joint';
+            g = f; g.updateScheme = 'componentwise'; g.prior.hierarchical.hyperprior = 'jeffreys_half'; g.prior.hierarchical.shiftEvery = 3;
+            cfg{end+1} = {yy, mk, [], x0, g, fwd, {}}; name{end+1} = 'K1 gaussian componentwise jeffreys every 3';
+            % K = 1, gaussian with sampled noise (non-hierarchical linear row with rejection) and a sigmoid M0 outside the hierarchy
+            [y, mask, w, pars0, fitting, obj] = McmcBayesUnitTest.r2starSetup();
+            r = fitting; r.checkCache = true; r.lb = [0; 0; 0.001]; r.ub = [2; Inf; 0.1];
+            r.parameterTransform = {'sigmoid','log','linear'};
+            r.prior.hierarchical = struct('params', {{'R2star'}}, 'shiftMove', true);
+            cfg{end+1} = {y, mask, w, pars0, r, @obj.FWD, {'mcmc', r}}; name{end+1} = 'K1 r2star gaussian, M0 sigmoid + noise outside';
+            % K = 1, marginal likelihood, mixed transforms, adaptive covariance
+            m = r; m.likelihood = 'marginal_noise'; m.prior.hierarchical = struct('shiftMove', true);
+            m.adaptStepSize = true; m.adaptInterval = 10; m.adaptCovariance = true; m.iteration = 300; m.burnin = 150;
+            cfg{end+1} = {y, mask, w, pars0, m, @obj.FWD, {'mcmc', m}}; name{end+1} = 'K1 r2star marginal_noise acov';
+            % K = 1, marginal_S0noise (IVIM, log/sigmoid/log hierarchical, S0 marginalised)
+            [yI, mI, x0I, fI, fwdI] = McmcBayesUnitTest.ivimGrid();
+            fI.checkCache = true; fI.prior.hierarchical = struct('shiftMove', true);
+            cfg{end+1} = {yI, mI, [], x0I, fI, fwdI, {}}; name{end+1} = 'K1 ivim marginal_S0noise';
+            % K = 2, gaussian, joint and componentwise
+            [yy, mk, x0, f, fwd] = McmcBayesUnitTest.mixGrid();
+            f.checkCache = true; f.repetition = 2; f.overdisp = 0.01; f.adaptStepSize = true; f.adaptInterval = 20;
+            f.prior.hierarchical = struct('K', 2, 'shiftMove', true);
+            cfg{end+1} = {yy, mk, [], x0, f, fwd, {}}; name{end+1} = 'K2 gaussian joint';
+            g = f; g.updateScheme = 'componentwise';
+            cfg{end+1} = {yy, mk, [], x0, g, fwd, {}}; name{end+1} = 'K2 gaussian componentwise';
+            % K = 2, marginal likelihood, M0 sigmoid outside the hierarchy
+            m = r; m.likelihood = 'marginal_noise'; m.prior.hierarchical = struct('K', 2, 'params', {{'M0','R2star'}}, 'shiftMove', true);
+            cfg{end+1} = {y, mask, w, pars0, m, @obj.FWD, {'mcmc', m}}; name{end+1} = 'K2 r2star marginal_noise';
+            for k = 1:numel(cfg)
+                c = cfg{k}; fk = c{5};
+                rng(810 + k); parallel.gpu.rng(810 + k);
+                out = mcmc_bayes().optimisation(c{1}, c{2}, c{3}, c{4}, fk, c{6}, c{7}{:});
+                cc  = out.diagnostics.cacheCheck;
+                Nrep = 1; if isfield(fk, 'repetition'); Nrep = fk.repetition; end
+                testCase.verifyEqual(cc.Ncheck, fk.iteration*Nrep, name{k});
+                testCase.verifyEqual([cc.loglik cc.logprior], [0 0], name{k});
+                % log-Jacobian rows are never touched by the shift; 1 ulp (6e-8) differences between the fused
+                % kernel and transform_logjac pre-date the move (same value with shiftMove = false)
+                testCase.verifyLessThanOrEqual(cc.logjac, 1e-5, name{k});
+                sm  = out.diagnostics.shiftMove;
+                every = 1; if isfield(fk.prior.hierarchical, 'shiftEvery'); every = fk.prior.hierarchical.shiftEvery; end
+                Nb  = mcmc.get_number_burnin(fk);
+                ks  = every:every:fk.iteration;
+                Kg  = sm.K;
+                testCase.verifyEqual(size(sm.acceptance), [Kg Nrep], name{k});
+                if Kg == 1
+                    % one attempt per shift sweep
+                    testCase.verifyEqual(sm.attemptsBurnin + sm.attempts, numel(ks) * ones(Kg, Nrep), name{k});
+                    testCase.verifyEqual(sm.attempts, nnz(ks > Nb) * ones(Kg, Nrep), name{k});
+                else
+                    % an empty group is skipped (no attempt)
+                    testCase.verifyLessThanOrEqual(sm.attemptsBurnin + sm.attempts, numel(ks) * ones(Kg, Nrep), name{k});
+                    testCase.verifyLessThanOrEqual(sm.attempts, nnz(ks > Nb) * ones(Kg, Nrep), name{k});
+                    testCase.verifyGreaterThan(sum(sm.attempts(:)), 0, name{k});
+                end
+                acc = [sm.acceptance(:); sm.acceptanceBurnin(:)];
+                testCase.verifyGreaterThan(max(acc), 0, [name{k} ': no shift accepted']);
+                testCase.verifyLessThan(min(acc), 1, [name{k} ': no shift rejected']);
+                testCase.verifyTrue(all(isfinite(sm.scale(:)) & sm.scale(:) > 0), name{k});
+                testCase.verifyTrue(isfield(out.settings.prior.hierarchical, 'shiftMove'), name{k});
+            end
+        end
+
+        function testShiftMoveTwoStage(testCase)
+            % run_two_stage with shiftMove: used in the free stage 1, stripped for the fixed stage 2 (no error);
+            % estimate_hyper_subset returns a fixed-mode fitting without the shift fields
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.linGaussGrid([6 5 3], 2);
+            f.prior.hierarchical = struct('shiftMove', true, 'shiftEvery', 2); f.prior.mrf = struct('potential', 'l1', 'tau', 2);
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, f, fwd);
+            testCase.verifyTrue(isfield(out.stage1.diagnostics, 'shiftMove'));
+            testCase.verifyEqual(out.stage1.diagnostics.shiftMove.every, 2);
+            testCase.verifyFalse(isfield(out.diagnostics, 'shiftMove'));
+            testCase.verifyTrue(out.hyper.fixed);
+            g = f; g.prior = struct('hierarchical', struct('shiftMove', true, 'subsetFraction', 0.5));
+            rng(820);
+            [~, ~, fFixed, outSub] = mcmc_bayes().estimate_hyper_subset(yy, mask, [], x0, g, fwd);
+            testCase.verifyTrue(isfield(outSub.diagnostics, 'shiftMove'));
+            testCase.verifyFalse(any(isfield(fFixed.prior.hierarchical, {'shiftMove','shiftEvery','shiftScale'})));
+        end
     end
 
     methods (Static)
+        % mixture quantities in the layout of mcmc_bayes.mixture_logweights (CPU double)
+        function th = mixTheta(mu, Sig, piW)
+            [d, K] = size(mu);
+            th.mu = mu; th.P = zeros(d, d, K); th.c = zeros(K, 1);
+            for k = 1:K
+                th.P(:,:,k) = inv(Sig(:,:,k)); th.c(k) = log(piW(k)) - 0.5*log(det(Sig(:,:,k)));
+            end
+        end
+
+        % conditional log prior log pi_{z_i} + log N(u_i | mu_{z_i}, Sigma_{z_i}) (u-dependent part), direct
+        function lp = condLogPrior(u, z, mu, Sig, piW)
+            n = size(u, 2); lp = zeros(1, n);
+            for i = 1:n
+                k = z(i); r = u(:,i) - mu(:,k);
+                lp(i) = log(piW(k)) - 0.5*log(det(Sig(:,:,k))) - 0.5*(r.'*(Sig(:,:,k)\r));
+            end
+        end
+
+        % collapsed mixture log prior log sum_k pi_k |Sigma_k|^(-1/2) exp(-q_k/2), direct (per voxel, log-sum-exp)
+        function lp = directMixLogPrior(u, mu, Sig, piW)
+            [~, n] = size(u); K = numel(piW); lp = zeros(1, n);
+            for i = 1:n
+                q = zeros(K, 1);
+                for k = 1:K
+                    r = u(:,i) - mu(:,k);
+                    q(k) = log(piW(k)) - 0.5*log(det(Sig(:,:,k))) - 0.5*(r.'*(Sig(:,:,k)\r));
+                end
+                lp(i) = max(q) + log(sum(exp(q - max(q))));
+            end
+        end
+
         function [lb, ub] = boundsFor(method)
             switch method
                 case 'log';     lb = 0.001; ub = 200;

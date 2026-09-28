@@ -85,6 +85,15 @@ Chains are run in parallel as copies of the volume stacked along dim 3 and
 separated by an empty slice, so that no MRF edge connects two copies.
 `MCMC_BAYES_T4_ITER` overrides the iterations of T4.2, T4.3 and T4.5 (pilots).
 
+Joint location-shift move (`prior.hierarchical.shiftMove`; GPU):
+
+- `test_T8_1_shift_move.m`: weakly identified linear Gaussian hierarchical
+  toy (d = 2, n = 2000, per-voxel likelihood SD 4 x prior SD). Part A (K = 1):
+  both arms (with and without the move) vs an exact reference of
+  p(mu, Sigma | y) (u integrated out analytically, long double-precision MH)
+  and Rao-Blackwellised voxel moments; ESS/R-hat gain and time per iteration.
+  Part B (K = 2): arm-vs-arm z-scores and gains.
+
 Shared helpers:
 
 - `lingauss_fwd.m`: linear toy forward model `s = A*[u1;...;ud]`.
