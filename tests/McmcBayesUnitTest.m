@@ -169,6 +169,23 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     end
 
     methods (Test)
+        function testJeffreysDegenerateStateFallsBackToFloor(testCase)
+            % all voxels at the same u (as in the wrappers' GPU memory probe): S = 0 and mu = ubar
+            % make the Jeffreys-half draw of Sigma undefined; it must fall back to the variance
+            % floor and return a positive definite Sigma and a finite mu (host, no GPU)
+            rng(71);
+            d = 3; n = 100; ubar = [-2; -1; 0.5]; floorVar = [0.04; 0.09; 0.01];
+            hp = struct('hyperprior', 'jeffreys_half', 'floorVar', floorVar);
+            for S = {zeros(d), 1e-4 * ones(d)}                         % S = 0, and rank 1 (voxels moved along one direction)
+                [mu, Sigma] = mcmc_bayes.gibbs_hyper(ubar, S{1}, n, ubar, eye(d), hp);
+                [~, pU] = chol(Sigma); [~, pL] = chol(Sigma ./ n, 'lower');
+                testCase.verifyEqual([pU pL], [0 0]);
+                testCase.verifyTrue(all(isfinite(mu)));
+                % centred near the floor: diagonal within a factor 10 of floorVar
+                testCase.verifyTrue(all(diag(Sigma) > floorVar/10 & diag(Sigma) < 10*floorVar));
+            end
+        end
+
         function testIsLegacyEmptyStruct(testCase)
             testCase.verifyTrue(mcmc_bayes.isLegacy(struct()));
             testCase.verifyTrue(mcmc_bayes.isLegacy([]));

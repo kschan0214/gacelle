@@ -2256,7 +2256,20 @@ classdef mcmc_bayes < mcmc
                     dm      = ubar - mu;
                     Smu     = S + n .* (dm * dm.');
                     Smu     = (Smu + Smu.')/2;
-                    Sigma   = mcmc_bayes.draw_iw_bartlett(Smu, n - d);
+                    % degenerate state (e.g. all voxels at, or next to, the same start, as in the
+                    % memory probe): Smu or the drawn Sigma is not numerically positive definite and
+                    % the improper-prior draw is undefined; redraw centred on the variance floor
+                    % instead (a healthy state takes the single draw below, unchanged)
+                    [~, notPD] = chol(Smu);
+                    if ~notPD
+                        Sigma       = mcmc_bayes.draw_iw_bartlett(Smu, n - d);
+                        [~, pU]     = chol(Sigma);                  % prior_to_gpu reads the upper triangle,
+                        [~, pL]     = chol(Sigma ./ n, 'lower');    % draw_mvn the lower one of Sigma/n
+                        notPD       = pU > 0 || pL > 0;
+                    end
+                    if notPD && isfield(hp, 'floorVar') && ~isempty(hp.floorVar)
+                        Sigma = mcmc_bayes.draw_iw_bartlett(Smu + max(n - d, 1) .* diag(hp.floorVar(:)), n - d);
+                    end
                     mu      = mcmc_bayes.draw_mvn(ubar, Sigma ./ n);
             end
         end
