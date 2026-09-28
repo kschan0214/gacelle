@@ -12,6 +12,9 @@ classdef McmcSamplerInfraTest < matlab.unittest.TestCase
     % mcmc vs mcmc_bayes (GPU): mcmc with the options and mcmc_bayes with the same options (Gaussian
     %   likelihood, no prior) run the same chain for the same seed: posterior, metrics and
     %   out.diagnostics bitwise identical, and the shared out.settings fields equal.
+    % 'GW' + parameterTransform (GPU): explicit 'linear' keeps the legacy path; sigmoid/mixed
+    %   transforms stay in the box and agree with the untransformed ensemble run; global
+    %   parameters + transform error.
     % Option detection and errors (no GPU): mcmc.use_sampler_infra, mcmc:unsupportedAlgorithm,
     %   mcmc:invalidUpdateScheme, mcmc:adaptCovariance, mcmc:noNoise, mcmc:forwardSize.
     %
@@ -151,6 +154,84 @@ classdef McmcSamplerInfraTest < matlab.unittest.TestCase
             testCase.verifyTrue(all(isnan(out.diagnostics.ess.R2star(:))) && all(isnan(out.diagnostics.rhat.R2star(:))));
         end
 
+        %% 'GW' with parameterTransform
+        function testGWLinearTransformIsLegacy(testCase)
+            % parameterTransform = 'linear' (explicit default) keeps the legacy ensemble path
+            gacelletest.assumeGPU(testCase);
+            [y, mask, pars0, f, fwd] = McmcSamplerInfraTest.gwSetup();
+            f.iteration = 200;
+            runSeed = 48463;
+            rng(runSeed); parallel.gpu.rng(runSeed);
+            ref = mcmc().optimisation(y, mask, [], pars0, f, fwd);
+            g = f; g.parameterTransform = 'linear';
+            rng(runSeed); parallel.gpu.rng(runSeed);
+            out = mcmc().optimisation(y, mask, [], pars0, g, fwd);
+            testCase.verifyTrue(isequaln(out, ref));
+            testCase.verifyEqual(sort(fieldnames(out)), sort({'posterior';'mean';'std'}));
+        end
+
+        function testGWTransformRuns(testCase)
+            % sigmoid (and mixed per-parameter) transforms, both ensemble update schemes: samples
+            % stay inside the box, the chain moves, and the posterior mean agrees with the
+            % untransformed ensemble run (same target) within a loose tolerance
+            gacelletest.assumeGPU(testCase);
+            [y, mask, pars0, f, fwd] = McmcSamplerInfraTest.gwSetup();
+            f.Nwalker = 16; f.iteration = 2000;
+            rng(5); parallel.gpu.rng(5);
+            ref = mcmc().optimisation(y, mask, [], pars0, f, fwd);
+            for scheme = {'simultaneous','redblack'}
+                for tr = {'sigmoid', {'sigmoid','log','log'}}
+                    g = f; g.Ensembleupdate = scheme{1}; g.parameterTransform = tr{1};
+                    rng(5); parallel.gpu.rng(5);
+                    out = mcmc().optimisation(y, mask, [], pars0, g, fwd);
+                    for k = 1:numel(f.modelParams)
+                        p = out.posterior.(f.modelParams{k});
+                        testCase.verifyTrue(all(isfinite(p(:)) & p(:) >= f.lb(k) & p(:) <= f.ub(k)), f.modelParams{k});
+                        testCase.verifyGreaterThan(numel(unique(p(:))), 1);
+                    end
+                    % R2star posterior mean within 3 posterior SD of the untransformed run
+                    d = abs(out.mean.R2star - ref.mean.R2star) ./ ref.std.R2star;
+                    testCase.verifyLessThan(max(d(:)), 3, sprintf('%s / %s', scheme{1}, strjoin(cellstr(tr{1}),',')));
+                end
+            end
+        end
+
+        function testR2starWrapperEnsemble(testCase)
+            % gpuR2starMapping with the ensemble sampler: 'ensemble' and its legacy label 'GW' give the
+            % same result through estimate(), FWD reshapes for both labels, and parameterTransform runs
+            gacelletest.assumeGPU(testCase);
+            rng(3); te = linspace(0, 40e-3, 6); Nv = 12;
+            obj = gpuR2starMapping(te);
+            p.M0 = 1 + 0.1*rand(1,Nv); p.R2star = 20 + 30*rand(1,Nv);
+            y   = permute(obj.FWD(p) + 0.02*randn(numel(te), Nv), [2 3 4 1]);
+            mask = true(size(y, 1:3));
+            f   = struct('solver','mcmc','algorithm','ensemble','Nwalker',8,'StepSize',2,'iteration',200, ...
+                         'burnin',0.5,'thinning',5,'metric',{{'mean','std'}},'start','default');
+            rng(9); parallel.gpu.rng(9); outE = obj.estimate(y, mask, f);
+            g = f; g.algorithm = 'GW';
+            rng(9); parallel.gpu.rng(9); outG = obj.estimate(y, mask, g);
+            testCase.verifyTrue(isequaln(outE, outG), '''GW'' and ''ensemble'' differ');
+            % FWD with the raw legacy label: one page per walker
+            pw.M0 = ones(Nv*8, 1, 'gpuArray'); pw.R2star = 30*ones(Nv*8, 1, 'gpuArray');
+            testCase.verifySize(obj.FWD(pw, 'mcmc', struct('algorithm','GW','Nwalker',8)), [numel(te) Nv 8]);
+            % parameterTransform through the wrapper
+            g = f; g.parameterTransform = 'sigmoid';
+            out = obj.estimate(y, mask, g);
+            testCase.verifyTrue(all(isfinite(out.mean.R2star(:))));
+            testCase.verifyGreaterThan(numel(unique(out.posterior.R2star(:))), 1);
+        end
+
+        function testGWTransformGlobalErrors(testCase)
+            gacelletest.assumeGPU(testCase);
+            fwd = @(p) p.M0 .* exp(-(0:5).' * 0.01 .* p.R2star);
+            f   = struct('modelParams', {{'M0','R2star','noise'}}, 'lb', [0 0.1 0.001], 'ub', [2 200 0.1], ...
+                         'algorithm', 'GW', 'Nwalker', 8, 'StepSize', 2, 'parameterTransform', 'sigmoid', ...
+                         'iteration', 20, 'burnin', 10, 'thinning', 1, 'metric', {{'mean'}});
+            x0  = struct('M0', ones(3,4), 'R2star', 30*ones(3,4), 'noise', 0.05);      % global noise
+            y   = rand(3, 4, 1, 6) + 0.5;
+            testCase.verifyError(@() mcmc().optimisation(y, true(3,4), [], x0, f, fwd), 'mcmc:unsupportedAlgorithm');
+        end
+
         %% option detection and errors (no GPU)
         function testUseSamplerInfra(testCase, nonDefaultOption)
             testCase.verifyFalse(mcmc.use_sampler_infra(struct()));
@@ -167,7 +248,8 @@ classdef McmcSamplerInfraTest < matlab.unittest.TestCase
 
         function testOptionErrors(testCase)
             run = @(f) mcmc().optimisation([], [], [], [], f, []);
-            testCase.verifyError(@() run(struct('algorithm', 'GW', 'parameterTransform', 'sigmoid')), 'mcmc:unsupportedAlgorithm');
+            testCase.verifyError(@() run(struct('algorithm', 'GW', 'adaptStepSize', true)), 'mcmc:unsupportedAlgorithm');
+            testCase.verifyError(@() run(struct('algorithm', 'GW', 'parameterTransform', 'sigmoid', 'overdisp', 0.1)), 'mcmc:unsupportedAlgorithm');
             testCase.verifyError(@() run(struct('updateScheme', 'blockwise')), 'mcmc:invalidUpdateScheme');
             testCase.verifyError(@() run(struct('adaptCovariance', true)), 'mcmc:adaptCovariance');
             testCase.verifyError(@() run(struct('adaptCovariance', true, 'adaptStepSize', true, 'updateScheme', 'componentwise')), 'mcmc:adaptCovariance');
@@ -415,6 +497,20 @@ classdef McmcSamplerInfraTest < matlab.unittest.TestCase
                 case 'log';     lb = 0.001; ub = 200;
                 otherwise;      lb = 0.5;   ub = 2;
             end
+        end
+
+        % mono-exponential dataset with a forward handle that accepts the walker dimension
+        % ([1,Nv,Nwalker] parameters -> [Nm,Nv,Nwalker])
+        function [y, mask, pars0, f, fwd] = gwSetup()
+            rng(1); te = linspace(0, 40e-3, 6).'; sz = [4 4 2]; Nv = prod(sz);
+            fwd   = @(p) p.M0 .* exp(-te .* p.R2star);
+            M0    = 1 + 0.1*rand(1,Nv); R2 = 20 + 30*rand(1,Nv);
+            y     = M0 .* exp(-te .* R2) + 0.02*randn(numel(te), Nv);
+            y     = reshape(y.', [sz numel(te)]); mask = true(sz);
+            f     = struct('modelParams', {{'M0','R2star','noise'}}, 'lb', [0 0.1 0.001], 'ub', [2 200 0.1], ...
+                           'algorithm', 'GW', 'Nwalker', 8, 'StepSize', 2, 'iteration', 200, 'burnin', 0.5, ...
+                           'thinning', 5, 'metric', {{'mean','std'}});
+            pars0 = struct('M0', ones(sz), 'R2star', 30*ones(sz), 'noise', 0.02*ones(sz));
         end
 
         % tiny R2* dataset as in SmokeFit_R2starMappingTest / McmcBayesLegacyTest
