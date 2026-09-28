@@ -18,10 +18,11 @@ classdef gpuIVIM < handle
     %
     % 'noise' is solver-conditional (mcmc only) and is kept LAST so that
     % updateProperty() can strip it by name without hardcoding an index.
-    % The bounds keep Dstar > D (lb of Dstar = ub of D).
+    % Bounds as in BayesIVIM (Spinner et al. 2021), suited to brain IVIM (Dstar of a few um2/ms);
+    % Dstar > D is not enforced, so D and Dstar can swap in poorly determined voxels.
         modelParams     = { 'S0';  'f';    'D'; 'Dstar'; 'noise'};
-        ub              = [    2;    1;      3;     100;     0.1];
-        lb              = [    0;    0;      0;       3;   0.001];
+        ub              = [    2;    1;    2.5;      50;     0.1];
+        lb              = [    0;    0;      0;       0;   0.001];
         startPoint      = [    1;  0.1;      1;      20;    0.01];
         step            = [ 0.01; 0.02;   0.02;       1;   0.005];
 
@@ -396,7 +397,7 @@ classdef gpuIVIM < handle
             end
 
             % bound and reshape
-            lbP = this.lb(1:size(pars,1)); ubP = this.ub(1:size(pars,1));
+            lbP = fitting.lb(1:size(pars,1)); ubP = fitting.ub(1:size(pars,1));      % the fitting bounds (user or class default)
             pars = min(max(pars, lbP(:)), ubP(:));
             for km = 1:numel(this.modelParams)
                 if strcmp(this.modelParams{km}, 'noise')
