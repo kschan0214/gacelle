@@ -17,10 +17,19 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
         % R2a   : Intrinsic neurite R2 [1/s]
         % 
         modelParams     = {'f'; 'fcsf';'DeR';  'r';'r_cov';'R2e';'k2a';'R2a'};
-        ub              = [  1;      1;  1.7;    5;    0.5;   50;    4; 20];
+        ub              = [  1;      1;  1.7;    5;    1;   50;    4; 20];
         lb              = [  0;      0;    0;1e-10;   1e-4;    1;    0;  5];
-        startPoint      = [0.6;      0;    2;    1;    0.1;   30;  2.4;  8];
+        startPoint      = [0.6;      0;    2;  0.5;    0.1;   30;  2.4;  8];
 
+    end
+
+    properties
+    % ===== USER-TUNABLE OPTIONS =====
+    % Used by prepare_dwi_data's QC mask exclusion (ported from
+    % gpuMEAxCaliberSMT.m) -- freely settable by users before fitting.
+        thres_similarity    = 0.1;
+        thres_impossible    = 0.1;
+        thres_bkg           = 0.01;
     end
 
     properties (Constant)
@@ -93,6 +102,16 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
             
             % sequence parameters
             % diffusion
+            % Deduplicate raw per-direction (b,delta,Delta,te) into unique
+            % shells (keeping b=0 volumes distinct per-TE) -- ported from
+            % gpuMEAxCaliberSMT.m's constructor. Without this, this.b
+            % ends up the same length as a raw multi-direction DWI's 4th
+            % dimension, which makes prepare_dwi_data's spherical-mean-
+            % computation check (size(dwi,4) > numel(this.b)) false and
+            % SKIPS spherical mean computation entirely -- the bug this
+            % fixes.
+            [b,delta,Delta,te] = DWIutility.unique_shell_keepb0(b,delta,Delta,te,false);
+
             b           = max(b,1e-10); % make sure b is not zero
             this.b      = (single( b(:)) );
             this.delta  = (single( delta(:))) ;
@@ -108,17 +127,21 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
                     this.te = single(te(:));    % same length as b or scalar (if Nt==1)
                 end
             end
-            
+
             % user defined
             % diffusion
-            if isfield(tissueProperties,'D0');      this.D0     = (single( D0 ));       end
-            if isfield(tissueProperties,'Da');      this.Da     = (single( Da ));       end
-            if isfield(tissueProperties,'DeL');     this.DeL    = (single( DeL ));      end
-            if isfield(tissueProperties,'Dcsf');    this.Dcsf   = (single( Dcsf ));     end
+            % (bug fix: these previously referenced bare undefined
+            % variables D0/Da/DeL/Dcsf/R2csf/R2c/rho2 instead of
+            % tissueProperties.<field> -- harmless only because every
+            % caller so far has passed an empty tissueProperties struct)
+            if isfield(tissueProperties,'D0');      this.D0     = (single( tissueProperties.D0 ));       end
+            if isfield(tissueProperties,'Da');      this.Da     = (single( tissueProperties.Da ));       end
+            if isfield(tissueProperties,'DeL');     this.DeL    = (single( tissueProperties.DeL ));      end
+            if isfield(tissueProperties,'Dcsf');    this.Dcsf   = (single( tissueProperties.Dcsf ));     end
             % relaxation
-            if isfield(tissueProperties,'R2csf');   this.R2csf  = (single( R2csf ));    end
-            if isfield(tissueProperties,'R2c');     this.R2c    = (single( R2c ));      end
-            if isfield(tissueProperties,'rho2');    this.rho2   = (single( rho2 ));     end
+            if isfield(tissueProperties,'R2csf');   this.R2csf  = (single( tissueProperties.R2csf ));    end
+            if isfield(tissueProperties,'R2c');     this.R2c    = (single( tissueProperties.R2c ));      end
+            if isfield(tissueProperties,'rho2');    this.rho2   = (single( tissueProperties.rho2 ));     end
 
             if ~isempty(model); this.model  = model;                        end  
 
@@ -230,58 +253,57 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
             % display basic info
             this.display_data_model_info;
 
-            % get all fitting algorithm parameters 
+            % get all fitting algorithm parameters
             fitting = this.check_set_default(fitting);
-
-            % get matrix size
-            dims = size(dwi,1:3);
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             lmax        = 0;    % only spherical mean
-            [this,dwi]  = this.prepare_dwi_data(dwi,extraData,lmax);
-
-            % mask sure no nan or inf in data
-            [dwi,mask] = utils.remove_img_naninf(dwi,mask);
+            [dwi,mask,scaleFactor] = this.prepare_dwi_data(dwi,mask,extraData,lmax,fitting);
 
             % convert datatype to single or logical
+            % (NaN/Inf removal is now handled inside prepare_dwi_data's QC
+            % pipeline -- no separate utils.remove_img_naninf call needed)
             dwi     = single(dwi);
             mask    = mask >0;
             if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0.(this.modelParams{km}) = single(pars0.(this.modelParams{km})); end; end
 
             %%%%%%%%%%%%%%%% End Step 1 %%%%%%%%%%%%%%%%
 
-            %%%%%%%%%%%%%%%% Step 2: Validate if GPU has enough memory  %%%%%%%%%%%%%%%%
-            % determine if we need to divide the data to fit in GPU
-            gpool = gpuDevice;  reset(gpool);
-            memoryFixPerVoxel       = 0.0001;   % get this number based on mdl fit
-            memoryDynamicPerVoxel   = 0.01;     % get this number based on mdl fit
-            [NSegment,maxSlice]     = utils.find_optimal_divide(mask,memoryFixPerVoxel,memoryDynamicPerVoxel);
-            
+            %%%%%%%%%%%%%%%% Step 2: Memory management %%%%%%%%%%%%%%%%
+            % --- [Experimental] estimate memory usage using a small batch of data size ---
+            % this method tends to be more conservative than the actual memory ussage
+            [seg,NSegment] = utils.find_optimal_segment_3D(this, dwi, mask, fitting, pars0);
+
             % parameter estimation
             out = [];
-            for ks = 1:NSegment
+            for kseg = 1:NSegment
 
-                fprintf('Running #Segment = %d/%d \n',ks,NSegment);
-                disp   ('------------------------')
-    
-                if ks ~= NSegment
-                    slice = 1+(ks-1)*maxSlice : ks*maxSlice;
-                else
-                    slice = 1+(ks-1)*maxSlice : dims(3);
+                if NSegment > 1
+                    fprintf('Running #Segment = %d/%d \n',kseg,NSegment);
+                    disp   ('------------------------')
                 end
-                
-                dwi_tmp     = dwi(:,:,slice,:);
-                mask_tmp    = mask(:,:,slice);
-                if ~isempty(pars0); for km = 1:numel(this.modelParams); pars0_tmp.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice); end; else; pars0_tmp = []; end
-                
-                [out_tmp]  = this.fit(dwi_tmp,mask_tmp,fitting,pars0_tmp);
+
+                % divide the data; fitRange includes halo slices (if any), ownedRange
+                % is what this segment is responsible for writing back
+                fitRange                        = seg(kseg).fit;
+                ownedRange                      = seg(kseg).owned;
+                [dwiSeg, maskSeg, pars0Seg]     = this.slice_segment(dwi, mask, fitRange, pars0);
+
+                % run fitting
+                [outSeg] = this.fit(dwiSeg,maskSeg,fitting,pars0Seg);
+
+                % discard halo slices from this segment's output before restoring,
+                % so segment boundaries never keep voxels from a neighbour's
+                % independently-converged fit (no-op when seg(kseg).fit == .owned)
+                outSeg = utils.crop_segment_output(outSeg, seg(kseg));
 
                 % restore 'out' structure from segment
-                out = utils.restore_segment_structure(out,out_tmp,slice,ks);
+                out = utils.restore_segment_structure(out,outSeg,ownedRange,kseg);
 
             end
-            out.mask = mask;
+            out.mask        = mask;
+            out.scaleFactor = scaleFactor;   % global reference-signal scalar from prepare_dwi_data
             %%%%%%%%%%%%%%%% End Step 2 %%%%%%%%%%%%%%%%
 
             % save the estimation results if the output filename is provided
@@ -360,26 +382,57 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
             if isempty(pars0);  pars0 = this.determine_x0(dwi,mask,fitting); end
 
             % 2.3 askAdam optimisation main
-            askadamObj  = askadam(); 
-            out         = askadamObj.optimisation(dwi, mask, w, pars0, fitting, @this.FWD);
+            out         = this.run_askadam(dwi, mask, w, pars0, fitting);
 
             %%%%%%%%%%%%%%%%%%%% End 2 %%%%%%%%%%%%%%%%%%%%
 
             disp('The estimation is completed.');
-            
+
             % clear GPU
             reset(gpool)
 
         end
 
+        % Thin wrapper of askadam().optimisation -- kept as its own method
+        % (matching gpuMEAxCaliberSMT.m's run_askadam) so fit() dispatches
+        % through a named solver entry point rather than constructing
+        % askadam() inline. No lambdaR2aPrior/custom-regularisation hook
+        % here (out of scope for this class -- see gpuMEAxCaliberSMT.m's
+        % run_askadam/reg_R2aPrior if that's ever needed), and no 'solver'
+        % argument passed to FWD (this class's FWD has no mcmc-specific
+        % arrayfun branch, unlike gpuMEAxCaliberSMT.m's).
+        function out = run_askadam(this, data, mask, w, pars0, fitting)
+            out = askadam().optimisation(data, mask, w, pars0, fitting, @this.FWD);
+        end
+
+        function [dataSeg, maskSeg, pars0Seg] = slice_segment(this, data, mask, slice, pars0)
+
+            dataSeg     = data(:,:,slice,:,:,:,:,:,:);
+            maskSeg     = mask(:,:,slice);
+            if ~isempty(pars0)
+                for km = 1:numel(this.modelParams)
+                    pars0Seg.(this.modelParams{km}) = pars0.(this.modelParams{km})(:,:,slice);
+                end
+            else
+                pars0Seg = [];
+            end
+
+        end
+
         %% Data preparation
 
-        % compute rotationally invariant DWI signal if necessary
-        % TODO
-        function [this,dwi] = prepare_dwi_data(this,dwi,extradata,lmax)
-            
+        % compute rotationally invariant DWI signal if necessary, then
+        % run the QC/scale-normalisation pipeline (ported from
+        % gpuMEAxCaliberSMT.m's prepare_dwi_data) -- global-scalar
+        % reference-signal normalisation (scaleFactor), then exclusion of
+        % biophysically-impossible/background/incoherent/NaN-Inf voxels
+        % from mask. isFitS0 is NOT supported by this class (out of
+        % scope) -- always treated as false, i.e. the per-voxel
+        % dwi./dwi(:,:,:,1) normalisation always runs.
+        function [dwi,mask,scaleFactor] = prepare_dwi_data(this,dwi,mask,extradata,lmax,fitting)
+
             % full DWI data then compute rotaionally invariant signal
-            if size(dwi,4)/(lmax/2+1) > numel(this.b) 
+            if size(dwi,4)/(lmax/2+1) > numel(this.b)
                 % compute spherical mean signal
                 fprintf('Computing rotationally invariant signal...')
 
@@ -401,9 +454,13 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
                 error('There are more b-shells in the class object than available in the input data. Please check your input data.');
             end
 
-            % sort the order of the signal based on TE, Delta, delta and b, then normalise the signal by the smallest b-value and shortest TE
+            % sort the order of the signal based on TE, Delta, delta and b
+            % (this class -- unlike gpuMEAxCaliberSMT.m -- does this sort
+            % here rather than once in the constructor, so this.b/te/
+            % Delta/delta and dwi's 4th dimension stay in the same order
+            % expected by the rest of this method and by FWD)
             acqTable = [this.b, this.te, this.Delta, this.delta, (1:numel(this.te)).'];
-            
+
             % Sort rows first by TE, Delta, delta and finally b
             sorted_data = sortrows(acqTable, [2,3,4,1]);
             idx         = uint16(sorted_data(:,end));
@@ -412,12 +469,110 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
             this.b      = this.b(idx);
             this.te     = this.te(idx);
             this.Delta  = this.Delta(idx);
-            this.Delta  = this.Delta(idx);
+            this.delta  = this.delta(idx);   % bug fix: was previously reassigning this.Delta twice, leaving this.delta unsorted
             dwi         = dwi(:,:,:,idx);
 
-            % normalised by the first volume
+            % --- Step 0: global-scalar reference-signal normalisation ---
+            % Bring the WHOLE dataset onto an O(1) reference-signal scale
+            % via ONE scalar for the entire dataset (as opposed to the
+            % PER-VOXEL normalisation below, which the forward model's own
+            % unit convention requires and which this step does NOT
+            % replace). Unlike per-voxel normalisation, a single global
+            % scalar preserves relative brightness BETWEEN voxels, which
+            % the background-voxel check below needs -- checking a
+            % per-voxel-normalised b=0 value (identically 1 by
+            % construction) can never detect a near-zero-signal voxel.
+            %
+            % Single-echo (or several b=0 shells at the same TE): the
+            % reference is just the (mean, if >1) b=0 signal itself.
+            % Multi-echo: the b=0 shells are ALREADY T2/T2*-decayed by
+            % their own TE, so the reference is instead the b=0 signal
+            % EXTRAPOLATED back to TE=0 via a per-voxel log-linear fit
+            % across the b=0 shells' TEs (see local_S0_TE0_lsq).
+            Nshells    = numel(this.b);
+            dwi_Sl0_g  = dwi(:,:,:,1:Nshells);   % Sl0 block, pre-per-voxel-normalisation
+            b0idx      = find(this.b(1:Nshells) < 1e-6);
+            if isempty(b0idx)
+                error('GACELLE:noB0shell', 'No b=0 shell found in this.b; cannot compute a reference signal.');
+            end
+            te0 = this.te(b0idx);
+
+            if numel(unique(te0)) <= 1
+                % single-echo (or several b=0 replicates at one TE)
+                S0map = mean(dwi_Sl0_g(:,:,:,b0idx), 4);
+            else
+                % multi-echo: extrapolate to TE=0
+                [~,S0map] = this.local_S0_TE0_lsq(dwi_Sl0_g(:,:,:,b0idx), te0, mask);
+            end
+
+            scaleFactor = median(S0map(mask>0), 'omitmissing');
+            if ~isfinite(scaleFactor) || scaleFactor <= 0
+                error('GACELLE:badScaleFactor', ...
+                    'Computed global reference signal is non-positive/non-finite (%.4g) -- check input data/mask.', scaleFactor);
+            end
+            dwi = dwi ./ scaleFactor;
+
+            % background check uses the GLOBALLY- (not yet per-voxel-)
+            % normalised b=0 signal, captured before it is corrupted to
+            % an unconditional 1 by the per-voxel step below
+            dwi_Sl0_bg = dwi(:,:,:,1:Nshells);
+
+            % normalised by the first volume (isFitS0 not supported by
+            % this class -- always runs)
             dwi = dwi ./ dwi(:,:,:,1);
-            
+
+            % --- Step 2: exclude biophysically impossible signal ---
+            dwi_Sl0         = dwi(:,:,:,1:Nshells);          % Sl0 block
+            dwi_Sl0_rn      = dwi_Sl0 ./ dwi_Sl0(:,:,:,1);   % per-voxel-normalised
+            mask_impossible = any(abs(dwi_Sl0_rn) > 1 + this.thres_impossible, 4);
+            mask_valid      = ~mask_impossible;
+
+            % --- Step 3: exclude near-zero signal (background voxels) ---
+            mask_background = dwi_Sl0_bg(:,:,:,1) < this.thres_bkg;  % first shell = lowest b
+            mask_valid      = mask_valid & ~mask_background;
+
+            % --- Step 4: exclude incoherent signal (random noise pattern) ---
+            dwi_2D         = utils.reshape_ND2GD(dwi_Sl0_rn, mask_valid);
+            if size(dwi_2D, 2) > 0
+                signalTemplate = median(dwi_2D, 2,'omitmissing');           % median across voxels
+                signalTemplate = (signalTemplate - mean(signalTemplate,'omitmissing')) ./ ...
+                                  std(signalTemplate,'omitmissing');
+
+                Rcorr = zeros(1, size(dwi_2D,2));
+                for k = 1:size(dwi_2D,2)
+                    signalVoxel = dwi_2D(:,k);
+                    denom       = std(signalVoxel);
+                    if denom < eps
+                        Rcorr(k) = 0;   % flat signal -> zero correlation
+                    else
+                        signalVoxel = (signalVoxel - mean(signalVoxel)) ./ denom;
+                        Rcorr(k)    = corr(signalTemplate, signalVoxel);
+                    end
+                end
+
+                Rcorr           = utils.reshape_GD2ND(Rcorr, mask_valid);
+                mask_incoherent = Rcorr < this.thres_similarity;
+                mask_valid      = mask_valid & ~mask_incoherent;
+            end
+
+            % --- Step 5: remove NaN/Inf ---
+            [dwi,mask_naninf] = utils.remove_img_naninf(dwi,mask);
+            mask_naninf        = max(mask_naninf, [], 4);
+            mask_valid         = mask_valid & mask_naninf;
+
+            % --- Report and update mask ---
+            Nexcluded = sum(mask(:)) - sum(mask_valid(:));
+            if Nexcluded > 0
+                fprintf('Signal mask updated: %d voxels excluded (%.1f%% of original mask).\n', ...
+                    Nexcluded, 100*Nexcluded/sum(mask(:)));
+                fprintf('  NaN/Inf        : %d\n', sum(mask_naninf(:) & mask(:)));
+                fprintf('  Impossible     : %d\n', sum(mask_impossible(:) & mask(:)));
+                fprintf('  Background     : %d\n', sum(mask_background(:) & mask(:)));
+                fprintf('  Incoherent     : %d\n', sum(mask_incoherent(:) & mask(:)));
+                disp('Please use the updated mask in subsequent analysis.');
+                mask = mask_valid;
+            end
+
         end
 
         % compute weights for optimisation
@@ -474,6 +629,40 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
                         if any(ismember(this.modelParams,'k2a')); x0.k2a = this.rho2;   end
 
                 end
+            elseif isstruct(fitting.start)
+                % PER-PARAMETER, OPTIONALLY PER-VOXEL user-defined
+                % starting point, addressed by NAME: fitting.start.(name)
+                % (e.g. fitting.start = struct('r', r0), an MDN-seeded
+                % start) -- ported from gpuMEAxCaliberSMT.m's
+                % determine_x0. May be a scalar (broadcast to every
+                % voxel) or a full array matching mask's spatial size.
+                % Any model parameter NOT named here falls back to this
+                % model's own DEFAULT starting value.
+                x0 = utils.initialise_x0(dims,this.modelParams,this.startPoint);
+                userFields = fieldnames(fitting.start);
+                appliedFields = {};
+                for kf = 1:numel(userFields)
+                    pname = userFields{kf};
+                    if ~any(strcmp(this.modelParams,pname))
+                        continue   % not an active parameter for this call -- ignore rather than error
+                    end
+                    v = fitting.start.(pname);
+                    if isscalar(v)
+                        x0.(pname) = ones(dims,'single') * v;
+                    else
+                        if ~isequal(size(v,1:3),dims)
+                            error('fitting.start.%s must be scalar or match mask''s spatial size [%s]; got [%s].', ...
+                                pname, num2str(dims), num2str(size(v,1:3)));
+                        end
+                        x0.(pname) = single(v);
+                    end
+                    appliedFields{end+1} = pname; %#ok<AGROW>
+                end
+                fprintf('Using default starting points for [%s], with per-parameter overrides for [%s]\n', ...
+                    cell2str(this.modelParams), cell2str(appliedFields));
+                % R2a and k2a are global constants
+                if any(ismember(this.modelParams,'R2a')); x0.R2a = this.R2c;    end
+                if any(ismember(this.modelParams,'k2a')); x0.k2a = this.rho2;   end
             else
                 % user defined starting point
                 x0 = fitting.start(:);
@@ -723,6 +912,50 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
 
         %% Utility
 
+        % Voxelwise closed-form mono-exponential decay fit, used ONLY to
+        % extrapolate the b=0 signal back to TE=0 for prepare_dwi_data's
+        % global-scalar reference-signal step. Ported verbatim from
+        % gpuMEAxCaliberSMT.m's local_S0_TE0_lsq (self-contained, no
+        % cross-class dependency).
+        %
+        % Input
+        % -----------
+        % img       : 4D multi-echo magnitude image, [x,y,z,te]
+        % te        : 1D echo times, same length as img's 4th dimension
+        % mask      : 3D signal mask, [x,y,z]
+        %
+        % Output
+        % -----------
+        % r2        : 3D R2 map [1/te's time unit], masked
+        % m0        : 3D extrapolated S0 (signal at te=0) map, masked
+        function [r2,m0] = local_S0_TE0_lsq(img,te,mask)
+
+            img = double(img);
+            te  = double(te);
+
+            % set range of R2 and T2
+            minT2s      = min(te)/20;
+            maxT2s      = max(te)*20;
+            ranger2     = [1/maxT2s, 1/minT2s];
+
+            [nx,ny,nz,nt] = size(img);
+
+            x       = ones(nt,2);
+            x(:,2)  = -te(:);
+            y       = permute(log(abs(img)),[4 1 2 3]);
+
+            y       = reshape(y,[size(y,1) numel(y)/size(y,1)]);
+            b       = x\y;
+            r2      = reshape( b(2,:),nx,ny,nz) .* mask;
+            m0      = exp(reshape( b(1,:),nx,ny,nz)) .* mask;
+
+            r2(r2>max(ranger2)) = max(ranger2);
+            r2(r2<min(ranger2)) = min(ranger2);
+
+            m0(m0<0) = 0;
+
+        end
+
         function [k,theta] = gamma_mean_cov_to_shape_scale(mu,cov)
             % k: shape
             % theta: scale
@@ -744,7 +977,17 @@ classdef gpuMEAxCaliberSMT_gammaDist < handle
                     C = gpuMEAxCaliberSMT_gammaDist.widepulse_r(g, delta, Delta, reff_diff, D0);    % less memory efficient but faster
             end
 
-            S = sqrt(pi./(4*(b.*Da - C))) .* exp(-C) .* erf(sqrt(b.*Da - C)) .* exp(-te.*( R2a + k2a./reff_T2));
+            % clamp b.*Da - C away from <=0 -- the gamma-distribution's
+            % effective diffusion radius (reff_diff) can grow larger than
+            % any single-point r ever could (see gamma_mean_cov_to_shape_
+            % scale's (k+2)(k+3)(k+4)(k+5) inflation factor), pushing C
+            % past b.*Da during askadam's gradient descent and hitting a
+            % GPU sqrt-of-negative-real domain error. exp(-C) itself needs
+            % no clamp (just decays toward 0). Same defensive idiom
+            % diffusion_relaxation_SMT_zeppelin below already uses for
+            % dDe.
+            bDaC = max(b.*Da - C, gpuMEAxCaliberSMT_gammaDist.epsilon);
+            S = sqrt(pi./(4*bDaC)) .* exp(-C) .* erf(sqrt(bDaC)) .* exp(-te.*( R2a + k2a./reff_T2));
 
         end
 
