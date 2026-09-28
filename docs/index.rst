@@ -60,6 +60,7 @@ Table of Contents
    supported_models/SANDI
    supported_models/NEXI
    supported_models/mcmicro
+   supported_models/IVIM
    supported_models/GREMWI
    supported_models/MCRMWI
    supported_models/JointR1R2star

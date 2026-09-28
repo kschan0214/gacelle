@@ -1,6 +1,6 @@
 classdef McmcClassHookTest < matlab.unittest.TestCase
     % Tier-2 (GPU) tests of the fitting.mcmcClass hook in the model wrappers not covered by
-    % McmcBayesLegacyTest (NEXI, JointR1R2starMapping, GREMWI, mcmicro; gpuMCRMWI does not
+    % McmcBayesLegacyTest (NEXI, JointR1R2starMapping, GREMWI, mcmicro, IVIM; gpuMCRMWI does not
     % support mcmc):
     %   - with mcmcClass = 'mcmc_bayes' and no new option, estimate() is bitwise identical to
     %     the default hook ('mcmc');
@@ -12,7 +12,7 @@ classdef McmcClassHookTest < matlab.unittest.TestCase
     % Kwok-Shing Chan @ MGH
 
     properties (TestParameter)
-        model = {'NEXI','JointR1R2starMapping','GREMWI','mcmicro'}
+        model = {'NEXI','JointR1R2starMapping','GREMWI','mcmicro','IVIM'}
     end
 
     methods (TestClassSetup)
@@ -71,7 +71,7 @@ classdef McmcClassHookTest < matlab.unittest.TestCase
                 case 'NEXI';                    p = {'fa'};
                 case 'JointR1R2starMapping';    p = {'R2star'};
                 case 'GREMWI';                  p = {'MWF'};
-                case 'mcmicro';                 p = {'f'};
+                case {'mcmicro','IVIM'};        p = {'f'};
             end
         end
 
@@ -129,6 +129,10 @@ classdef McmcClassHookTest < matlab.unittest.TestCase
                     y = s + (pars.S0.')/150 .* randn(size(s));
                     y = y(:,:,:,:,1) + 1i * y(:,:,:,:,2);
                     f.start = 'prior';
+
+                case 'IVIM'
+                    [y, ~, bval] = SmokeFit_IVIMTest.data();
+                    obj = @() gpuIVIM(bval);
 
                 case 'mcmicro'
                     Nsample = 8; bval = [0, 0.5, 1, 2];
