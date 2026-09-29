@@ -92,3 +92,13 @@ Example script for in vivo data:
 
 .. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMT_invivoData.m
     :language: matlab
+
+Bayesian priors (experimental)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With ``fitting.solver = 'mcmc'`` and ``fitting.mcmcClass = 'mcmc_bayes'``, ``gpuAxCaliberSMT`` can be fitted with a hierarchical (population) prior and a spatial prior. The coupled priors need the whole volume in one GPU call. See :ref:`mcmc-bayes`.
+
+Example script for in vivo data with the hierarchical prior (BSP) and the hierarchical + spatial prior:
+
+.. literalinclude:: ../../AxCaliberSMT/demo_gpuAxCaliberSMT_invivo_bayes.m
+    :language: matlab

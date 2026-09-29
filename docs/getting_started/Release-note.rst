@@ -3,6 +3,30 @@
 Release note
 ============
 
+Development version (dev1.2, unreleased)
+----------------------------------------
+
+Bayesian priors for MCMC (experimental)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+* New experimental subclass ``mcmc_bayes`` (``utils/mcmc_bayes.m``) with marginal likelihoods (noise, and optionally the signal amplitude, integrated out), a hierarchical population prior ("BSP", with an optional ``K``-group mixture) and a spatial MRF prior fitted by two-stage empirical Bayes, after Spinner et al. 2021. See :ref:`mcmc-bayes`, :ref:`tutorial-mcmc_bayes_tutorial` and :ref:`api-mcmc_bayes-optimisation`.
+* Every model class with MCMC support accepts ``fitting.mcmcClass = 'mcmc_bayes'`` (default ``'mcmc'``, unchanged behaviour). Priors that couple voxels need the whole volume in one GPU call; ``estimate()`` stops with ``<Class>:singleSegment`` otherwise.
+* New in vivo demos ``demo_<class>_invivo_bayes.m`` for R2star, JointR1R2star, GREMWI, AxCaliberSMT, NEXI, SANDI and mcmicro.
+
+MCMC solver
+^^^^^^^^^^^
+* New opt-in options of the Metropolis-Hastings sampler: ``parameterTransform``, ``updateScheme``, ``adaptStepSize``, ``adaptCovariance`` (adaptive Metropolis) and ``overdisp``, with R-hat and ESS in ``out.diagnostics``. All off by default (output unchanged). See :ref:`mcmc-sampler-options`.
+* The affine-invariant ensemble sampler supports ``parameterTransform``. ``'ensemble'`` is the algorithm name; ``'GW'`` remains accepted as a legacy label, also in the forward models of R2star, JointR1R2star and GREMWI.
+* ``mcmc`` checks that the forward model returns ``[Nmeas, Nvoxel]`` (error ``mcmc:forwardSize``).
+
+New model
+^^^^^^^^^
+* ``gpuIVIM``: bi-exponential intravoxel incoherent motion model (:ref:`supportedmodels-ivim`).
+
+Fixes
+^^^^^
+* ``gpuAxCaliberSMT``, ``gpuNEXI``: default MCMC noise lower bound lowered from 0.01 to 0.001 (the old bound could bind at high SNR and widen the posterior).
+* ``gpumcTFI``: ``fitting.start`` now defaults to ``'prior'``, and ``extraData.fint`` is optional as documented.
+
 v1.1
 ----
 
