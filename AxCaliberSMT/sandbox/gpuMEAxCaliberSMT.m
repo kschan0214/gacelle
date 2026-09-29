@@ -311,11 +311,12 @@ classdef gpuMEAxCaliberSMT < handle
 
             % get all fitting algorithm parameters 
             fitting     = this.check_set_default(fitting);
+            [extraData, noiseMap] = mcmc_bayes.take_noise_map(extraData);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             lmax        = 0;    % only spherical mean
-            [data,mask,scaleFactor] = this.prepare_dwi_data(data,mask,extraData,lmax,fitting);
+            [data,mask,scaleFactor,normMap] = this.prepare_dwi_data(data,mask,extraData,lmax,fitting);
 
             % convert datatype to single or logical
             data    = single(data);
@@ -328,6 +329,7 @@ classdef gpuMEAxCaliberSMT < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
+            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, normMap);   % -> fitting.ricianSigma, fitted-data units
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -352,7 +354,7 @@ classdef gpuMEAxCaliberSMT < handle
                 [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, fitRange, pars0);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)),pars0Seg);
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's
@@ -700,7 +702,9 @@ classdef gpuMEAxCaliberSMT < handle
 
         % compute rotationally invariant DWI signal if necessary
         % TODO
-        function [dwi,mask,scaleFactor] = prepare_dwi_data(this,dwi,mask,extradata,lmax,fitting)
+        function [dwi,mask,scaleFactor,normMap] = prepare_dwi_data(this,dwi,mask,extradata,lmax,fitting)
+        % normMap : total per-voxel factor the data were divided by (scaleFactor, times the first Sl0 volume
+        %           unless isFitS0); used to put extraData.noiseSigma in the same units
 
             if nargin < 6 || isempty(fitting) || ~isfield(fitting,'isFitS0')
                 isFitS0 = false;   % preserve prior behaviour for any caller that doesn't pass fitting
@@ -774,6 +778,7 @@ classdef gpuMEAxCaliberSMT < handle
                     'Computed global reference signal is non-positive/non-finite (%.4g) -- check input data/mask.', scaleFactor);
             end
             dwi = dwi ./ scaleFactor;
+            normMap = scaleFactor;
 
             % background check uses the GLOBALLY- (not yet per-voxel-)
             % normalised b=0 signal, captured before it is corrupted to
@@ -788,6 +793,7 @@ classdef gpuMEAxCaliberSMT < handle
             % per-voxel-normalised copy (dwi_Sl0_rn) regardless of
             % isFitS0, so they stay meaningful either way.
             if ~isFitS0
+                normMap = normMap .* dwi(:,:,:,1);
                 dwi = dwi ./ dwi(:,:,:,1);
             end
 

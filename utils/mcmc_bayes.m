@@ -18,9 +18,23 @@ classdef mcmc_bayes < mcmc
 %
 % New fitting options (legacy defaults)
 %   .parameterTransform : 'linear'      'linear'|'sigmoid'|'log', or a cell with one entry per modelParams
-%   .likelihood         : 'gaussian'    'gaussian'|'marginal_noise'|'marginal_S0noise'|'marginal_S0noise_flat'
+%   .likelihood         : 'gaussian'    'gaussian'|'marginal_noise'|'marginal_S0noise'|'marginal_S0noise_flat'|
+%                                       'rician'|'gaussian_ricianmean' (Phase 9a, see "Rician noise models")
 %   .S0Param            : ''            name of the amplitude parameter in modelParams, required by
 %                                       (and only allowed with) 'marginal_S0noise(_flat)'
+%   .ricianNav          : []            'gaussian_ricianmean' only: # magnitude measurements averaged into each
+%                                       measurement, scalar or one entry per measurement (> 0), [] -> 1; the
+%                                       noise of one magnitude measurement is sigma_s,i = sigma*sqrt(ricianNav_i/w_i)
+%   .ricianSigma        : []            'rician' | 'gaussian_ricianmean': noise sigma of ONE magnitude measurement,
+%                                       a scalar > 0 or a per-voxel map (spatial size of the mask, or [1,Nv] after
+%                                       masking; positive and finite inside the mask), in the units of the data
+%                                       passed to mcmc_bayes. 'rician': sigma is FIXED (not sampled, 'noise' leaves
+%                                       the sampled set and out.posterior.noise = ricianSigma). 'gaussian_ricianmean':
+%                                       fixes sigma_s inside the Rician mean (sigma still sampled); not with ricianNav.
+%                                       A map must match the mask passed to mcmc_bayes, else error
+%                                       mcmc_bayes:ricianSigma. Model classes take a map from extraData.noiseSigma
+%                                       (take_noise_map, noise_map_to_fitting: rescaled like the data) and slice it
+%                                       per GPU segment (slice_noise_map)
 %   .updateScheme       : 'joint'       'joint'|'componentwise'
 %   .adaptStepSize      : false         adapt proposal scale during burn-in (frozen afterwards)
 %   .adaptInterval      : 50            # iterations between two adaptation steps
@@ -489,6 +503,68 @@ classdef mcmc_bayes < mcmc
 %       V = sum_k pi_k (Sigma_k + mu_k mu_k') - mubar mubar',  mubar = sum_k pi_k mu_k,
 %   and the Huber threshold is delta_p = huberDelta * sqrt(V_pp) (K = 1: V = Sigma, as before).
 %
+% Phase 9a (Rician noise models, fitting.likelihood = 'rician' | 'gaussian_ricianmean')
+% ------------------------------------------------------------------------------------
+% Both sample the noise sigma (as 'gaussian'; 'noise' must be in modelParams, S0Param is not allowed)
+%   and keep it outside the hierarchical prior. There are no marginal forms (sigma enters
+%   non-linearly). Per measurement i (per voxel): y_i the data, nu_i the FWDfunc output, w_i the
+%   fitting weight, sigma_i^2 = sigma^2/w_i. A measurement with w_i = 0 is dropped, so
+%   m = # measurements with NON-ZERO weight (as the marginal likelihoods). Only the likelihood
+%   term changes: transforms, update schemes, adaptation, hierarchical (K >= 1), MRF, two-stage
+%   and subsetForward work unchanged.
+%
+% 'rician': exact Rician density of one magnitude measurement (y_i >= 0) with amplitude nu_i:
+%       p(y_i) = (y_i/sigma_i^2) exp(-(y_i^2 + nu_i^2)/(2 sigma_i^2)) I0(y_i nu_i/sigma_i^2)
+%   With a_i = w_i/sigma^2, z_i = a_i y_i |nu_i| and I0e(z) = e^(-z) I0(z), the identity
+%   y^2 + nu^2 = (y - |nu|)^2 + 2 y |nu| gives the form evaluated (no overflow, no cancellation
+%   of large terms in single precision):
+%       log L = sum_{i: w_i ~= 0} [ -log(sigma^2) - a_i (y_i - |nu_i|)^2 / 2 + log I0e(z_i) ]
+%   (the constants log y_i + log w_i are dropped). For large SNR, log I0e(z) = -log(2 pi z)/2 + O(1/z),
+%   so each term tends to the Gaussian log-density log N(y_i; |nu_i|, sigma_i^2) + log(y_i/|nu_i|)/2
+%   (up to the dropped constants), and y_i/|nu_i| -> 1.
+%   Negative nu: the density depends on nu only through I0(y nu/sigma^2) and nu^2, both even in nu
+%   (nu is the amplitude of a complex signal), so |nu| is used: no rejection. y_i = 0 is allowed
+%   (log I0e(0) = 0). Negative data (non-zero weight) are an error (mcmc_bayes:ricianNegativeData):
+%   the Rician density is zero there; take the magnitude first. Intended for single (unaveraged)
+%   magnitude measurements.
+%   Known noise (fitting.ricianSigma, scalar or per-voxel map): sigma is FIXED at ricianSigma
+%   (sigma_i^2 = ricianSigma_v^2 / w_i); 'noise' is removed from the sampled set (as a marginalised
+%   parameter) and restored in the output as the constant ricianSigma_v in every sample (so its
+%   ESS/R-hat are not meaningful). At low SNR a sampled sigma trades off against the signal decay
+%   into the noise floor (broad, biased posteriors); a known noise map removes that degeneracy.
+%
+% 'gaussian_ricianmean': Gaussian likelihood around the Rician expectation of a magnitude:
+%       y_i ~ N(E_i, sigma_i^2),   E_i = sigma_s,i sqrt(pi/2) L_{1/2}(-nu_i^2 / (2 sigma_s,i^2))
+%       log L = -(m/2) log(sigma^2) - sum_i w_i (y_i - E_i)^2 / (2 sigma^2)
+%   where sigma_s,i is the noise of ONE unaveraged magnitude measurement, by default
+%   sigma_s,i = sigma_i sqrt(ricianNav_i) = sigma sqrt(ricianNav_i / w_i) (ricianNav_i = # magnitude
+%   measurements averaged into measurement i; the average of N of them has SD ~ sigma_s/sqrt(N)), or
+%   the fixed fitting.ricianSigma (scalar or per-voxel map; sigma itself is still sampled). With t = nu^2/(4 sigma_s^2) >= 0 and x = -2t:
+%       L_{1/2}(x) = e^(x/2) [(1-x) I0(-x/2) - x I1(-x/2)] = (1 + 2t) I0e(t) + 2t I1e(t)
+%   (exponentially scaled Bessel functions, no overflow). Limits: t -> 0: E -> sigma_s sqrt(pi/2);
+%   t -> Inf: E = |nu| (1 + 1/(8t) + O(t^-2)) = |nu| + sigma_s^2/(2|nu|) + ..., which is used for
+%   t >= 1e4 (relative error < 1e-8; also covers sigma_s -> 0). sigma_s = 0 gives E = |nu|.
+%   Intended for averaged or combined magnitude data (e.g. spherical means over N directions:
+%   ricianNav = N). A direction average of Rician magnitudes is not Rician: by the CLT it is close
+%   to Gaussian, with the Rician-biased mean and a spread ~ sigma_s/sqrt(N). Note: for a spherical
+%   mean the exact expectation is the average of E over directions; E of the averaged model signal
+%   is an approximation (exact when nu is the same in all directions).
+%
+% Kernels (GPU arrayfun, single or double): I0e and I1e from Abramowitz & Stegun 9.8.1-9.8.4
+%   (|error| < 2.2e-7 of the scaled function), log I0e(z) = log1p(poly - 1) - z for z < 3.75 and
+%   log(poly(3.75/z)) - log(z)/2 above; static wrappers bessel_i0e, bessel_i1e, bessel_logi0e and
+%   rician_mean for tests and validation.
+%
+% Output: out.settings.likelihood, and out.settings.rician (these two likelihoods only) with the
+%   log-likelihood form, the resolved ricianNav (per measurement) or ricianSigma (scalar or [1,Nv],
+%   masked) and the rules above.
+% Maps: a ricianSigma map is masked like the data ([1,Nv]), subset per colour (subsetForward) and per
+%   voxel subset (estimate_hyper_subset). It must match the mask that mcmc_bayes receives (else error
+%   mcmc_bayes:ricianSigma). Model classes: extraData.noiseSigma (map or scalar) is removed from extraData
+%   (take_noise_map, so no FWD sees it), divided by the class's data scaling and set to 1 outside the mask
+%   (noise_map_to_fitting; only the GPU memory probe reaches those voxels), put in fitting.ricianSigma, and
+%   sliced with the data per GPU segment (slice_noise_map). Without extraData.noiseSigma nothing changes.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
@@ -499,6 +575,7 @@ classdef mcmc_bayes < mcmc
 % Date modified: 27 September 2026 (Phase 7: Gaussian-mixture hierarchical prior, K > 1)
 % Date modified: 28 September 2026 (Phase 8: transforms, adaptation, adaptive covariance, R-hat/ESS and the forward-size
 %                                   check moved to mcmc as opt-in options/static helpers; location-shift move removed)
+% Date modified: 29 September 2026 (Phase 9a: 'rician' and 'gaussian_ricianmean' likelihoods, ricianNav/ricianSigma)
 %
 
     methods
@@ -555,6 +632,10 @@ classdef mcmc_bayes < mcmc
             mask_idx = find(mask>0);
             geom     = struct('mask_idx', mask_idx, 'dims', size(mask));
             if ~ismatrix(data);     data    = utils.reshape_ND2GD(data,      mask_idx); else; data = data(:,mask_idx);     end
+            % Rician likelihoods: a per-voxel ricianSigma map is masked like the data, [1,Nv]
+            if isfield(fitting,'ricianSigma') && ~isscalar(fitting.ricianSigma) && ~isempty(fitting.ricianSigma)
+                fitting.ricianSigma = this.mask_rician_sigma(fitting.ricianSigma, mask, mask_idx);
+            end
             if ~ismatrix(weights);  weights = utils.reshape_ND2GD(weights,   mask_idx); elseif ~isempty(weights); weights = weights(:,mask_idx);  end
             pars0 = utils.reshape_ND2GD_struct(pars0,mask);
 
@@ -624,6 +705,12 @@ classdef mcmc_bayes < mcmc
             f1 = fitting;
             h.fixed = false; h.subsetFraction = 1;
             f1.prior.hierarchical = h;
+            % a per-voxel ricianSigma map follows the voxel subset
+            if isfield(f1,'ricianSigma') && ~isscalar(f1.ricianSigma) && ~isempty(f1.ricianSigma)
+                rs = this.mask_rician_sigma(f1.ricianSigma, mask, mask_idx);     % [1,N], mask order
+                [~, pos] = ismember(idxSub, mask_idx);
+                f1.ricianSigma = reshape(rs(pos), k, 1);
+            end
             outSub = this.optimisation(data, maskSub, weights, pars0, f1, FWDfunc, varargin{:});
 
             muHat    = outSub.hyper.mean.mu;
@@ -770,6 +857,9 @@ classdef mcmc_bayes < mcmc
             % likelihoods, test-only fixedParams removed)
             [fitting, lik]  = this.setup_likelihood(fitting);
             isMarginal      = lik.isMarginal;
+            % Rician likelihoods (Phase 9a): option sizes and data checked before any GPU work
+            isRician        = lik.isRician;
+            if isRician; this.check_rician_data(y, weights, lik); end
             % hierarchical prior on the sampled parameters
             hier            = this.setup_hierarchical(fitting);
             isHier          = hier.on;
@@ -792,8 +882,8 @@ classdef mcmc_bayes < mcmc
             % Ns: # samples in posterior distribution
             Ns          = numel(Nburnin+1:fitting.thinning:fitting.iteration);
 
-            % marginal likelihoods: m = # measurements with non-zero weight, per voxel
-            if isMarginal
+            % marginal and Rician likelihoods: m = # measurements with non-zero weight, per voxel
+            if isMarginal || isRician
                 mNZ = sum(double(gather(weights)) ~= 0, 1);
                 if min(mNZ) < 1 + lik.shapeOffset
                     error('mcmc_bayes:tooFewMeasurements', ...
@@ -927,6 +1017,12 @@ classdef mcmc_bayes < mcmc
                                 y, weights, lik.name, rssFloor, mArg);
                 Nstat       = lik.Nstat;
                 statsPost   = zeros(Nstat, Nv, Ns, fitting.repetition, 'single');
+            elseif isRician
+                % Phase 9a: sampled noise, m = # non-zero weights, ricianNav [Nm,1] or scalar (per measurement)
+                ric         = this.rician_setup(lik, Nm, Nv);
+                if isscalar(mNZ); mArg = mNZ; else; mArg = gpuArray(single(mNZ)); end
+                loglik      = @(x) mcmc_bayes.loglik_rician(mcmc_bayes.inject_values(this.array2struct(x,fitting.modelParams), userFixed), ...
+                                y, weights, ric, mArg, FWDfunc, varargin{:});
             elseif hasUserFixed
                 loglik      = @(x) mcmc_bayes.loglik_gaussian(mcmc_bayes.inject_values(this.array2struct(x,fitting.modelParams), userFixed), y, weights, Nm, FWDfunc, varargin{:});
             else
@@ -1040,6 +1136,13 @@ classdef mcmc_bayes < mcmc
                             if isscalar(mArg); mA = mArg; else; mA = mArg(act); end
                             loglikC{kc} = @(x) mcmc_bayes.loglik_marginal(FWDfunc(mkPars(x, fvA, ufA), varargin{:}), ...
                                                 yA, wA, lik.name, rfA, mA);
+                        elseif isRician
+                            % ricianNav is per measurement (no copy); a per-voxel ricianSigma map is copied per colour
+                            if isscalar(mArg); mA = mArg; else; mA = mArg(act); end
+                            ricA = ric;
+                            if ~isscalar(ric.sFix2); ricA.sFix2 = ric.sFix2(act); end
+                            loglikC{kc} = @(x) mcmc_bayes.loglik_rician(mcmc_bayes.inject_values(this.array2struct(x,fitting.modelParams), ufA), ...
+                                                yA, wA, ricA, mA, FWDfunc, varargin{:});
                         elseif hasUserFixed
                             loglikC{kc} = @(x) mcmc_bayes.loglik_gaussian(mcmc_bayes.inject_values(this.array2struct(x,fitting.modelParams), ufA), ...
                                                 yA, wA, Nm, FWDfunc, varargin{:});
@@ -1048,7 +1151,7 @@ classdef mcmc_bayes < mcmc
                         end
                         parsC{kc} = mkPars(xStart(:, act), fvA, ufA);
                     end
-                    clear yA wA fvA ufA rfA mA
+                    clear yA wA fvA ufA rfA mA ricA
                     % safety check at the starting state: subset columns == columns of the full evaluation
                     sfInfo = this.check_subset_forward(FWDfunc, varargin, mkPars(xStart, ones(1, Nv, 'like', y), userFixed), ...
                                                        parsC, mrfActH, Nv, sfTol);
@@ -1526,6 +1629,11 @@ classdef mcmc_bayes < mcmc
             xPosterior = this.array2struct(xPosterior,fitting.modelParams);
             for kvar = 1:Nvar; xPosterior.(fitting.modelParams{kvar}) = shiftdim(xPosterior.(fitting.modelParams{kvar}),1); end
 
+            % fixed-noise 'rician': 'noise' = ricianSigma in every sample, full output order
+            if isRician && lik.fixedNoise
+                xPosterior = this.fixed_noise_posterior(xPosterior, lik, ric.sigma, Nv, Ns, fitting.repetition);
+            end
+
             % nuisance recovery: exact conditional draws of sigma (and S0) for every retained sample,
             % from the cached statistics (no extra forward evaluation); output in full modelParams order
             if isMarginal
@@ -1621,6 +1729,16 @@ classdef mcmc_bayes < mcmc
                 'rngState',             rngState, ...
                 'gpuRngState',          gpuRngState, ...
                 'geom',                 geom);
+            % Rician likelihoods (Phase 9a) only, so that the settings of the other likelihoods are unchanged
+            if isRician
+                diagnostics.settings.rician = lik.rician;
+                if strcmp(lik.name, 'gaussian_ricianmean') && isempty(lik.ricianSigma)
+                    diagnostics.settings.rician.ricianNav = double(gather(ric.nav));    % resolved: 1 or [Nm,1]
+                end
+                if ~isempty(lik.ricianSigma)
+                    diagnostics.settings.rician.ricianSigma = lik.ricianSigma;            % resolved: scalar or [1,Nv] (masked)
+                end
+            end
 
             disp('The Metropolis-Hastings MCMC sampling (mcmc_bayes) is completed.')
 
@@ -1648,7 +1766,9 @@ classdef mcmc_bayes < mcmc
                          'adaptCovariance',     false;
                          'overdisp',            0;
                          'prior',               [];
-                         'fixedParams',         []};
+                         'fixedParams',         [];
+                         'ricianNav',           [];
+                         'ricianSigma',         []};
 
             nonDefault = mcmc.nondefault_options(fitting, defaults);
             tf = isempty(nonDefault);
@@ -1666,6 +1786,8 @@ classdef mcmc_bayes < mcmc
 
             if ~isfield(fitting,'likelihood');          fitting2.likelihood         = 'gaussian';    end
             if ~isfield(fitting,'S0Param');             fitting2.S0Param            = '';            end
+            if ~isfield(fitting,'ricianNav');           fitting2.ricianNav          = [];            end
+            if ~isfield(fitting,'ricianSigma');         fitting2.ricianSigma        = [];            end
             if ~isfield(fitting,'prior');               fitting2.prior              = [];            end
             if ~isfield(fitting,'forceNewPath');        fitting2.forceNewPath       = false;         end
             if ~isfield(fitting,'fixedParams');         fitting2.fixedParams        = [];            end
@@ -1678,6 +1800,24 @@ classdef mcmc_bayes < mcmc
             mcmc.display_infra_algorithm_parameters(fitting);
             disp(['Likelihood        : ', char(fitting.likelihood)]);
             if ~isempty(fitting.S0Param); disp(['S0 parameter      : ', char(fitting.S0Param), ' (marginalised)']); end
+            if ~isempty(fitting.ricianSigma)
+                rs = double(fitting.ricianSigma(:));
+                if isscalar(rs); rsStr = num2str(rs); else; rsStr = sprintf('map, %d values in [%g, %g]', numel(rs), min(rs), max(rs)); end
+            end
+            if strcmpi(fitting.likelihood, 'rician') && ~isempty(fitting.ricianSigma)
+                disp(['Rician noise      : sigma fixed = ricianSigma (', rsStr, '), not sampled']);
+            end
+            if strcmpi(fitting.likelihood, 'gaussian_ricianmean')
+                if ~isempty(fitting.ricianSigma)
+                    disp(['Rician mean       : sigma_s fixed = ricianSigma (', rsStr, ')']);
+                elseif ~isempty(fitting.ricianNav)
+                    nav = double(fitting.ricianNav(:).');
+                    if numel(nav) <= 8; navStr = mat2str(nav, 4); else; navStr = sprintf('%d entries in [%g, %g]', numel(nav), min(nav), max(nav)); end
+                    disp(['Rician mean       : sigma_s = sigma*sqrt(ricianNav/w), ricianNav = ', navStr]);
+                else
+                    disp( 'Rician mean       : sigma_s = sigma/sqrt(w) (ricianNav = 1)');
+                end
+            end
             if isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical') && ~isempty(fitting.prior.hierarchical) && ...
                     ~(islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
                 h = fitting.prior.hierarchical;
@@ -1725,9 +1865,14 @@ classdef mcmc_bayes < mcmc
         %   .shapeOffset    : InvGamma shape is (m - shapeOffset)/2
         %   .Nstat          : # cached statistics per voxel ([R] or [RSS; Shat; g'Wg])
         %   .fittingOut     : fitting with the full output parameter list (for res2out)
-        %   .nuisance       : description for out.settings ([] for 'gaussian')
+        %   .nuisance       : description for out.settings ([] for 'gaussian', 'rician', 'gaussian_ricianmean')
+        %   .isRician       : true for 'rician' and 'gaussian_ricianmean' (Phase 9a)
+        %   .ricianNav      : fitting.ricianNav as a double column ([] if not set)
+        %   .ricianSigma    : fitting.ricianSigma as double, scalar or map ([] if not set)
+        %   .fixedNoise     : true for 'rician' with ricianSigma ('noise' fixed, not sampled)
+        %   .rician         : description for out.settings.rician ([] for the other likelihoods)
         %
-            valid = {'gaussian','marginal_noise','marginal_S0noise','marginal_S0noise_flat'};
+            valid = {'gaussian','marginal_noise','marginal_S0noise','marginal_S0noise_flat','rician','gaussian_ricianmean'};
             if ~isfield(fitting,'likelihood') || isempty(fitting.likelihood); fitting.likelihood = 'gaussian'; end
             if ~isfield(fitting,'S0Param'); fitting.S0Param = ''; end
             if ~(ischar(fitting.likelihood) || (isstring(fitting.likelihood) && isscalar(fitting.likelihood))) || ~any(strcmpi(fitting.likelihood, valid))
@@ -1752,12 +1897,12 @@ classdef mcmc_bayes < mcmc
             isNoise = strcmp(params, 'noise');
             isS0    = false(1, Nfull);
             switch name
-                case 'gaussian'
+                case {'gaussian','rician','gaussian_ricianmean'}
                     if ~isempty(S0Param)
                         error('mcmc_bayes:S0Param', 'mcmc_bayes: fitting.S0Param is only used with likelihood ''marginal_S0noise'' or ''marginal_S0noise_flat''.');
                     end
                     if ~any(isNoise)
-                        error('mcmc_bayes:noNoise', 'mcmc_bayes: likelihood ''gaussian'' requires ''noise'' in fitting.modelParams.');
+                        error('mcmc_bayes:noNoise', 'mcmc_bayes: likelihood ''%s'' requires ''noise'' in fitting.modelParams.', name);
                     end
                 case 'marginal_noise'
                     if ~isempty(S0Param)
@@ -1773,8 +1918,46 @@ classdef mcmc_bayes < mcmc
                     end
             end
 
-            isMarginal  = ~strcmp(name, 'gaussian');
-            isDrop      = isMarginal & (isNoise | isS0);
+            isRician    = any(strcmp(name, {'rician','gaussian_ricianmean'}));
+            isMarginal  = ~strcmp(name, 'gaussian') && ~isRician;
+
+            % Rician options (Phase 9a): ricianNav with 'gaussian_ricianmean' only, ricianSigma with both
+            % Rician likelihoods; sizes against the data/mask are checked in optimisation and
+            % metropolis_hastings_bayes
+            ricianNav   = [];
+            ricianSigma = [];
+            hasNav      = isfield(fitting,'ricianNav')   && ~isempty(fitting.ricianNav);
+            hasSig      = isfield(fitting,'ricianSigma') && ~isempty(fitting.ricianSigma);
+            if hasNav && ~strcmp(name, 'gaussian_ricianmean')
+                error('mcmc_bayes:ricianOption', 'mcmc_bayes: fitting.ricianNav is only used with likelihood ''gaussian_ricianmean'' (got ''%s'').', name);
+            end
+            if hasSig && ~isRician
+                error('mcmc_bayes:ricianOption', 'mcmc_bayes: fitting.ricianSigma is only used with likelihood ''rician'' or ''gaussian_ricianmean'' (got ''%s'').', name);
+            end
+            if hasNav && hasSig
+                error('mcmc_bayes:ricianOption', 'mcmc_bayes: set either fitting.ricianNav or fitting.ricianSigma, not both (ricianSigma fixes sigma_s).');
+            end
+            if hasNav
+                ricianNav = fitting.ricianNav;
+                if ~(isnumeric(ricianNav) && isreal(ricianNav) && isvector(ricianNav) && all(isfinite(ricianNav)) && all(ricianNav > 0))
+                    error('mcmc_bayes:ricianNav', 'mcmc_bayes: fitting.ricianNav must be a positive finite scalar or vector (one entry per measurement).');
+                end
+                ricianNav = double(ricianNav(:));
+            end
+            if hasSig
+                % scalar, or a per-voxel map (values inside the mask are checked in optimisation)
+                ricianSigma = fitting.ricianSigma;
+                if ~(isnumeric(ricianSigma) && isreal(ricianSigma))
+                    error('mcmc_bayes:ricianSigma', 'mcmc_bayes: fitting.ricianSigma must be a positive finite scalar or a per-voxel map.');
+                end
+                if isscalar(ricianSigma) && ~(isfinite(ricianSigma) && ricianSigma > 0)
+                    error('mcmc_bayes:ricianSigma', 'mcmc_bayes: fitting.ricianSigma must be a positive finite scalar or a per-voxel map.');
+                end
+                ricianSigma = double(ricianSigma);
+            end
+            % 'rician' with ricianSigma: sigma is fixed, 'noise' leaves the sampled set
+            fixedNoise  = strcmp(name, 'rician') && hasSig;
+            isDrop      = (isMarginal & (isNoise | isS0)) | (fixedNoise & isNoise);
 
             % test-only fixed parameters (removed from the sampled set, value injected)
             userFixed   = struct();
@@ -1833,9 +2016,15 @@ classdef mcmc_bayes < mcmc
             lik.userFixed       = userFixed;
             lik.fittingOut      = fittingOut;
             lik.shapeOffset     = double(strcmp(name, 'marginal_S0noise_flat'));
+            lik.isRician        = isRician;
+            lik.ricianNav       = ricianNav;
+            lik.ricianSigma     = ricianSigma;
+            lik.fixedNoise      = fixedNoise;
             switch name
-                case 'gaussian'
+                case {'gaussian','rician','gaussian_ricianmean'}
                     lik.fixedParams = {}; lik.recoveredParams = {}; lik.Nstat = 0;
+                    % fixed-noise 'rician': 'noise' is restored in the output (= ricianSigma)
+                    if fixedNoise; lik.recoveredParams = {'noise'}; end
                 case 'marginal_noise'
                     lik.fixedParams = {'noise'}; lik.recoveredParams = {'noise'}; lik.Nstat = 1;
                 otherwise
@@ -1862,6 +2051,39 @@ classdef mcmc_bayes < mcmc
                     'statistics',   'cached at the retained iterations inside the loop (no extra forward evaluation)');
             else
                 lik.nuisance = [];
+            end
+            % Phase 9a: description for out.settings.rician (ricianNav resolved per measurement later)
+            switch name
+                case 'rician'
+                    if fixedNoise
+                        nRule = 'sigma FIXED at fitting.ricianSigma (scalar or per-voxel map; sigma_i^2 = ricianSigma^2/w_i), not sampled; out.posterior.noise = ricianSigma';
+                    else
+                        nRule = 'sigma sampled (sigma_i^2 = sigma^2/w_i), outside the hierarchical prior';
+                    end
+                    lik.rician = struct( ...
+                        'logLikelihood',    'sum_{w_i~=0} [-log(sigma^2) - a_i (y_i-|nu_i|)^2/2 + log I0e(a_i y_i |nu_i|)], a_i = w_i/sigma^2 (log y_i + log w_i dropped)', ...
+                        'noise',            nRule, ...
+                        'm',                '# measurements with non-zero weight', ...
+                        'negativeNu',       '|nu| used (the Rician density is even in nu)', ...
+                        'ricianNav',        [], ...
+                        'ricianSigma',      ricianSigma, ...
+                        'sigmaSingle',      'n/a');
+                case 'gaussian_ricianmean'
+                    if isempty(ricianSigma)
+                        sRule = 'sigma_s,i = sigma*sqrt(ricianNav_i/w_i) (ricianNav: # magnitude measurements averaged into measurement i)';
+                    else
+                        sRule = 'sigma_s = ricianSigma (fixed; scalar or per-voxel map)';
+                    end
+                    lik.rician = struct( ...
+                        'logLikelihood',    '-(m/2) log(sigma^2) - sum_i w_i (y_i - E_i)^2/(2 sigma^2), E_i = sigma_s,i sqrt(pi/2) L_{1/2}(-nu_i^2/(2 sigma_s,i^2))', ...
+                        'noise',            'sigma sampled (sigma_i^2 = sigma^2/w_i), outside the hierarchical prior', ...
+                        'm',                '# measurements with non-zero weight', ...
+                        'negativeNu',       '|nu| used (E depends on nu^2 only)', ...
+                        'ricianNav',        ricianNav, ...
+                        'ricianSigma',      ricianSigma, ...
+                        'sigmaSingle',      sRule);
+                otherwise
+                    lik.rician = [];
             end
         end
 
@@ -1984,6 +2206,240 @@ classdef mcmc_bayes < mcmc
                 if isfield(recovered, p); xOut.(p) = recovered.(p); else; xOut.(p) = xPosterior.(p); end
             end
             xPosterior = xOut;
+        end
+
+        %% Rician likelihoods (Phase 9a), see the derivation in the class header
+        % option sizes and data checks against the data (host or GPU input, no random numbers)
+        function check_rician_data(y, weights, lik)
+        % y         : measurements, [Nm, Nv]
+        % weights   : weights, [Nm, Nv] or [] (all 1)
+        % lik       : see setup_likelihood
+        %
+            [Nm, Nv] = size(y);
+            if ~isempty(lik.ricianSigma)
+                mcmc_bayes.check_rician_sigma_values(lik.ricianSigma, Nv);
+            end
+            if ~isempty(lik.ricianNav) && ~any(numel(lik.ricianNav) == [1 Nm])
+                error('mcmc_bayes:ricianNav', ...
+                    'mcmc_bayes: fitting.ricianNav must be a scalar or have one entry per measurement (%d), got %d entries.', Nm, numel(lik.ricianNav));
+            end
+            if strcmp(lik.name, 'rician')
+                if isempty(weights); isUsed = true(size(y)); else; isUsed = weights ~= 0; end
+                nNeg = gather(nnz(y(isUsed) < 0));
+                if nNeg > 0
+                    error('mcmc_bayes:ricianNegativeData', ...
+                        ['mcmc_bayes: likelihood ''rician'' needs magnitude data (y >= 0); %d measurement(s) with non-zero ' ...
+                         'weight are negative. Use the magnitude, or give them weight 0.'], nNeg);
+                end
+            end
+        end
+
+        % GPU constants of the Rician likelihoods
+        function ric = rician_setup(lik, Nm, Nv)
+        % Input
+        % -----
+        % lik       : see setup_likelihood (.ricianSigma scalar or [1,Nv] after masking)
+        % Nm, Nv    : # measurements, # voxels (Nv is only used to shape a ricianSigma map)
+        % Output
+        % ------
+        % ric       : structure
+        %   .name       : 'rician' | 'gaussian_ricianmean'
+        %   .fixed      : true for 'rician' with ricianSigma (sigma^2 = sFix2, 'noise' not sampled)
+        %   .nav        : ricianNav, [Nm,1] or scalar single gpuArray (1 if not set)
+        %   .sFix2      : ricianSigma^2, single gpuArray scalar or [1,Nv], 0 if not set
+        %                 ('gaussian_ricianmean': sigma_s^2; fixed 'rician': sigma^2)
+        %   .sigma      : ricianSigma, single gpuArray scalar or [1,Nv] ([] if not set)
+        %
+            if nargin < 3; Nv = []; end
+            ric.name  = lik.name;
+            ric.fixed = isfield(lik, 'fixedNoise') && lik.fixedNoise;
+            if isempty(lik.ricianNav)
+                ric.nav = gpuArray(single(1));
+            elseif isscalar(lik.ricianNav)
+                ric.nav = gpuArray(single(lik.ricianNav));
+            else
+                ric.nav = gpuArray(single(reshape(lik.ricianNav, Nm, 1)));
+            end
+            if isempty(lik.ricianSigma)
+                ric.sFix2 = gpuArray(single(0));
+                ric.sigma = [];
+            else
+                sg = lik.ricianSigma;
+                if ~isscalar(sg); sg = reshape(sg, 1, Nv); end
+                ric.sigma = gpuArray(single(sg));
+                ric.sFix2 = ric.sigma.^2;
+            end
+        end
+
+        %% noise maps through the model classes (extraData.noiseSigma), Phase 9a
+        % take extraData.noiseSigma out of extraData (so that no forward model or data preparation sees
+        % it); extraData is unchanged if it has no such field
+        function [extraData, noiseMap] = take_noise_map(extraData)
+            noiseMap = [];
+            if isstruct(extraData) && isfield(extraData, 'noiseSigma')
+                noiseMap  = extraData.noiseSigma;
+                extraData = rmfield(extraData, 'noiseSigma');
+            end
+        end
+
+        % put a noise map (extraData.noiseSigma of a model class) into fitting.ricianSigma, in the units
+        % of the fitted data; fitting is unchanged if noiseMap is empty
+        function fitting = noise_map_to_fitting(fitting, noiseMap, mask, scale)
+        % Input
+        % -----
+        % fitting   : fitting structure of the model class (after check_set_default)
+        % noiseMap  : noise sigma of ONE magnitude measurement, scalar or [x,y,z] (size of mask)
+        % mask      : final signal mask of the full volume, [x,y,z]
+        % scale     : (optional) the class's data normalisation (data_fitted = data ./ scale), scalar or
+        %             [x,y,z]; the map is divided by it. [] or absent: 1
+        % Output
+        % ------
+        % fitting   : .ricianSigma = noiseMap ./ scale; outside the mask set to 1 (never fitted, only the
+        %             GPU memory probe of find_optimal_segment_3D can reach those voxels)
+        %
+            if isempty(noiseMap); return; end
+            isBayes = isfield(fitting, 'solver') && strcmpi(fitting.solver, 'mcmc') && ...
+                      isfield(fitting, 'mcmcClass') && strcmpi(fitting.mcmcClass, 'mcmc_bayes');
+            if ~isBayes
+                warning('mcmc_bayes:noiseSigmaUnused', ...
+                    'extraData.noiseSigma is only used by fitting.mcmcClass = ''mcmc_bayes'' (likelihood ''rician'' or ''gaussian_ricianmean''); ignored.');
+                return
+            end
+            if isfield(fitting, 'ricianSigma') && ~isempty(fitting.ricianSigma)
+                error('mcmc_bayes:ricianSigma', ...
+                    'mcmc_bayes: set either extraData.noiseSigma (noise map) or fitting.ricianSigma (scalar), not both.');
+            end
+            if ~(isnumeric(noiseMap) && isreal(noiseMap)) || ...
+                    ~(isscalar(noiseMap) || (ndims(noiseMap) <= 3 && isequal(size(noiseMap, 1:3), size(mask, 1:3))))
+                error('mcmc_bayes:ricianSigma', ...
+                    'mcmc_bayes: extraData.noiseSigma must be a scalar or a map with the spatial size of the mask (%s), got %s.', ...
+                    mat2str(size(mask, 1:3)), mat2str(size(noiseMap)));
+            end
+            noiseMap = double(noiseMap);
+            if nargin >= 4 && ~isempty(scale); noiseMap = noiseMap ./ double(scale); end
+            if ~isscalar(noiseMap); noiseMap(~(mask > 0)) = 1; end
+            fitting.ricianSigma = noiseMap;
+        end
+
+        % per-segment copy of fitting: a ricianSigma map with the spatial size of the full volume is sliced
+        % along dim 3 like the data (fitRange, halo slices included); otherwise fitting is returned unchanged
+        function fittingSeg = slice_noise_map(fitting, fitRange, dims)
+            fittingSeg = fitting;
+            if isfield(fitting, 'ricianSigma') && isnumeric(fitting.ricianSigma) && ~isscalar(fitting.ricianSigma) && ...
+                    ~isempty(fitting.ricianSigma) && isequal(size(fitting.ricianSigma, 1:3), dims(1:3))
+                fittingSeg.ricianSigma = fitting.ricianSigma(:, :, fitRange);
+            end
+        end
+
+        % per-voxel ricianSigma map -> [1,Nv] in mask order (like the data); errors if it does not
+        % match the mask passed to mcmc_bayes (e.g. a wrapper split the volume into segments)
+        function rs = mask_rician_sigma(rs, mask, mask_idx)
+            Nv = numel(mask_idx);
+            if numel(rs) == numel(mask) && isequal(size(rs, 1:3), size(mask, 1:3))
+                rs = reshape(rs(mask_idx), 1, []);
+            elseif isvector(rs) && numel(rs) == Nv
+                rs = reshape(rs, 1, []);
+            else
+                error('mcmc_bayes:ricianSigma', ...
+                    ['mcmc_bayes: fitting.ricianSigma is a map of size %s, but the mask passed to mcmc_bayes has size %s ' ...
+                     '(%d voxels); the map must have the spatial size of the mask (or one value per masked voxel). Model ' ...
+                     'classes may split the volume into GPU segments and do not slice fitting.ricianSigma: use a scalar, ' ...
+                     'or a single segment (fitting.autoMemManage = false or fitting.NSegmentUser = 1).'], ...
+                    mat2str(size(rs)), mat2str(size(mask)), Nv);
+            end
+            mcmc_bayes.check_rician_sigma_values(rs, Nv);
+            rs = double(rs);
+        end
+
+        % ricianSigma (scalar or [1,Nv]) must be positive and finite
+        function check_rician_sigma_values(rs, Nv)
+            if ~any(numel(rs) == [1 Nv])
+                error('mcmc_bayes:ricianSigma', ...
+                    ['mcmc_bayes: fitting.ricianSigma has %d values for %d voxels; use a scalar, or a map matching the mask ' ...
+                     'passed to mcmc_bayes (model classes do not slice it into GPU segments: use a single segment).'], numel(rs), Nv);
+            end
+            nBad = nnz(~(isfinite(rs) & rs > 0));
+            if nBad > 0
+                error('mcmc_bayes:ricianSigma', 'mcmc_bayes: fitting.ricianSigma must be positive and finite inside the mask (%d voxel(s) are not).', nBad);
+            end
+        end
+
+        % fixed-noise 'rician': add 'noise' = ricianSigma to every sample, fields in the full output order
+        function xPosterior = fixed_noise_posterior(xPosterior, lik, sigma, Nv, Ns, Nrep)
+            sg = single(gather(sigma(:)));
+            if isscalar(sg); sg = sg .* ones(Nv, 1, 'single'); end
+            recovered.noise = repmat(sg, 1, Ns, Nrep);
+            outParams = lik.fittingOut.modelParams;
+            xOut = struct();
+            for k = 1:numel(outParams)
+                p = outParams{k};
+                if isfield(recovered, p); xOut.(p) = recovered.(p); else; xOut.(p) = xPosterior.(p); end
+            end
+            xPosterior = xOut;
+        end
+
+        % Rician log-likelihoods (theta- and sigma-dependent part), [1,Nv]
+        function logL = loglik_rician(x_struct, y, weights, ric, m, FWDfunc, varargin)
+        % Input
+        % -----
+        % x_struct  : parameter structure, fields [1,Nv] (incl. 'noise' = sigma, unless ric.fixed)
+        % y         : measurements, [Nm, Nv]
+        % weights   : weights, [Nm, Nv]
+        % ric       : see rician_setup (.nav and .sFix2 may be CPU or GPU, single or double)
+        % m         : # measurements with non-zero weight, scalar or [1,Nv] ('gaussian_ricianmean')
+        % FWDfunc   : forward model, returns nu [Nm, Nv]
+        % Output
+        % ------
+        % logL      : [1,Nv]; -Inf if sigma <= 0; NaN for NaN inputs (rejected by the sampler)
+        %
+        % GPU arrayfun (broadcasting); on the CPU (tests) all inputs are expanded to [Nm, Nv] first.
+            nu = FWDfunc(x_struct, varargin{:});
+            if isfield(ric, 'fixed') && ric.fixed
+                s2 = ric.sFix2;                     % fixed-noise 'rician': sigma^2 = ricianSigma^2 (scalar or [1,Nv])
+            else
+                s2 = x_struct.noise.^2;
+            end
+            switch ric.name
+                case 'rician'
+                    if isa(nu, 'gpuArray') || isa(y, 'gpuArray')
+                        logL = sum(arrayfun(@rician_term_kernel, y, nu, weights, s2), 1);
+                    else
+                        sz   = size(y);
+                        logL = sum(arrayfun(@rician_term_kernel, y, nu, weights, s2 .* ones(sz, 'like', y)), 1);
+                    end
+                case 'gaussian_ricianmean'
+                    if isa(nu, 'gpuArray') || isa(y, 'gpuArray')
+                        R    = sum(arrayfun(@ricianmean_sqres_kernel, y, nu, weights, s2, ric.nav, ric.sFix2), 1);
+                        logL = arrayfun(@gauss_rss_kernel, R, s2, m);
+                    else
+                        sz   = size(y); o = ones(sz, 'like', y);
+                        R    = sum(arrayfun(@ricianmean_sqres_kernel, y, nu, weights, s2.*o, ric.nav.*o, ric.sFix2.*o), 1);
+                        logL = arrayfun(@gauss_rss_kernel, R, s2, m .* ones(size(R), 'like', R));
+                    end
+                otherwise
+                    error('mcmc_bayes:invalidLikelihood', 'mcmc_bayes: loglik_rician does not handle likelihood ''%s''.', ric.name);
+            end
+        end
+
+        % exponentially scaled modified Bessel functions and the Rician mean (tests, validation);
+        % elementwise, CPU or GPU, single or double
+        function v = bessel_i0e(z)          % e^(-|z|) I0(z)
+            v = arrayfun(@i0e_kernel, z);
+        end
+        function v = bessel_i1e(z)          % e^(-z) I1(z), z >= 0
+            v = arrayfun(@i1e_kernel, z);
+        end
+        function v = bessel_logi0e(z)       % log I0(z) - |z|
+            v = arrayfun(@logi0e_kernel, z);
+        end
+        function E = rician_mean(nu, sigmaS)
+        % E[|nu + sigma_s (n1 + i n2)|] = sigma_s sqrt(pi/2) L_{1/2}(-nu^2/(2 sigma_s^2)), elementwise
+        % (on the CPU nu and sigmaS must have the same size or one of them be scalar)
+            if ~isa(nu, 'gpuArray') && ~isa(sigmaS, 'gpuArray')
+                o = ones(size(nu + sigmaS), 'like', nu + sigmaS);
+                nu = nu .* o; sigmaS = sigmaS .* o;
+            end
+            E = arrayfun(@ricianmean_kernel, nu, sigmaS.^2);
         end
 
         %% hierarchical Normal prior (Phase 3), see the derivation in the class header
@@ -3272,6 +3728,104 @@ ok      = (R > rssFloor) && (gWg > gFloor) && (gWg < Inf);
 logL    = -a*log(max(R, rssFloor)) - cG*log(min(max(gWg, gFloor), 1/gFloor));
 if ~ok
     logL = logL - Inf;
+end
+end
+
+% ===== Phase 9a kernels (elementwise; GPU arrayfun, single or double) =====
+% Abramowitz & Stegun 9.8.1-9.8.4, |error| < 2.2e-7 of the scaled functions below
+
+% I0e(z) = e^(-|z|) I0(z)
+function v = i0e_kernel(z)
+z = abs(z);
+if z < 3.75
+    t = (z/3.75)^2;
+    v = (1 + t*(3.5156229 + t*(3.0899424 + t*(1.2067492 + t*(0.2659732 + t*(0.0360768 + t*0.0045813)))))) * exp(-z);
+else
+    u = 3.75/z;
+    v = (0.39894228 + u*(0.01328592 + u*(0.00225319 + u*(-0.00157565 + u*(0.00916281 + u*(-0.02057706 + ...
+         u*(0.02635537 + u*(-0.01647633 + u*0.00392377)))))))) / sqrt(z);
+end
+end
+
+% I1e(z) = e^(-z) I1(z), z >= 0
+function v = i1e_kernel(z)
+if z < 3.75
+    t = (z/3.75)^2;
+    v = z*(0.5 + t*(0.87890594 + t*(0.51498869 + t*(0.15084934 + t*(0.02658733 + t*(0.00301532 + t*0.00032411)))))) * exp(-z);
+else
+    u = 3.75/z;
+    v = (0.39894228 + u*(-0.03988024 + u*(-0.00362018 + u*(0.00163801 + u*(-0.01031555 + u*(0.02282967 + ...
+         u*(-0.02895312 + u*(0.01787654 - u*0.00420059)))))))) / sqrt(z);
+end
+end
+
+% log I0e(z) = log I0(z) - |z|; log1p keeps the relative accuracy for small z
+function v = logi0e_kernel(z)
+z = abs(z);
+if z < 3.75
+    t = (z/3.75)^2;
+    v = log1p(t*(3.5156229 + t*(3.0899424 + t*(1.2067492 + t*(0.2659732 + t*(0.0360768 + t*0.0045813)))))) - z;
+else
+    u = 3.75/z;
+    v = log(0.39894228 + u*(0.01328592 + u*(0.00225319 + u*(-0.00157565 + u*(0.00916281 + u*(-0.02057706 + ...
+         u*(0.02635537 + u*(-0.01647633 + u*0.00392377)))))))) - 0.5*log(z);
+end
+end
+
+% Rician mean E = sigma_s sqrt(pi/2) L_{1/2}(-nu^2/(2 sigma_s^2)), s2s = sigma_s^2, t = nu^2/(4 s2s):
+%   L_{1/2} = (1 + 2t) I0e(t) + 2t I1e(t); for t >= 1e4, E = |nu| (1 + 1/(8t)) (relative error < 1e-8);
+%   s2s <= 0 gives E = |nu|
+function E = ricianmean_kernel(nu, s2s)
+nuA = abs(nu);
+if s2s > 0
+    t = nuA*nuA/(4*s2s);
+    if t < 1e4
+        E = sqrt(pi/2)*sqrt(s2s)*((1 + 2*t)*i0e_kernel(t) + 2*t*i1e_kernel(t));
+    else
+        E = nuA*(1 + 1/(8*t));
+    end
+else
+    E = nuA + 0*s2s;
+end
+end
+
+% 'rician': one measurement's log-density term (see the class header); 0 if w = 0, -Inf if sigma^2 <= 0
+function lp = rician_term_kernel(y, nu, w, s2)
+if w ~= 0
+    if s2 > 0
+        a   = w/s2;
+        nuA = abs(nu);
+        lp  = -log(s2) - 0.5*a*(y - nuA)^2 + logi0e_kernel(a*y*nuA);
+    else
+        lp  = 0*w - Inf;
+    end
+else
+    lp = 0*w;
+end
+end
+
+% 'gaussian_ricianmean': weighted squared residual w (y - E)^2 of one measurement (0 if w = 0);
+%   sigma_s^2 = sFix2 if sFix2 > 0, else sigma^2 nav / w
+function r = ricianmean_sqres_kernel(y, nu, w, s2, nav, sFix2)
+if w ~= 0
+    if sFix2 > 0
+        s2s = sFix2;
+    else
+        s2s = s2*nav/w;
+    end
+    d = y - ricianmean_kernel(nu, s2s);
+    r = w*d*d;
+else
+    r = 0*w;
+end
+end
+
+% 'gaussian_ricianmean': -R/(2 sigma^2) - (m/2) log(sigma^2), -Inf if sigma^2 <= 0
+function logL = gauss_rss_kernel(R, s2, m)
+if s2 > 0
+    logL = -R/(2*s2) - 0.5*m*log(s2);
+else
+    logL = 0*R - Inf;
 end
 end
 

@@ -11,6 +11,9 @@ Bayesian priors for MCMC (experimental)
 * New experimental subclass ``mcmc_bayes`` (``utils/mcmc_bayes.m``) with marginal likelihoods (noise, and optionally the signal amplitude, integrated out), a hierarchical population prior ("BSP", with an optional ``K``-group mixture) and a spatial MRF prior fitted by two-stage empirical Bayes, after Spinner et al. 2021. See :ref:`mcmc-bayes`, :ref:`tutorial-mcmc_bayes_tutorial` and :ref:`api-mcmc_bayes-optimisation`.
 * Every model class with MCMC support accepts ``fitting.mcmcClass = 'mcmc_bayes'`` (default ``'mcmc'``, unchanged behaviour). Priors that couple voxels need the whole volume in one GPU call; ``estimate()`` stops with ``<Class>:singleSegment`` otherwise.
 * New in vivo demos ``demo_<class>_invivo_bayes.m`` for R2star, JointR1R2star, GREMWI, AxCaliberSMT, NEXI, SANDI and mcmicro.
+* Two Rician noise models for ``mcmc_bayes``: ``fitting.likelihood = 'rician'`` (exact Rician density, for single magnitude measurements) and ``'gaussian_ricianmean'`` (Gaussian around the Rician mean, for averaged magnitudes such as spherical means; option ``fitting.ricianNav``). The noise is sampled, or known: a scalar ``fitting.ricianSigma`` or a noise map ``extraData.noiseSigma`` (passed through every model class with MCMC support, given in input-data units and normalised by the class like the data, e.g. by the b = 0 signal of the diffusion models, and sliced per GPU segment); with ``'rician'`` a known noise is fixed, not sampled. See the new section "Choosing the likelihood" in :ref:`mcmc-bayes`.
+* ``DWIutility.compute_rotationally_invariant_signal`` and the ``prepare_dwi_data`` methods of the diffusion classes return the per-voxel normalisation map as an extra (optional) output.
+* ``gpuR2starMapping.estimate`` accepts an optional 4th argument ``extraData`` (for ``extraData.noiseSigma``); the 3-argument call is unchanged.
 
 MCMC solver
 ^^^^^^^^^^^
@@ -26,6 +29,7 @@ Fixes
 ^^^^^
 * ``gpuAxCaliberSMT``, ``gpuNEXI``: default MCMC noise lower bound lowered from 0.01 to 0.001 (the old bound could bind at high SNR and widen the posterior).
 * ``gpumcTFI``: ``fitting.start`` now defaults to ``'prior'``, and ``extraData.fint`` is optional as documented.
+* ``utils/rician.m``: ``rician_mean_gacelle`` and ``L12_gacelle`` use exponentially scaled Bessel functions and no longer clamp the argument, so the Rician mean keeps its bias correction above an SNR of about 18 (the old code returned the signal itself there) and has no overflow at any SNR. They still work with ``dlarray``. ``rician_mean`` no longer errors (it called ``this.L12`` in a static method).
 
 v1.1
 ----

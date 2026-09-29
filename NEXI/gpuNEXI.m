@@ -186,11 +186,12 @@ classdef gpuNEXI < handle
 
             % get all fitting algorithm parameters 
             fitting     = this.check_set_default(fitting);
+            [extradata, noiseMap] = mcmc_bayes.take_noise_map(extradata);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
             % [data,mask] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax);
-            [data, mask, extradata] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax,fitting);
+            [data, mask, extradata, normMap] = this.prepare_dwi_data(data,mask,extradata,fitting.lmax,fitting);
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -206,6 +207,7 @@ classdef gpuNEXI < handle
 
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
+            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, normMap);   % -> fitting.ricianSigma, fitted-data units
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -230,7 +232,7 @@ classdef gpuNEXI < handle
                 [dataSeg, maskSeg, pars0Seg, extradataSeg]  = this.slice_segment(data, mask, fitRange, pars0, extradata);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg,extradataSeg);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)),pars0Seg,extradataSeg);
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's
@@ -483,7 +485,10 @@ classdef gpuNEXI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [data, mask, extradata] = prepare_dwi_data(this,data,mask,extradata,lmax,fitting)
+        function [data, mask, extradata, normMap] = prepare_dwi_data(this,data,mask,extradata,lmax,fitting)
+        % normMap : per-voxel factor the class divided the data by ([x,y,z], b=0 signal), 1 if the input
+        %           was already normalised; used to put extraData.noiseSigma in the same units
+            normMap = 1;    % no normalisation by the class (already normalised input)
 
             if strcmpi(fitting.dataType,'surface')
                 %%%%%%%%%%%% Surface path %%%%%%%%%%%%
@@ -562,7 +567,7 @@ classdef gpuNEXI < handle
                 %     extradata.ldelta = ones(size(extradata.bval)) * extradata.ldelta;
                 % end
                 DWIutilityObj   = DWIutility();
-                [data]          = DWIutilityObj.compute_rotationally_invariant_signal(data,extradata.bval,extradata.bvec,[],extradata.BDELTA,[],lmax);
+                [data,~,~,~,~,normMap] = DWIutilityObj.compute_rotationally_invariant_signal(data,extradata.bval,extradata.bvec,[],extradata.BDELTA,[],lmax);
                 % [dwi]   = DWIutilityObj.get_Sl_all(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,lmax);
 
                 fprintf('done.\n');

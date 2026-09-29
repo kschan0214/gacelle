@@ -162,10 +162,11 @@ classdef gpuSANDI < handle
 
             % get all fitting algorithm parameters
             fitting     = this.check_set_default(fitting);
+            [extradata, noiseMap] = mcmc_bayes.take_noise_map(extradata);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
-            [data, mask] = this.prepare_dwi_data(data,mask,extradata,0);  % spherical mean
+            [data, mask, normMap] = this.prepare_dwi_data(data,mask,extradata,0);  % spherical mean
 
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0 = []; end
@@ -181,6 +182,7 @@ classdef gpuSANDI < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
+            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, normMap);   % -> fitting.ricianSigma, fitted-data units
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -205,7 +207,7 @@ classdef gpuSANDI < handle
                 [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, fitRange, pars0);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting,pars0Seg);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)),pars0Seg);
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's
@@ -337,7 +339,10 @@ classdef gpuSANDI < handle
         end
 
         % compute rotationally invariant DWI signal if necessary
-        function [dwi,mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        function [dwi,mask,normMap] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        % normMap : per-voxel factor the class divided the data by ([x,y,z], b=0 signal), 1 if the input
+        %           was already normalised; used to put extraData.noiseSigma in the same units
+            normMap = 1;    % no normalisation by the class (already normalised input)
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
                 % compute spherical mean signal
@@ -351,7 +356,7 @@ classdef gpuSANDI < handle
                     extradata.BDELTA = ones(size(extradata.bval))*extradata.BDELTA;
                 end
                 DWIutils    = DWIutility();
-                [dwi]       = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,[],lmax);
+                [dwi,~,~,~,~,normMap] = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,extradata.ldelta,extradata.BDELTA,[],lmax);
                 
                 fprintf('done.\n');
 

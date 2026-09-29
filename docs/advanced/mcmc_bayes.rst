@@ -62,25 +62,113 @@ Supported models: ``gpuR2starMapping``, ``gpuJointR1R2starMapping``, ``gpuGREMWI
 .. important::
    The hierarchical prior (with free population parameters) and the spatial prior couple all voxels, so the whole volume must be fitted in **one GPU call**. If the automatic memory manager would split the data into several segments, ``estimate()`` stops with the error ``<Class>:singleSegment``. Fit a slab of slices or a region of interest, or use a GPU with more memory. The in vivo demos use a central slab of 8 slices.
 
-Likelihood
-----------
+Choosing the likelihood
+-----------------------
+
+``fitting.likelihood`` sets the noise model. :math:`\nu` is the forward-model signal, :math:`\sigma` the noise, :math:`w_i` the fitting weight of measurement :math:`i` (noise variance :math:`\sigma^2/w_i`) and :math:`m` the number of measurements with non-zero weight.
+
+.. list-table::
+   :widths: 22 30 20 28
+   :header-rows: 1
+
+   * - ``fitting.likelihood``
+     - Noise model
+     - Noise (and amplitude)
+     - Intended data
+   * - ``'gaussian'`` (default)
+     - Gaussian around :math:`\nu` (the legacy likelihood)
+     - ``noise`` sampled
+     - any data at high SNR; complex or real-valued data
+   * - ``'marginal_noise'``
+     - Gaussian around :math:`\nu`
+     - integrated out (:math:`1/\sigma^2` prior): :math:`\log L = -\tfrac{m}{2}\log R`, :math:`R` the weighted residual sum of squares
+     - normalised data (no amplitude parameter), SNR above about 10
+   * - ``'marginal_S0noise'``
+     - Gaussian around :math:`S_0 g`
+     - noise and the linear amplitude ``fitting.S0Param`` integrated out (broad Zellner prior, as in Spinner et al.)
+     - data with an amplitude parameter (``'M0'``, ``'S0'``), SNR above about 10
+   * - ``'marginal_S0noise_flat'``
+     - Gaussian around :math:`S_0 g`
+     - as above with a flat amplitude prior
+     - as above; better-calibrated intervals with few measurements (e.g. 4 echoes); used in the R2* demos
+   * - ``'rician'``
+     - exact Rician density of each magnitude measurement
+     - ``noise`` sampled, or fixed by a known noise level (see `Known noise`_)
+     - single (unaveraged) magnitude measurements at low SNR: late echoes (R2*, R1/R2*, GRE-MWI), high b-values per direction
+   * - ``'gaussian_ricianmean'``
+     - Gaussian around the Rician mean :math:`E[\,|\nu + \text{noise}|\,]`
+     - ``noise`` sampled
+     - averaged or combined magnitudes: spherical means (AxCaliberSMT, SANDI, NEXI, mcmicro), averaged repetitions
+
+With a marginal likelihood, the noise (and amplitude) still appear in ``out.posterior``, ``out.median`` etc.: after sampling, each kept sample gets an exact draw from their conditional posterior. The two Rician likelihoods have no marginal form (:math:`\sigma` enters non-linearly), so ``noise`` must be in the model parameters and is sampled, as with ``'gaussian'`` (unless the noise is known, see `Known noise`_). It stays outside the hierarchical prior. Both work with the hierarchical, mixture and spatial priors: only the likelihood term changes.
+
+**Rician likelihood.** A magnitude measurement :math:`y_i = |\nu_i + \sigma_i (n_1 + i n_2)|` with :math:`n_1, n_2 \sim N(0,1)` has the density
+
+.. math::
+
+   p(y_i) = \frac{y_i}{\sigma_i^2} \exp\!\left(-\frac{y_i^2 + \nu_i^2}{2\sigma_i^2}\right) I_0\!\left(\frac{y_i \nu_i}{\sigma_i^2}\right), \qquad \sigma_i^2 = \sigma^2/w_i .
+
+``mcmc_bayes`` evaluates it with the exponentially scaled Bessel function, so it neither overflows nor loses precision at high SNR, where it tends to the Gaussian density. The data must be magnitudes (``y >= 0``; otherwise the error ``mcmc_bayes:ricianNegativeData``). A negative model signal is treated as its magnitude, since the density depends on :math:`\nu` only through :math:`\nu^2` and :math:`y\nu` in an even function.
+
+**Averaged magnitudes are not Rician.** The average of :math:`N` Rician magnitudes (e.g. over the directions of a shell) is not Rician. By the central limit theorem it is close to Gaussian. Its mean is the Rician mean of the single measurements, so it keeps the noise-floor bias, and its spread is about :math:`\sigma_s/\sqrt{N}`, where :math:`\sigma_s` is the noise of one measurement. A Rician density with a single :math:`\sigma` cannot describe this: with :math:`\sigma = \sigma_s` it is far too wide, and with :math:`\sigma = \sigma_s/\sqrt{N}` its floor is far too low. ``'gaussian_ricianmean'`` models such data directly:
+
+.. math::
+
+   y_i \sim N\!\left(E_i, \sigma_i^2\right), \qquad E_i = \sigma_{s,i}\sqrt{\pi/2}\; L_{1/2}\!\left(-\frac{\nu_i^2}{2\sigma_{s,i}^2}\right),
+
+where :math:`L_{1/2}` is the Laguerre function of order 1/2. :math:`E_i \to \sigma_{s,i}\sqrt{\pi/2}` for :math:`\nu_i \to 0` and :math:`E_i \to \nu_i + \sigma_{s,i}^2/(2\nu_i)` at high SNR. By default :math:`\sigma_{s,i} = \sigma_i \sqrt{N_i}`, with :math:`N_i` given by ``fitting.ricianNav``:
+
+.. list-table::
+   :widths: 25 15 60
+   :header-rows: 1
+
+   * - Option
+     - Default
+     - Description
+   * - ``fitting.ricianNav``
+     - ``[]`` (= 1)
+     - number of magnitude measurements averaged into each measurement: a scalar, or one entry per measurement (e.g. the number of directions of each shell)
+
+``ricianNav`` is only used with ``'gaussian_ricianmean'`` (error ``mcmc_bayes:ricianOption`` otherwise). A known single-measurement noise replaces :math:`\sigma\sqrt{N_i}`, see `Known noise`_. ``out.settings.rician`` records the resolved values.
+
+Known noise
+^^^^^^^^^^^
+
+If the noise :math:`\sigma_s` of one magnitude measurement is known (e.g. from a noise scan or the background), give it as a scalar in ``fitting.ricianSigma`` or as a map in ``extraData.noiseSigma``:
 
 .. list-table::
    :widths: 25 75
    :header-rows: 1
 
-   * - ``fitting.likelihood``
+   * - Option
      - Description
-   * - ``'gaussian'`` (default)
-     - The legacy likelihood: Gaussian noise with the ``noise`` parameter sampled.
-   * - ``'marginal_noise'``
-     - The noise variance is integrated out with a :math:`1/\sigma^2` prior: :math:`\log L = -\tfrac{m}{2}\log R`, with :math:`R` the weighted residual sum of squares and :math:`m` the number of measurements with non-zero weight. Recommended for models whose data are normalised (no amplitude parameter).
-   * - ``'marginal_S0noise'``
-     - Also integrates out a linear amplitude parameter (``fitting.S0Param``, e.g. ``'M0'`` or ``'S0'``) under a broad Zellner prior, as in Spinner et al. The forward model is evaluated with the amplitude set to 1.
-   * - ``'marginal_S0noise_flat'``
-     - As above with a flat prior on the amplitude. It gave better-calibrated intervals with few measurements (e.g. 4 echoes), and is used in the R2* demos.
+   * - ``fitting.ricianSigma``
+     - scalar :math:`\sigma_s > 0`, in the units of the fitted (normalised) data
+   * - ``extraData.noiseSigma``
+     - :math:`\sigma_s` as a 3D map ``[x,y,z]`` (or a scalar), positive and finite inside the mask; passed to the model class's ``estimate()`` (``gpuR2starMapping``: optional 4th argument, ``estimate(data, mask, fitting, extraData)``). Not together with ``fitting.ricianSigma``
 
-With a marginal likelihood, the noise (and amplitude) still appear in ``out.posterior``, ``out.median`` etc.: after sampling, each kept sample gets an exact draw from their conditional posterior.
+What it does depends on the likelihood:
+
+* ``'rician'``: :math:`\sigma` is **fixed** at the given value (:math:`\sigma_i^2 = \sigma_s^2/w_i`) and not sampled. ``noise`` is removed from the sampled parameters, and ``out.posterior.noise`` (and ``out.mean.noise`` etc.) equal the given value in every sample, so its ESS and R-hat are not meaningful. Without a known noise, :math:`\sigma` is sampled.
+* ``'gaussian_ricianmean'``: it fixes :math:`\sigma_s` inside the Rician mean (instead of :math:`\sigma\sqrt{N_i}`). The spread :math:`\sigma` of the averaged data is still sampled. Not together with ``ricianNav``.
+
+Units: give ``extraData.noiseSigma`` in the units of your **input data** (the noise of one raw magnitude measurement). Every model class divides it by the same per-voxel factor as the data: ``gpuR2starMapping``, ``gpuJointR1R2starMapping``, ``gpuGREMWI`` and the sandbox ``gpuAxonalT2model`` by their global scale factor, ``gpuIVIM`` by the lowest-b signal, and ``gpuAxCaliberSMT``, ``gpuNEXI``, ``gpuSANDI`` and ``gpumcmicro`` (and the sandbox ``gpuMEAxCaliberSMT``) by the b = 0 signal when they compute the spherical mean from full DWI data. The fixed ``noise`` output is then in the fitted (normalised) units, as without a map. If the input data are already normalised (e.g. spherical means divided by b = 0), the class does not normalise them and the map is used as given, so it must be in the same normalised units (:math:`\sigma/S_0`). A scalar ``fitting.ricianSigma`` is never rescaled: it is in the units of the fitted data.
+
+The map works with the automatic GPU memory manager: the model classes slice it with the data for each segment. It must have the spatial size of the full volume; a map of another size is an error (``mcmc_bayes:ricianSigma``). The map is only used with ``fitting.mcmcClass = 'mcmc_bayes'``; otherwise it is ignored with the warning ``mcmc_bayes:noiseSigmaUnused``.
+
+Low-SNR guidance
+^^^^^^^^^^^^^^^^
+
+* If every measurement has :math:`\nu/\sigma` above about 10, the Rician bias (about :math:`\sigma^2/(2\nu)`, i.e. at most 5% of :math:`\sigma`) is negligible and the Gaussian and marginal likelihoods are fine.
+* If some single magnitude measurements approach the noise floor (late echoes of fast-decaying tissue, high b-values per direction), use ``'rician'``, and provide the noise if you can (``extraData.noiseSigma`` or ``fitting.ricianSigma``). With a sampled :math:`\sigma` at SNR 5-10, the posterior of fast-decaying tissue can be broad and biased upwards (see the limitations below); a known noise level reduces this. Complex or phase-corrected real-valued data are Gaussian; keep ``'gaussian'`` or a marginal likelihood there.
+* For direction-averaged or otherwise combined magnitudes, use ``'gaussian_ricianmean'`` with ``ricianNav`` set to the number of averaged measurements, or with a known single-measurement noise. Do not use ``'rician'`` on averaged data.
+
+Limitations of the Rician likelihoods
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* At very low SNR the voxel-wise posterior can be broad: the data can be explained either by the signal or by a larger :math:`\sigma` and a faster decay into the noise floor. Posterior means can then be biased even though the likelihood is correct; check the credible intervals and posterior medians. A known noise level removes the :math:`\sigma` part of this trade-off, but at SNR 5 a fast decay that reaches the noise floor after a few echoes stays weakly determined.
+* ``'gaussian_ricianmean'`` applies the Rician mean to the model's averaged signal. The exact expectation of a direction average is the average of the Rician means of the directional signals, which is larger for anisotropic tissue at low SNR (the Rician mean is convex). The difference is zero for isotropic signals and grows with anisotropy and b-value.
+* One :math:`\sigma` is used for all measurements (up to the weights). The spread of an averaged magnitude near the noise floor is smaller than :math:`\sigma_s/\sqrt{N}` (by up to a factor of about 0.65 at zero signal), which the model does not describe.
 
 Hierarchical prior (BSP)
 ------------------------
@@ -216,7 +304,7 @@ In addition to the usual MCMC output (``out.posterior``, ``out.median``, ...; se
    * - ``out.diagnostics``
      - as in :ref:`mcmc-sampler-options`
    * - ``out.settings``
-     - resolved options, likelihood, prior and MRF settings, RNG states
+     - resolved options, likelihood, prior and MRF settings, RNG states; ``.rician`` for the two Rician likelihoods
    * - ``out.stage1``
      - two-stage only: stage-1 ``.hyper``, ``.diagnostics``, ``.settings``
    * - ``out.settings.empiricalBayes``
@@ -240,6 +328,6 @@ Limitations
 
 * **Algorithms:** Metropolis-Hastings only; the Bayesian options cannot be combined with the ensemble sampler.
 * **Memory:** the coupled priors need a single GPU call, see above.
-* **Noise model:** the marginal likelihoods assume Gaussian noise. For magnitude data at low SNR (roughly below 10) the Rician bias is not modelled.
+* **Noise model:** the marginal likelihoods assume Gaussian noise. For magnitude data at low SNR (roughly below 10) use ``'rician'`` or ``'gaussian_ricianmean'``, see `Choosing the likelihood`_.
 * **Weights:** the marginal likelihoods treat the fitting weights as relative precisions of the measurements (correct for per-shell noise, e.g. a different number of directions per shell). Other uses of the weights are not specified yet.
 * **Two-stage approximation:** the uncertainty of the population prior is not propagated to stage 2.

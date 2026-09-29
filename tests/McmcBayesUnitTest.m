@@ -119,6 +119,44 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     sits in a u-mode the random-walk chains rarely visit, and the between-chain SD of the smooth RB
     %     estimate does not include it (T7.1 run 4: shortfall <= 1.4e-5)
     %   location-shift move removed (Phase 8): prior.hierarchical.shiftMove/shiftEvery/shiftScale error mcmc_bayes:invalidPrior
+    %   Phase 9a (Rician likelihoods 'rician', 'gaussian_ricianmean'):
+    %   kernels I0e, I1e, log I0e (and log I0 = log I0e + z in double) vs besseli(nu,z,1) (log I0 for z < 3.75
+    %     from the power series in double), z = 0 and 2000 points log-spaced in [1e-8, 1e6]: relative error
+    %     <= 1e-6 (double, CPU) and <= 1e-5 (single, GPU, reference at the single-rounded z); all finite;
+    %     I1e(0) = log I0e(0) = 0 exactly, I0e(0) = 1 exactly
+    %   Rician mean vs sigma_s sqrt(pi/2) [(1+2t) besseli(0,t,1) + 2t besseli(1,t,1)], t = nu^2/(4 sigma_s^2) = 0
+    %     and 1500 points log-spaced in [1e-8, 1e6]: relative error <= 1e-6 (double CPU), <= 1e-5 (single GPU),
+    %     finite; E(0) = sigma_s sqrt(pi/2) (RelTol 1e-7, double); high SNR (t >= 1e3): |E/nu - 1 - 1/(8t)|
+    %     <= 1e-6 (double) and <= 2e-6 (single GPU); E(-nu) == E(nu) and sigma_s = 0 gives |nu| exactly
+    %   'rician' log-likelihood (GPU) vs the direct Rician density with besseli (double, CPU; constants
+    %     log y + log w removed), 6 voxels with nu/sigma from 0 to 1e3 (Bessel arguments up to ~1e6), weights
+    %     incl. zeros, y = 0 and negative nu: double |diff| <= 1e-6 m + 1e-12 S; single |diff| <= 1e-5 S + 1e-6 m
+    %     (S = sum of |terms| of the kernel form); sigma = 0: -Inf; high SNR (single): Rician - Gaussian
+    %     log-density - log(y/|nu|)/2 summed over the measurements within sum 1/(8z) + 1e-5 S + 1e-6 m
+    %   'gaussian_ricianmean' log-likelihood (GPU) vs the direct Gaussian with E from besseli (double, CPU), the
+    %     same voxels, ricianNav 1 (default), per measurement, and a fixed ricianSigma:
+    %     |diff| <= sum_i w_i |y_i - E_i| (c_E |E_i| + c_y |y_i|)/sigma^2 + c_R (R/(2 sigma^2) + (m/2)|log sigma^2|) + 1e-6
+    %     with (c_E, c_y, c_R) = (5e-7, 0, 1e-10) in double and (2e-6, 2e-7, 1e-5) in single; finite
+    %   option errors: S0Param / missing noise with the new likelihoods, ricianNav or ricianSigma with another
+    %     likelihood or both set, non-positive / non-finite / wrong-size ricianNav, non-positive or non-scalar
+    %     ricianSigma, negative data with non-zero weight ('rician')
+    %   known noise (fitting.ricianSigma, scalar or per-voxel map): fixed-sigma 'rician' log-likelihood (GPU) vs the
+    %     direct density with the per-voxel sigma map (same tolerances as above); map masking (full-size map and
+    %     [1,Nv], values outside the mask ignored) and errors (size mismatch, non-positive/NaN inside the mask,
+    %     ricianSigma with another likelihood); a constant map gives exactly the same output as the scalar for the
+    %     same seed ('rician' fixed sigma, and 'gaussian_ricianmean', both with MRF + subsetForward), apart from
+    %     out.settings.rician.ricianSigma; fixed sigma: 'noise' not sampled, out.posterior.noise == single(map) in
+    %     every sample; two-stage with subsetFraction 0.5 and a varying map: stage-1 map follows the voxel subset;
+    %     extraData.noiseSigma through gpuR2starMapping (4th argument), 1 and 2 segments (NSegmentUser = 2), map
+    %     differing per slice: out.mean.noise x scale == the map in every voxel (RelTol 1e-6); errors: both
+    %     noiseSigma and ricianSigma, wrong map size, 0 inside the mask; warning mcmc_bayes:noiseSigmaUnused with
+    %     mcmcClass 'mcmc'; helpers take_noise_map / noise_map_to_fitting / slice_noise_map (exact)
+    %   DWI normalisation (gpumcmicro, full-DWI input with a per-voxel S0 map): fixed 'rician' noise == noiseSigma./S0
+    %     (RelTol 1e-6); spherical-mean input (no normalisation by the class): the map is used as given
+    %   GPU runs (R2* grid with Rician noise, checkCache): plain, hierarchical K = 1 + adaptCovariance, K = 2,
+    %     run_two_stage + MRF (subsetForward used): caches <= 1e-5, inactive voxels never move (exactly 0),
+    %     finite means, 'noise' in the output, out.settings.rician present; wrappers gpuR2starMapping ('rician')
+    %     and gpumcmicro ('gaussian_ricianmean', ricianNav per measurement): finite output, noise present
     %
     % Kwok-Shing Chan @ MGH
 
@@ -136,7 +174,10 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             'adaptCovariance',          {{'adaptCovariance', true}}, ...
             'overdisp',                 {{'overdisp', 0.01}}, ...
             'prior',                    {{'prior', struct('hierarchical', struct())}}, ...
-            'fixedParams',              {{'fixedParams', struct('noise', 0.1)}} ...
+            'fixedParams',              {{'fixedParams', struct('noise', 0.1)}}, ...
+            'likelihoodRician',         {{'likelihood', 'rician'}}, ...
+            'ricianNav',                {{'ricianNav', 30}}, ...
+            'ricianSigma',              {{'ricianSigma', 0.02}} ...
             )
 
         % MRF geometry configurations {mode, radius, connectivity, K}
@@ -155,6 +196,8 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
         hyperprior = {'niw','jeffreys_half'}
 
         updateScheme = {'joint','componentwise'}
+
+        ricianLikelihood = {'rician','gaussian_ricianmean'}
 
         marginalLikelihood = {'marginal_S0noise','marginal_S0noise_flat'}
     end
@@ -1810,9 +1853,489 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             end
             testCase.verifyFalse(ismember('shift_hyper_delta', methods('mcmc_bayes')));
         end
+
+        %% Phase 9a: Rician likelihoods
+        function testRicianBesselKernels(testCase)
+            z   = [0, logspace(-8, 6, 2000)].';
+            % double on the CPU
+            [r0, r1, rl] = McmcBayesUnitTest.besselRef(z);
+            a0  = mcmc_bayes.bessel_i0e(z); a1 = mcmc_bayes.bessel_i1e(z); al = mcmc_bayes.bessel_logi0e(z);
+            testCase.verifyEqual([a0(1) a1(1) al(1)], [1 0 0]);
+            k   = z > 0;
+            testCase.verifyLessThanOrEqual(max(abs(a0 - r0) ./ r0), 1e-6, 'I0e (double)');
+            testCase.verifyLessThanOrEqual(max(abs(a1(k) - r1(k)) ./ r1(k)), 1e-6, 'I1e (double)');
+            testCase.verifyLessThanOrEqual(max(abs(al(k) - rl(k)) ./ abs(rl(k))), 1e-6, 'log I0e (double)');
+            lI0 = al + z; lI0ref = rl + z;
+            lI0ref(z < 3.75) = McmcBayesUnitTest.logI0Series(z(z < 3.75));
+            testCase.verifyLessThanOrEqual(max(abs(lI0(k) - lI0ref(k)) ./ lI0ref(k)), 1e-6, 'log I0 (double)');
+            % single on the GPU
+            gacelletest.assumeGPU(testCase);
+            zs  = gpuArray(single(z));
+            [r0, r1, rl] = McmcBayesUnitTest.besselRef(double(gather(zs)));
+            b0  = double(gather(mcmc_bayes.bessel_i0e(zs))); b1 = double(gather(mcmc_bayes.bessel_i1e(zs)));
+            bl  = double(gather(mcmc_bayes.bessel_logi0e(zs)));
+            testCase.verifyTrue(all(isfinite([b0; b1; bl])));
+            testCase.verifyLessThanOrEqual(max(abs(b0 - r0) ./ r0), 1e-5, 'I0e (single)');
+            testCase.verifyLessThanOrEqual(max(abs(b1(k) - r1(k)) ./ r1(k)), 1e-5, 'I1e (single)');
+            testCase.verifyLessThanOrEqual(max(abs(bl(k) - rl(k)) ./ abs(rl(k))), 1e-5, 'log I0e (single)');
+        end
+
+        function testRicianMeanKernel(testCase)
+            t   = [0, logspace(-8, 6, 1500)];
+            s   = 0.7;
+            nu  = 2*s*sqrt(t);
+            ref = McmcBayesUnitTest.ricianMeanRef(nu, s);
+            E   = mcmc_bayes.rician_mean(nu, s);
+            testCase.verifyTrue(all(isfinite(E)));
+            testCase.verifyLessThanOrEqual(max(abs(E - ref) ./ ref), 1e-6, 'Rician mean (double)');
+            testCase.verifyEqual(E(1), s*sqrt(pi/2), 'RelTol', 1e-7);
+            hi  = t >= 1e3;
+            testCase.verifyLessThanOrEqual(max(abs(E(hi)./nu(hi) - 1 - 1./(8*t(hi)))), 1e-6, 'E -> nu (double)');
+            testCase.verifyEqual(mcmc_bayes.rician_mean(-nu, s), E);
+            testCase.verifyEqual(mcmc_bayes.rician_mean(nu, 0), nu);
+            % single on the GPU, up to t = 1e6 (nu/sigma_s = 2e3)
+            gacelletest.assumeGPU(testCase);
+            nuS = gpuArray(single(nu)); sS = gpuArray(single(s));
+            Es  = double(gather(mcmc_bayes.rician_mean(nuS, sS)));
+            nuD = double(gather(nuS)); tD = nuD.^2 ./ (4*double(single(s))^2);
+            refS = McmcBayesUnitTest.ricianMeanRef(nuD, double(single(s)));
+            testCase.verifyTrue(all(isfinite(Es)));
+            testCase.verifyLessThanOrEqual(max(abs(Es - refS) ./ refS), 1e-5, 'Rician mean (single)');
+            hi  = tD >= 1e3;
+            testCase.verifyLessThanOrEqual(max(abs(Es(hi)./nuD(hi) - 1 - 1./(8*tD(hi)))), 2e-6, 'E -> nu (single)');
+            testCase.verifyEqual(gather(mcmc_bayes.rician_mean(-nuS, sS)), gather(mcmc_bayes.rician_mean(nuS, sS)));
+        end
+
+        function testLoglikRicianVsDirect(testCase)
+            gacelletest.assumeGPU(testCase);
+            [y, nu, w, sig] = McmcBayesUnitTest.ricianVoxels();
+            m   = sum(w ~= 0, 1);
+            ric = struct('name', 'rician');
+            for cls = {'double','single'}
+                c   = cls{1};
+                yc  = cast(y, c); nuc = cast(nu, c); wc = cast(w, c); sc = cast(sig, c);
+                % reference on the (rounded) inputs, double precision, direct Rician density
+                [ref, S] = McmcBayesUnitTest.ricianLogLRef(double(yc), double(nuc), double(wc), double(sc));
+                fwd  = @(p) gpuArray(nuc);
+                logL = double(gather(mcmc_bayes.loglik_rician(struct('noise', gpuArray(sc)), gpuArray(yc), gpuArray(wc), ric, m, fwd)));
+                testCase.verifyTrue(all(isfinite(logL)), c);
+                if strcmp(c, 'double'); tol = 1e-6*m + 1e-12*S; else; tol = 1e-5*S + 1e-6*m; end
+                testCase.verifyLessThanOrEqual(abs(logL - ref) - tol, 0, sprintf('rician logL (%s): diff %s', c, mat2str(abs(logL-ref), 3)));
+            end
+            % high SNR (single, the last voxels: nu/sigma up to 1e3): Rician density -> Gaussian density x sqrt(y/|nu|)
+            yc = single(y); nuc = single(nu); wc = single(w); sc = single(sig);
+            logL = double(gather(mcmc_bayes.loglik_rician(struct('noise', gpuArray(sc)), gpuArray(yc), gpuArray(wc), ric, m, @(p) gpuArray(nuc))));
+            [yd, nd, wd, sd] = deal(double(yc), double(nuc), double(wc), double(sc));
+            [~, S] = McmcBayesUnitTest.ricianLogLRef(yd, nd, wd, sd);
+            on   = wd ~= 0;
+            s2i  = sd.^2 ./ wd;
+            lG   = -0.5*log(2*pi*s2i) - (yd - abs(nd)).^2 ./ (2*s2i);                 % Gaussian log-density, mean |nu|
+            dRG  = sum(on .* (log(yd) + log(wd) - lG - 0.5*log(yd./abs(nd))), 1, 'omitnan');   % + dropped constants
+            z    = yd .* abs(nd) ./ s2i; z(~on) = Inf;
+            for v = 5:6
+                gap = abs(logL(v) + dRG(v));
+                testCase.verifyLessThanOrEqual(gap, sum(1 ./ (8*z(:,v))) + 1e-5*S(v) + 1e-6*m(v), sprintf('high SNR voxel %d: %.3g', v, gap));
+            end
+            % sigma = 0 gives -Inf
+            logL0 = gather(mcmc_bayes.loglik_rician(struct('noise', gpuArray(zeros(1, 6, 'single'))), gpuArray(yc), gpuArray(wc), ric, m, @(p) gpuArray(nuc)));
+            testCase.verifyEqual(logL0, -Inf(1, 6, 'single'));
+        end
+
+        function testLoglikRicianMeanVsDirect(testCase)
+            gacelletest.assumeGPU(testCase);
+            [y, nu, w, sig] = McmcBayesUnitTest.ricianVoxels();
+            Nm  = size(y, 1); m = sum(w ~= 0, 1);
+            nav = [1; 1; 30; 30; 30; 8; 8; 64; 64; 16];
+            opts = {struct('name','gaussian_ricianmean','ricianNav',[],'ricianSigma',[]), ...
+                    struct('name','gaussian_ricianmean','ricianNav',nav,'ricianSigma',[]), ...
+                    struct('name','gaussian_ricianmean','ricianNav',[],'ricianSigma',0.03)};
+            for ko = 1:numel(opts)
+                ric = mcmc_bayes.rician_setup(opts{ko}, Nm);
+                navD = double(gather(ric.nav)); sF2 = double(gather(ric.sFix2));
+                for cls = {'double','single'}
+                    c   = cls{1};
+                    yc  = cast(y, c); nuc = cast(nu, c); wc = cast(w, c); sc = cast(sig, c);
+                    rc  = ric; rc.nav = cast(rc.nav, c); rc.sFix2 = cast(rc.sFix2, c);
+                    [yd, nd, wd, sd] = deal(double(yc), double(nuc), double(wc), double(sc));
+                    s2  = sd.^2;
+                    if sF2 > 0; s2s = sF2 * ones(size(yd)); else; s2s = s2 .* navD ./ wd; end
+                    E   = McmcBayesUnitTest.ricianMeanRef(nd, sqrt(s2s));
+                    on  = wd ~= 0;
+                    r   = on .* wd .* (yd - E).^2; r(~on) = 0;
+                    R   = sum(r, 1);
+                    ref = -R ./ (2*s2) - 0.5*m.*log(s2);
+                    logL = double(gather(mcmc_bayes.loglik_rician(struct('noise', gpuArray(sc)), gpuArray(yc), gpuArray(wc), rc, m, @(p) gpuArray(nuc))));
+                    testCase.verifyTrue(all(isfinite(logL)), c);
+                    if strcmp(c, 'double'); cE = 5e-7; cY = 0; cR = 1e-10; else; cE = 2e-6; cY = 2e-7; cR = 1e-5; end
+                    dE  = on .* wd .* abs(yd - E) .* (cE*abs(E) + cY*abs(yd)) ./ s2; dE(~on) = 0;
+                    tol = sum(dE, 1) + cR*(R./(2*s2) + 0.5*m.*abs(log(s2))) + 1e-6;
+                    testCase.verifyLessThanOrEqual(abs(logL - ref) - tol, 0, ...
+                        sprintf('gaussian_ricianmean opt %d (%s): diff %s', ko, c, mat2str(abs(logL-ref), 3)));
+                end
+            end
+        end
+
+        function testRicianOptionErrors(testCase)
+            base.modelParams = {'M0';'R2star';'noise'};
+            base.lb          = [0; 0.1; 0.001];
+            base.ub          = [2; 200; 0.1];
+            base.xStepSize   = [0.01; 1; 0.005];
+            run = @(f) mcmc_bayes().optimisation([], [], [], [], f, []);
+            for lik = {'rician','gaussian_ricianmean'}
+                f = base; f.likelihood = lik{1}; f.S0Param = 'M0';
+                testCase.verifyError(@() run(f), 'mcmc_bayes:S0Param');
+                f = base; f.likelihood = lik{1}; f.modelParams = {'M0';'R2star';'sigma'};
+                testCase.verifyError(@() run(f), 'mcmc_bayes:noNoise');
+            end
+            f = base; f.likelihood = 'rician'; f.ricianNav = 4;
+            testCase.verifyError(@() run(f), 'mcmc_bayes:ricianOption');
+            f = base; f.likelihood = 'marginal_noise'; f.ricianSigma = 0.1;
+            testCase.verifyError(@() run(f), 'mcmc_bayes:ricianOption');
+            f = base; f.ricianSigma = 0.1;                                  % 'gaussian' (new path: ricianSigma non-default)
+            testCase.verifyError(@() run(f), 'mcmc_bayes:ricianOption');
+            f = base; f.likelihood = 'gaussian_ricianmean'; f.ricianNav = 4; f.ricianSigma = 0.1;
+            testCase.verifyError(@() run(f), 'mcmc_bayes:ricianOption');
+            for bad = {[2 -1], NaN, 0, Inf, 'a', ones(2)}
+                f = base; f.likelihood = 'gaussian_ricianmean'; f.ricianNav = bad{1};
+                testCase.verifyError(@() run(f), 'mcmc_bayes:ricianNav');
+            end
+            for lik = {'rician','gaussian_ricianmean'}
+                for bad = {-0.1, 0, NaN, Inf, 'a'}
+                    f = base; f.likelihood = lik{1}; f.ricianSigma = bad{1};
+                    testCase.verifyError(@() run(f), 'mcmc_bayes:ricianSigma');
+                end
+            end
+            % against the data (raised before any GPU work)
+            y    = 0.5 + rand(3, 1, 1, 6); mask = true(3, 1, 1);
+            x0   = struct('M0', ones(3,1,1), 'R2star', 30*ones(3,1,1), 'noise', 0.05*ones(3,1,1));
+            fwd  = @(p) p.M0 .* exp(-(1:6).'*1e-3 .* p.R2star);
+            f = base; f.likelihood = 'gaussian_ricianmean'; f.ricianNav = ones(5, 1);
+            testCase.verifyError(@() mcmc_bayes().optimisation(y, mask, [], x0, f, fwd), 'mcmc_bayes:ricianNav');
+            % ricianSigma maps against the mask (3 voxels; raised before any GPU work)
+            for lik = {'rician','gaussian_ricianmean'}
+                f = base; f.likelihood = lik{1};
+                for bad = {0.05*ones(4,1,1), 0.05*ones(3,2), [0.05; 0; 0.05], [0.05; NaN; 0.05]}
+                    f.ricianSigma = bad{1};
+                    testCase.verifyError(@() mcmc_bayes().optimisation(y, mask, [], x0, f, fwd), 'mcmc_bayes:ricianSigma');
+                end
+            end
+            m2 = logical([1; 0; 1]); idx = find(m2);
+            testCase.verifyEqual(mcmc_bayes.mask_rician_sigma([0.1; 0; 0.3], m2, idx), [0.1 0.3]);   % outside the mask ignored
+            testCase.verifyEqual(mcmc_bayes.mask_rician_sigma([0.1 0.3], m2, idx), [0.1 0.3]);       % already masked
+            testCase.verifyError(@() mcmc_bayes.mask_rician_sigma([0.1; NaN; 0], m2, idx), 'mcmc_bayes:ricianSigma');
+            % fixed-noise 'rician' drops 'noise' from the sampled set and restores it in the output
+            f = base; f.likelihood = 'rician'; f.ricianSigma = 0.05;
+            [fS, lik] = mcmc_bayes.setup_likelihood(f);
+            testCase.verifyEqual(fS.modelParams, {'M0';'R2star'});
+            testCase.verifyEqual(lik.droppedParams, {'noise'});
+            testCase.verifyEqual(lik.fittingOut.modelParams, {'M0';'R2star';'noise'});
+            testCase.verifyTrue(lik.fixedNoise);
+            f.likelihood = 'gaussian_ricianmean'; [fS, lik] = mcmc_bayes.setup_likelihood(f);
+            testCase.verifyEqual(fS.modelParams, {'M0';'R2star';'noise'});
+            testCase.verifyFalse(lik.fixedNoise);
+            f = base; f.likelihood = 'rician'; yn = y; yn(2,1,1,4) = -0.01;
+            testCase.verifyError(@() mcmc_bayes().optimisation(yn, mask, [], x0, f, fwd), 'mcmc_bayes:ricianNegativeData');
+            % a negative value with weight 0 is allowed; negative data are fine for 'gaussian_ricianmean'
+            [~, lik] = mcmc_bayes.setup_likelihood(f);
+            yv = reshape(permute(yn, [4 1 2 3]), 6, 3); wv = ones(6, 3); wv(4,2) = 0;
+            mcmc_bayes.check_rician_data(yv, wv, lik);
+            f.likelihood = 'gaussian_ricianmean'; [~, lik] = mcmc_bayes.setup_likelihood(f);
+            mcmc_bayes.check_rician_data(yv, [], lik);
+        end
+
+        function testLoglikRicianFixedSigma(testCase)
+            % fixed-noise 'rician' (ricianSigma, per-voxel map) vs the direct density, no 'noise' in the parameters
+            gacelletest.assumeGPU(testCase);
+            [y, nu, w, sig] = McmcBayesUnitTest.ricianVoxels();
+            m   = sum(w ~= 0, 1);
+            for cls = {'double','single'}
+                c   = cls{1};
+                lik = struct('name', 'rician', 'ricianNav', [], 'ricianSigma', sig, 'fixedNoise', true);
+                ric = mcmc_bayes.rician_setup(lik, size(y,1), size(y,2));
+                testCase.verifyTrue(ric.fixed);
+                ric.sFix2 = cast(ric.sFix2, c);
+                yc  = cast(y, c); nuc = cast(nu, c); wc = cast(w, c);
+                sc  = double(single(sig)); if strcmp(c, 'double'); sc = sig; ric.sFix2 = gpuArray(sig.^2); end
+                [ref, S] = McmcBayesUnitTest.ricianLogLRef(double(yc), double(nuc), double(wc), sc);
+                logL = double(gather(mcmc_bayes.loglik_rician(struct('M0', gpuArray(ones(1,6,c))), gpuArray(yc), gpuArray(wc), ric, m, @(p) gpuArray(nuc))));
+                testCase.verifyTrue(all(isfinite(logL)), c);
+                if strcmp(c, 'double'); tol = 1e-6*m + 1e-12*S; else; tol = 1e-5*S + 1e-6*m; end
+                testCase.verifyLessThanOrEqual(abs(logL - ref) - tol, 0, sprintf('fixed-sigma rician logL (%s): diff %s', c, mat2str(abs(logL-ref), 3)));
+            end
+        end
+
+        function testRicianSigmaMapRuns(testCase)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.ricianR2starGrid();
+            dims = size(mask);
+            f.iteration = 150; f.burnin = 50;
+            % a constant map gives exactly the scalar result ('rician' fixed sigma; 'gaussian_ricianmean' sigma_s),
+            % also with the MRF colour steps on the active voxels (subsetForward)
+            for lik = {'rician','gaussian_ricianmean'}
+                for pr = {[], struct('hierarchical', struct('params', {{'M0','R2star'}}, 'fixed', true, 'mu', [0; -1], ...
+                                     'Sigma', diag([1 1])), 'mrf', struct('tau', 2.5))}
+                    g = f; g.likelihood = lik{1}; g.prior = pr{1};
+                    g.ricianSigma = 0.05;
+                    rng(21); parallel.gpu.rng(21);
+                    outS = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+                    g.ricianSigma = 0.05*ones(dims);
+                    rng(21); parallel.gpu.rng(21);
+                    outM = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+                    testCase.verifyEqual(outM.settings.rician.ricianSigma, 0.05*ones(1, nnz(mask)));
+                    testCase.verifyEqual(outS.settings.rician.ricianSigma, 0.05);
+                    if ~isempty(pr{1}); testCase.verifyTrue(outM.settings.mrf.subsetForward.used); end
+                    outM.settings.rician.ricianSigma = 0.05;
+                    testCase.verifyTrue(isequaln(outM, outS), sprintf('%s: map ~= scalar', lik{1}));
+                    if strcmp(lik{1}, 'rician')
+                        testCase.verifyEqual(outS.settings.sampledParams, {'M0','R2star'});
+                        testCase.verifyEqual(fieldnames(outS.posterior), {'M0';'R2star';'noise'});
+                        testCase.verifyTrue(all(outS.posterior.noise(:) == single(0.05)));
+                    else
+                        testCase.verifyEqual(outS.settings.sampledParams, {'M0','R2star','noise'});
+                    end
+                end
+            end
+            % a varying map: fixed noise per voxel in the output; two-stage with a voxel subset in stage 1
+            rng(22); smap = 0.03 + 0.04*rand(dims); smap(~mask) = 0;
+            g = f; g.likelihood = 'rician'; g.ricianSigma = smap;
+            g.prior = struct('hierarchical', struct('params', {{'M0','R2star'}}, 'subsetFraction', 0.5), 'mrf', struct('tau', 2.5));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            nz  = out.posterior.noise;                                          % [Nv, Ns, Nrep]
+            testCase.verifyEqual(nz(:,1), single(smap(mask)));
+            testCase.verifyTrue(all(nz == nz(:,1), 'all'));
+            testCase.verifyEqual(out.stage1.settings.rician.ricianSigma, smap(out.stage1.voxelIndex(:)).', 'AbsTol', 0);
+            testCase.verifyTrue(all(isfinite(out.mean.R2star(mask))));
+            g = f; g.likelihood = 'gaussian_ricianmean'; g.ricianSigma = smap;
+            g.prior = struct('hierarchical', struct('params', {{'M0','R2star'}}), 'mrf', struct('tau', 2.5));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            testCase.verifyTrue(all(isfinite(out.mean.noise(mask))));
+        end
+
+        function testNoiseMapThroughWrapper(testCase)
+            % extraData.noiseSigma through gpuR2starMapping (optional 4th argument), one segment and two segments
+            % (NSegmentUser = 2) with a map that differs per slice: every voxel gets its own map value (in the
+            % units of the fitted data: the class divides the data, and so the map, by the 98th percentile of
+            % the first echo); both-set, size and unused-map errors/warnings
+            gacelletest.assumeGPU(testCase);
+            rng(23); gpurng(23);
+            dims = [4 3 4]; Nv = prod(dims);
+            te   = linspace(2e-3, 40e-3, 8); obj = gpuR2starMapping(te);
+            p    = struct('M0', 1 + 0.05*rand(1, Nv), 'R2star', 30 + 10*rand(1, Nv));
+            s    = double(obj.FWD(p));
+            smap = repmat(reshape(0.02*(1:dims(3)), 1, 1, []), dims(1), dims(2));      % differs per slice
+            yv   = abs(s + smap(:).' .* (randn(size(s)) + 1i*randn(size(s))));
+            y    = reshape(yv.', [dims numel(te)]);
+            mask = true(dims);
+            scale = prctile(reshape(y(:,:,:,1), [], 1), 98);        % gpuR2starMapping's data scaling
+            f    = struct('solver','mcmc','algorithm','MH','iteration',200,'thinning',2,'burnin',0.3, ...
+                          'metric',{{'mean'}},'mcmcClass','mcmc_bayes','likelihood','rician');
+            ed   = struct('noiseSigma', smap);
+            for nseg = [1 2]
+                g = f; if nseg == 2; g.NSegmentUser = 2; end
+                out = gpuR2starMapping(te).estimate(y, mask, g, ed);
+                testCase.verifyEqual(double(out.mean.noise) * scale, smap, 'RelTol', 1e-6, sprintf('%d segment(s)', nseg));
+                testCase.verifyTrue(all(isfinite(out.mean.R2star(:))));
+                testCase.verifyFalse(any(strcmp(out.settings.sampledParams, 'noise')));   % fixed noise, not sampled
+            end
+            % both set; wrong size; not mcmc_bayes (warning, map ignored)
+            g = f; g.ricianSigma = 0.05;
+            testCase.verifyError(@() gpuR2starMapping(te).estimate(y, mask, g, ed), 'mcmc_bayes:ricianSigma');
+            testCase.verifyError(@() gpuR2starMapping(te).estimate(y, mask, f, struct('noiseSigma', smap(:,:,1:3))), 'mcmc_bayes:ricianSigma');
+            g = f; g.mcmcClass = 'mcmc'; g = rmfield(g, 'likelihood'); g.iteration = 20;
+            testCase.verifyWarning(@() gpuR2starMapping(te).estimate(y, mask, g, ed), 'mcmc_bayes:noiseSigmaUnused');
+            % a non-positive value inside the mask is an error; outside the mask it is ignored
+            bad = smap; bad(2,2,2) = 0;
+            testCase.verifyError(@() gpuR2starMapping(te).estimate(y, mask, f, struct('noiseSigma', bad)), 'mcmc_bayes:ricianSigma');
+            m2 = mask; m2(2,2,2) = false;
+            out = gpuR2starMapping(te).estimate(y, m2, f, struct('noiseSigma', bad));
+            testCase.verifyTrue(all(isfinite(out.mean.R2star(m2))));
+        end
+
+        function testNoiseMapDwiNormalisation(testCase)
+            % gpumcmicro with full-DWI input (b = 0 plus two shells of 12 directions, S0 map varying per voxel):
+            % the class divides the data by the b = 0 signal, and extraData.noiseSigma (input units) by the same
+            % per-voxel factor: the fixed 'rician' noise == sigma./S0; with spherical-mean (already normalised)
+            % input the map is used as given
+            gacelletest.assumeGPU(testCase);
+            rng(31); gpurng(31);
+            dims = [3 2 2]; Nv = prod(dims);
+            S0   = reshape(500 + 1000*rand(1, Nv), dims);
+            sig  = reshape(10 + 20*rand(1, Nv), dims);                   % noise of one magnitude measurement
+            Ndir = 12; g = randn(3, Ndir); g = g ./ sqrt(sum(g.^2, 1));
+            bval = [0 0 ones(1, Ndir) 2.5*ones(1, Ndir)]; bvec = [[1 0 0; 1 0 0].' g g];
+            n    = [0; 0; 1]; c2 = (n.' * bvec).^2;
+            att  = 0.6*exp(-bval*2.*c2) + 0.4*exp(-bval*0.8);            % [1, Nvol], same fibre in every voxel
+            dwi  = S0 .* reshape(att, 1, 1, 1, []);
+            mask = true(dims);
+            f    = struct('solver','mcmc','algorithm','MH','iteration',100,'thinning',2,'burnin',0.3, ...
+                          'metric',{{'mean'}},'mcmcClass','mcmc_bayes','likelihood','rician');
+            ed   = struct('bval', bval, 'bvec', bvec, 'noiseSigma', sig);
+            out  = gpumcmicro([1 2.5]).estimate(dwi, mask, ed, f);
+            testCase.verifyEqual(nnz(out.mask), Nv);
+            testCase.verifyEqual(double(out.mean.noise), sig ./ S0, 'RelTol', 1e-6, 'noise map / b0 signal');
+            % already normalised (spherical-mean) input: no normalisation by the class, the map is taken as given
+            ysm  = zeros([dims 2]); ysm(:,:,:,1) = mean(att(3:2+Ndir)); ysm(:,:,:,2) = mean(att(3+Ndir:end));
+            out  = gpumcmicro([1 2.5]).estimate(ysm, mask, struct('noiseSigma', sig ./ S0), f);
+            testCase.verifyEqual(double(out.mean.noise), sig ./ S0, 'RelTol', 1e-6, 'pre-normalised input');
+        end
+
+        function testNoiseMapHelpers(testCase)
+            mask = true(2, 3, 4); mask(1,1,1) = false;
+            f    = struct('solver', 'mcmc', 'mcmcClass', 'mcmc_bayes', 'ricianSigma', []);
+            m    = 0.1*ones(2, 3, 4); m(1,1,1) = NaN;
+            g    = mcmc_bayes.noise_map_to_fitting(f, m, mask, 2);
+            testCase.verifyEqual(g.ricianSigma(mask), 0.05*ones(nnz(mask), 1));
+            testCase.verifyEqual(g.ricianSigma(1,1,1), 1);                           % outside the mask: placeholder
+            testCase.verifyTrue(isequal(mcmc_bayes.noise_map_to_fitting(f, [], mask, 2), f));
+            gs   = mcmc_bayes.slice_noise_map(g, 2:3, [2 3 4]);
+            testCase.verifyEqual(gs.ricianSigma, g.ricianSigma(:,:,2:3));
+            testCase.verifyTrue(isequal(mcmc_bayes.slice_noise_map(f, 2:3, [2 3 4]), f));  % no map: unchanged
+            f.ricianSigma = 0.05;
+            testCase.verifyTrue(isequal(mcmc_bayes.slice_noise_map(f, 2:3, [2 3 4]), f));
+            [ed, nm] = mcmc_bayes.take_noise_map(struct('b', 1, 'noiseSigma', m));
+            testCase.verifyEqual(ed, struct('b', 1)); testCase.verifyEqual(nm, m);
+            [ed, nm] = mcmc_bayes.take_noise_map(struct('b', 1));
+            testCase.verifyEqual(ed, struct('b', 1)); testCase.verifyEmpty(nm);
+            [ed, nm] = mcmc_bayes.take_noise_map([]);
+            testCase.verifyEmpty(ed); testCase.verifyEmpty(nm);
+        end
+
+        function testNewPathRicianRuns(testCase, ricianLikelihood)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.ricianR2starGrid();
+            f.likelihood = ricianLikelihood;
+            f.checkCache = true;
+            cfgs = {[], struct('hierarchical', struct('params', {{'M0','R2star'}})), ...
+                    struct('hierarchical', struct('params', {{'M0','R2star'}}, 'K', 2)), ...
+                    struct('hierarchical', struct('params', {{'M0','R2star'}}), 'mrf', struct('tau', 2.5))};
+            for k = 1:numel(cfgs)
+                g = f; g.prior = cfgs{k};
+                g.adaptCovariance = (k == 2);
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5, sprintf('cfg %d', k));
+                if isfield(cc, 'inactiveMoved'); testCase.verifyEqual(cc.inactiveMoved, 0, sprintf('cfg %d', k)); end
+                testCase.verifyEqual(fieldnames(out.posterior), {'M0';'R2star';'noise'});
+                for p = {'M0','R2star','noise'}
+                    testCase.verifyTrue(all(isfinite(out.mean.(p{1})(mask))), sprintf('cfg %d %s', k, p{1}));
+                end
+                testCase.verifyTrue(all(out.mean.noise(mask) > 0));
+                testCase.verifyEqual(out.settings.likelihood, ricianLikelihood);
+                testCase.verifyTrue(isfield(out.settings, 'rician'));
+                if k == 4
+                    testCase.verifyTrue(out.settings.mrf.subsetForward.used);
+                    testCase.verifyEqual(out.stage1.settings.likelihood, ricianLikelihood);
+                end
+            end
+        end
+
+        function testRicianWrappers(testCase)
+            gacelletest.assumeGPU(testCase);
+            % 'rician' through gpuR2starMapping.estimate
+            rng(7); gpurng(7);
+            te  = linspace(2e-3, 40e-3, 8); obj = gpuR2starMapping(te);
+            p   = struct('M0', 1 + 0.05*rand(1, 8), 'R2star', 30 + 10*rand(1, 8));
+            s   = double(obj.FWD(p)); sg = 0.05;
+            y   = permute(abs(s + sg*randn(size(s)) + 1i*sg*randn(size(s))), [2 3 4 1]);
+            mask = true(size(y, 1:3));
+            f   = struct('solver','mcmc','algorithm','MH','iteration',300,'thinning',2,'burnin',0.3, ...
+                         'metric',{{'mean','std'}},'mcmcClass','mcmc_bayes','likelihood','rician');
+            out = gpuR2starMapping(te).estimate(y, mask, f);
+            testCase.verifyEqual(out.settings.likelihood, 'rician');
+            for q = {'M0','R2star','noise'}
+                testCase.verifyTrue(all(isfinite(out.mean.(q{1})(:))), q{1});
+            end
+            % 'gaussian_ricianmean' through gpumcmicro.estimate (b0-normalised spherical means of 20-40 directions)
+            rng(8); gpurng(8);
+            b   = [0.7, 1.5, 3]; Ndir = [20; 30; 40];
+            obj = gpumcmicro(b);
+            p   = struct('f', 0.3 + 0.4*rand(1, 8), 'D', 1.5 + rand(1, 8));
+            s   = double(obj.FWD(p)); sg = 0.05;
+            ysm = zeros(size(s));
+            for kb = 1:numel(b)
+                ysm(kb,:) = mean(abs(s(kb,:) + sg*randn(Ndir(kb), 8) + 1i*sg*randn(Ndir(kb), 8)), 1);
+            end
+            y   = permute(ysm, [2 3 4 1]); mask = true(size(y, 1:3));
+            f   = struct('solver','mcmc','algorithm','MH','iteration',300,'thinning',2,'burnin',0.3, ...
+                         'metric',{{'mean','std'}},'mcmcClass','mcmc_bayes','likelihood','gaussian_ricianmean', ...
+                         'ricianNav', Ndir);
+            out = gpumcmicro(b).estimate(y, mask, [], f);
+            testCase.verifyEqual(out.settings.likelihood, 'gaussian_ricianmean');
+            testCase.verifyEqual(out.settings.rician.ricianNav, Ndir);
+            testCase.verifyTrue(isfield(out.mean, 'noise'));
+            for q = fieldnames(out.mean).'
+                testCase.verifyTrue(all(isfinite(out.mean.(q{1})(:))), q{1});
+            end
+        end
     end
 
     methods (Static)
+        % Phase 9a references (double, CPU): scaled Bessel functions and log I0e = log I0 - z
+        function [r0, r1, rl] = besselRef(z)
+            r0 = besseli(0, z, 1); r1 = besseli(1, z, 1);
+            rl = log(r0);
+            sm = z < 3.75;
+            rl(sm) = McmcBayesUnitTest.logI0Series(z(sm)) - z(sm);
+        end
+
+        % log I0(z) from the power series sum_k (z^2/4)^k/(k!)^2 (double, z < 3.75)
+        function v = logI0Series(z)
+            q = (z/2).^2; term = ones(size(z)); ser = zeros(size(z));
+            for k = 1:60; term = term .* q / k^2; ser = ser + term; end
+            v = log1p(ser);
+        end
+
+        % Rician mean sigma_s sqrt(pi/2) L_{1/2}(-nu^2/(2 sigma_s^2)) with besseli (double)
+        function E = ricianMeanRef(nu, s)
+            t = nu.^2 ./ (4*s.^2);
+            E = s .* sqrt(pi/2) .* ((1 + 2*t) .* besseli(0, t, 1) + 2*t .* besseli(1, t, 1));
+            E(s == 0) = abs(nu(s == 0));
+        end
+
+        % 6 voxels x 10 measurements, nu/sigma from 0 to 1e3 (Rician data), weights incl. zeros,
+        % one y = 0 and negative nu
+        function [y, nu, w, sig] = ricianVoxels()
+            rng(9); Nm = 10;
+            snr = [0 0.5 2 10 100 1000];
+            sig = [0.05 0.02 0.1 0.03 0.01 0.001];
+            nu  = exp(-0.2*(0:Nm-1)).' .* (snr .* sig);
+            w   = 0.3 + 1.2*rand(Nm, 6); w(4,3) = 0; w(7,5) = 0;
+            y   = abs(nu + sig./sqrt(w) .* (randn(Nm, 6) + 1i*randn(Nm, 6)));
+            y(3,2) = 0;
+            nu(:,2) = -nu(:,2);
+        end
+
+        % direct Rician log-density minus log y + log w (the dropped constants), summed over w ~= 0
+        function [ref, S] = ricianLogLRef(y, nu, w, sig)
+            on  = w ~= 0;
+            s2i = sig.^2 ./ w;
+            z   = y .* abs(nu) ./ s2i;
+            lp  = -log(s2i) - (y.^2 + nu.^2) ./ (2*s2i) + log(besseli(0, y.*nu./s2i, 1)) + z - log(w);   % log(p/y) - log w
+            lp(~on) = 0;
+            ref = sum(lp, 1);
+            % scale of the kernel-form terms
+            t   = abs(log(sig.^2)) + w .* (y - abs(nu)).^2 ./ (2*sig.^2) + abs(log(besseli(0, z, 1)));
+            t(~on) = 0;
+            S   = sum(t, 1);
+        end
+
+        % R2* grid with Rician noise (magnitude of complex Gaussian noise), sampled noise
+        function [yy, mask, x0, f, fwd] = ricianR2starGrid()
+            rng(3); dims = [6 5 3]; mask = rand(dims) > 0.15; Nv = nnz(mask);
+            te  = linspace(2e-3, 40e-3, 8); obj = gpuR2starMapping(te);
+            tr  = struct('M0', 1 + 0.05*randn(1, Nv), 'R2star', 30 + 10*rand(1, Nv));
+            s   = double(obj.FWD(tr)); sg = 0.05;
+            yv  = abs(s + sg*randn(size(s)) + 1i*sg*randn(size(s)));
+            y   = zeros(numel(mask), numel(te)); y(mask(:), :) = yv.';
+            yy  = reshape(y, [dims numel(te)]);
+            o   = ones(dims);
+            x0  = struct('M0', o, 'R2star', 30*o, 'noise', 0.05*o);
+            f.modelParams = {'M0';'R2star';'noise'}; f.lb = [0; 0.1; 0.001]; f.ub = [2; 200; 0.5]; f.xStepSize = [0.01; 1; 0.005];
+            f.algorithm = 'MH'; f.iteration = 300; f.burnin = 100; f.thinning = 5; f.metric = {'mean'};
+            f.parameterTransform = {'sigmoid','sigmoid','log'}; f.adaptStepSize = true; f.adaptInterval = 25;
+            fwd = @(p) obj.FWD(p);
+        end
+
         % tiny R2* dataset as in SmokeFit_R2starMappingTest / McmcBayesLegacyTest
         function [y, mask, w, pars0, fitting, obj] = r2starSetup()
             seed = 1; rng(seed); gpurng(seed);
