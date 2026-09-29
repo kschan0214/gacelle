@@ -20,7 +20,7 @@
 %
 % Data: phantom_meax.mat is derived from in vivo data and stays in the development folder (nothing is stored
 %   in the repository). MCMC_BAYES_PHASE6_DIR must point to that folder (default below: Kwok's LOCAL path);
-%   the class gpuMEAxCaliberSMT lives in AxCaliberSMT/sandbox (added to the path below).
+%   the class gpuMEAxCaliberSMT lives in AxCaliberSMT/ (on the path via addpath_gacelle).
 % Sizes: full = 20000 iterations, burn-in 10000 (as Phase 6/7, ~19-24 min per arm on an A40, ~1 h in total).
 %   MCMC_BAYES_T9B_PILOT = 1 runs a pilot (1000 iterations, burn-in 500) that only checks the script.
 %
@@ -40,8 +40,6 @@ devDir  = getenv('MCMC_BAYES_PHASE6_DIR');
 if isempty(devDir)
     devDir = '/autofs/space/virtuoso_001/users/kwokshing/project/gacelle/development/mcmc_bayes_phase6';   % LOCAL path (Kwok)
 end
-repoDir = fileparts(which('addpath_gacelle'));
-addpath(fullfile(repoDir, 'AxCaliberSMT', 'sandbox'));
 
 L  = load(fullfile(devDir, 'phantom_meax.mat'), 'P'); P = L.P; clear L
 pn = {'f','fcsf','DeR','r','R2e'}; m = P.mask; idx = find(m);

@@ -60,6 +60,7 @@ Table of Contents
    :name: sec-supportedmodel
 
    supported_models/AxCaliberSMT
+   supported_models/MEAxCaliberSMT
    supported_models/SANDI
    supported_models/NEXI
    supported_models/mcmicro

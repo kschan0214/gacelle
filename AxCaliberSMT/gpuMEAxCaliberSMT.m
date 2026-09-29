@@ -4,6 +4,10 @@ classdef gpuMEAxCaliberSMT < handle
 % Date created: 29 September 2025
 % Date modified: 13 August 2026
 % Date modified: 4 September 2026
+% Date modified: 29 September 2026 (moved from AxCaliberSMT/sandbox; EXPERIMENTAL)
+%
+% *** EXPERIMENTAL *** Multi-echo AxCaliberSMT. Interface and behaviour may change. Note the argument
+% order estimate(data, mask, fitting, extraData, pars0), which differs from the other model classes.
 
     properties (GetAccess = public, SetAccess = protected)
     % ===== MODEL PARAMETER CONTRACT =====
