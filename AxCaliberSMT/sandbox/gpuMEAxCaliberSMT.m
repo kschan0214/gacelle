@@ -296,6 +296,9 @@ classdef gpuMEAxCaliberSMT < handle
         %   .bvec       : 2D b-table, [3,dwi]                       (Optional, only needed if dwi is full acquisition)
         %   .ldelta     : 1D gradient pulse duration in ms, [1,dwi] (Optional, only needed if dwi is full acquisition)
         %   .BDELTA     : 1D diffusion time in ms, [1,dwi]          (Optional, only needed if dwi is full acquisition)
+        %   .noiseSigma : noise of one magnitude measurement, scalar or [x,y,z] (Optional, mcmc_bayes Rician likelihoods)
+        %   .priorLabels: integer segmentation map [x,y,z]           (Optional, mcmc_bayes with fitting.prior.hierarchical:
+        %                 one population group per label value inside the mask, see mcmc_bayes Phase 9c)
         % fitting   : fitting algorithm parameters (see fit function)
         % 
         % Output
@@ -311,7 +314,7 @@ classdef gpuMEAxCaliberSMT < handle
 
             % get all fitting algorithm parameters 
             fitting     = this.check_set_default(fitting);
-            [extraData, noiseMap] = mcmc_bayes.take_noise_map(extraData);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
+            [extraData, voxelMaps] = mcmc_bayes.take_voxel_maps(extraData);    % extraData.noiseSigma/.priorLabels (mcmc_bayes per-voxel inputs), not seen by FWD
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % compute rotationally invariant signal if needed
@@ -329,7 +332,7 @@ classdef gpuMEAxCaliberSMT < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
-            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, normMap);   % -> fitting.ricianSigma, fitted-data units
+            fitting = mcmc_bayes.voxel_maps_to_fitting(fitting, voxelMaps, mask, normMap);   % -> fitting.ricianSigma (fitted-data units), fitting.prior.hierarchical.labels
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, pars0);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -354,7 +357,7 @@ classdef gpuMEAxCaliberSMT < handle
                 [dataSeg, maskSeg, pars0Seg]    = this.slice_segment(data, mask, fitRange, pars0);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)),pars0Seg);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_voxel_maps(fitting, fitRange, size(mask,1:3)),pars0Seg);
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's

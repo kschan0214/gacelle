@@ -109,9 +109,18 @@ A structure, or ``true`` for all defaults.
    * - ``.nu``
      - ``4``
      - degrees of freedom of ``'t'`` (positive, fixed; only with ``distribution = 't'``)
+   * - ``.labels``
+     - ``[]``
+     - fixed segmentation labels: an integer map with the spatial size of ``mask`` (or ``[1, Nvoxel]``, mask order). Every distinct value inside the mask (``0`` included) is one group with its own ``N(mu_k, Sigma_k)``, learned from its voxels only (or fixed: ``.mu [d,K]``, ``.Sigma [d,d,K]``); ``K`` is implied (do not set another ``.K``); no ``.pi``, not with ``'t'``; ``'jeffreys_half'`` needs more than ``2d-1`` voxels per group. Model classes fill it from ``extraData.priorLabels`` (not rescaled, sliced per GPU segment)
+   * - ``.labelValues``
+     - ``[]``
+     - the label value of each group, strictly increasing ``[1,K]``; ``[]`` = the sorted distinct labels inside the mask. Group ``k`` <-> ``labelValues(k)`` (also ``out.hyper.labels``)
    * - ``.subsetFraction``
      - ``1``
-     - fraction of voxels for stage 1 (two-stage / ``estimate_hyper_subset`` only)
+     - fraction of voxels for stage 1 (two-stage / ``estimate_hyper_subset`` only; with labels drawn per group, at least ``min(n_k, max(10, 2d))`` voxels of each)
+   * - ``.stage1RhatMax``
+     - ``1.1``
+     - two-stage only: stage 2 runs if the largest stage-1 split-R-hat of ``mu`` (and ``pi`` for a mixture) is at most this value, else error ``mcmc_bayes:stage1NotConverged``; ``Inf`` = no check
    * - ``.maxGPUMemory``
      - ``[]``
      - bytes available for the coupled run; ``[]`` = available GPU memory
@@ -136,7 +145,7 @@ A structure, or ``true`` for all defaults. Requires ``fitting.prior.hierarchical
      - temperature (coupling strength ``1/tau``)
    * - ``.W``
      - ``[]``
-     - per-parameter weights ``[d,1]``; ``[]`` = ``1./sqrt(diag(Sigma))`` (``K > 1``: of the mixture's marginal covariance; ``'t'``: of the scale matrix)
+     - per-parameter weights ``[d,1]``; ``[]`` = ``1./sqrt(diag(Sigma))`` (``K > 1``: of the mixture's marginal covariance; ``'t'``: of the scale matrix; labels: of the pooled covariance of the groups, weights ``n_k/n``)
    * - ``.huberDelta``
      - ``1``
      - Huber threshold in units of ``sqrt(Sigma_pp)`` (``'huber'`` only)
@@ -173,7 +182,7 @@ Output
    * - ``out.diagnostics``
      - ``.acceptance``, ``.stepSize``, ``.rhat``, ``.ess``, ``.adaptCovariance`` (see :ref:`mcmc-sampler-options`)
    * - ``out.hyper``
-     - hierarchical prior: ``.params``, ``.transform``, ``.posterior.mu``/``.Sigma`` (``.pi``), ``.mean``, ``.median``, ``.ess``, ``.rhat``; ``K > 1``: ``.membership [x,y,z,K]``, ``.mapLabel [x,y,z]``; ``'t'``: ``.distribution``, ``.nu``, ``.lambda [x,y,z]`` (posterior mean of the per-voxel scale weight)
+     - hierarchical prior: ``.params``, ``.transform``, ``.posterior.mu``/``.Sigma`` (``.pi``), ``.mean``, ``.median``, ``.ess``, ``.rhat``; ``K > 1``: ``.membership [x,y,z,K]``, ``.mapLabel [x,y,z]``; ``'t'``: ``.distribution``, ``.nu``, ``.lambda [x,y,z]`` (posterior mean of the per-voxel scale weight); labels: ``.K``, ``.labels`` (label value of each group), ``.groupSize [K,1]``, ``mu [d,K]``, ``Sigma [d,d,K]`` per group (no ``.pi`` / ``.membership``)
    * - ``out.settings``
      - resolved options (``.likelihood``, ``.prior``, ``.mrf``, ``.nuisance``, RNG states, ...); ``.rician`` (log-likelihood form, resolved ``ricianNav`` / ``ricianSigma``) for ``'rician'`` and ``'gaussian_ricianmean'``
 
@@ -192,6 +201,14 @@ Errors
      - a hierarchical parameter whose transform does not map to the whole real line
    * - ``mcmc_bayes:hierarchicalStudentT``
      - ``prior.hierarchical.distribution`` not ``'normal'`` / ``'t'``; ``.nu`` not a positive finite scalar or set without ``'t'``; ``'t'`` with ``K > 1``
+   * - ``mcmc_bayes:hierarchicalLabels``
+     - ``prior.hierarchical.labels`` not integer-valued and finite inside the mask, of the wrong size, or with a label that is not in ``.labelValues``; ``.labelValues`` not strictly increasing or set without labels; ``.K`` different from the number of groups; with ``.pi`` or ``distribution = 't'``; ``'jeffreys_half'`` with a group of at most ``2d-1`` voxels; (model classes) ``extraData.priorLabels`` without ``fitting.prior.hierarchical``, together with ``prior.hierarchical.labels``, or not of the spatial size of the mask
+   * - ``mcmc_bayes:hierarchicalLabelsEmpty`` (warning)
+     - free labelled prior with a group that has no voxel in this call (only with a user ``.labelValues``): its ``mu_k, Sigma_k`` are drawn from the hyperprior
+   * - ``mcmc_bayes:priorLabelsUnused`` (warning)
+     - (model classes) ``extraData.priorLabels`` without ``fitting.mcmcClass = 'mcmc_bayes'``: ignored
+   * - ``mcmc_bayes:stage1NotConverged``
+     - (two-stage) the stage-1 population prior has not converged: max R-hat of ``mu`` (mixture: also ``pi``) above ``prior.hierarchical.stage1RhatMax``, see :ref:`api-mcmc_bayes-run_two_stage`
    * - ``mcmc_bayes:hierarchicalMemory``, ``mcmc_bayes:mrfMemory``
      - the coupled run does not fit in GPU memory
    * - ``mcmc_bayes:ricianOption``, ``mcmc_bayes:ricianNav``, ``mcmc_bayes:ricianSigma``

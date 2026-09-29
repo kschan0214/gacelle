@@ -23,7 +23,7 @@ Usage
 I/O overview
 ------------
 
-Inputs as :ref:`api-mcmc_bayes-optimisation`. ``fitting.prior.hierarchical`` must be set and not fixed; ``.subsetFraction`` in ``(0, 1]`` is the fraction of masked voxels used (at least ``min(Nmask, 10)``). The subset is drawn with the global random stream. ``varargin`` is passed unchanged, so it must not contain inputs with a voxel dimension.
+Inputs as :ref:`api-mcmc_bayes-optimisation`. ``fitting.prior.hierarchical`` must be set and not fixed; ``.subsetFraction`` in ``(0, 1]`` is the fraction of masked voxels used (at least ``min(Nmask, 10)``). The subset is drawn with the global random stream. With segmentation labels (``prior.hierarchical.labels``) it is drawn per label group, ``min(n_k, max(ceil(subsetFraction*n_k), 10, 2d))`` voxels of each, and ``fittingFixed`` keeps the labels of the whole volume with ``.labelValues`` of the groups. ``varargin`` is passed unchanged, so it must not contain inputs with a voxel dimension.
 
 .. list-table::
    :widths: 25 75
