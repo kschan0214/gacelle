@@ -41,7 +41,7 @@ BDELTA  = readmatrix(fullfile(preproc_dir,'sub-01','sub-01_preprocessed.diffusio
 bval    = bval/1e3; % convert s/mm2 to ms/um2
 
 %% slab of slices (see Notes)
-slab    = round(size(mask,3)/2) + (-4:3);
+slab    = round(size(mask,3)/2) + (-4:13);
 dwi     = dwi(:,:,slab,:);
 mask    = mask(:,:,slab);
 
@@ -78,7 +78,7 @@ fitting.likelihood          = 'marginal_noise';            % noise integrated ou
 % hierarchical prior: all tissue parameters; it made the axon diameter a identifiable
 % in our semi-synthetic tests
 fitting.prior               = [];
-fitting.prior.hierarchical  = struct('params', {{'a','f','fcsf','DeR'}}, 'K', 1);
+fitting.prior.hierarchical  = struct('params', {{'a','f','fcsf','DeR'}}, 'K', 2);
 % K = 2 gives a two-group (mixture) population prior if the tissue is heterogeneous (e.g. CSF
 % partial volume)
 
