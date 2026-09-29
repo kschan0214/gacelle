@@ -93,7 +93,7 @@ classdef McmcBayesLegacyTest < matlab.unittest.TestCase
         end
 
         function testMEAxCaliberSMTWrapperHookBitwise(testCase)
-            % gpuMEAxCaliberSMT (sandbox) with fitting.mcmcClass = 'mcmc_bayes' (and no new option)
+            % gpuMEAxCaliberSMT with fitting.mcmcClass = 'mcmc_bayes' (and no new option)
             % must be bitwise identical to the default hook ('mcmc')
             gacelletest.assumeGPU(testCase);
             [y, mask, obj] = McmcBayesLegacyTest.meaxcaliberData();
@@ -145,8 +145,7 @@ classdef McmcBayesLegacyTest < matlab.unittest.TestCase
 
     methods (Static)
         function [y, mask, obj] = meaxcaliberData()
-            % small synthetic two-TE spherical-mean data for the sandbox gpuMEAxCaliberSMT
-            addpath(fullfile(fileparts(fileparts(mfilename('fullpath'))), 'AxCaliberSMT', 'sandbox'));
+            % small synthetic two-TE spherical-mean data for gpuMEAxCaliberSMT
             rng(1); gpurng(1);
             b0 = [0 0.35 1.5 3.45 6]; b = [b0 b0]; d = 6*ones(size(b)); D = 13*ones(size(b)); te = [0.051*ones(size(b0)) 0.092*ones(size(b0))];
             obj  = @() gpuMEAxCaliberSMT(b, d, D, te, [], []);

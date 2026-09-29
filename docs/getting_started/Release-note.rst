@@ -28,6 +28,7 @@ MCMC solver
 New model
 ^^^^^^^^^
 * ``gpuIVIM``: bi-exponential intravoxel incoherent motion model (:ref:`supportedmodels-ivim`).
+* ``gpuMEAxCaliberSMT`` (experimental) moved from ``AxCaliberSMT/sandbox/`` to ``AxCaliberSMT/``: multi-echo AxCaliberSMT, now on the path via ``addpath_gacelle`` (:ref:`supportedmodels-meaxcalibersmt`).
 
 Fixes
 ^^^^^

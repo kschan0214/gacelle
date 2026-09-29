@@ -17,6 +17,7 @@ GACELLE provides two types of solvers to handle parameter estimation prolem:
 | Model (class) | Estimates | Data |
 |---|---|---|
 | [AxCaliberSMT](https://gacelle.readthedocs.io/en/latest/supported_models/AxCaliberSMT.html) (`gpuAxCaliberSMT`) | Orientation-invariant axon diameter index | Multi-shell diffusion MRI |
+| [ME-AxCaliberSMT](https://gacelle.readthedocs.io/en/latest/supported_models/MEAxCaliberSMT.html) (`gpuMEAxCaliberSMT`, experimental) | Axon radius with compartmental R2 | Multi-shell, multi-echo diffusion MRI |
 | [SANDI](https://gacelle.readthedocs.io/en/latest/supported_models/SANDI.html) (`gpuSANDI`) | Soma radius/fraction, neurite density, extracellular diffusivity | Multi-shell diffusion MRI |
 | [NEXI](https://gacelle.readthedocs.io/en/latest/supported_models/NEXI.html) (`gpuNEXI`) | Neurite volume fraction, compartment diffusivities, inter-compartment exchange rate | Multi-shell, multi-diffusion-time diffusion MRI |
 | [mcmicro](https://gacelle.readthedocs.io/en/latest/supported_models/mcmicro.html) (`gpumcmicro`) | Neurite volume fraction and intrinsic diffusivity (± compartmental R2) | Multi-shell (± multi-echo) diffusion MRI |
