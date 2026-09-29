@@ -118,6 +118,19 @@ T9b.1 and T9b.2 need the development data (not in the repository):
 and `phantom_meax.mat` (default: Kwok's local path). `MCMC_BAYES_T9B_PILOT=1`
 runs them with short chains (script check only).
 
+Phase 9c scripts (fixed segmentation labels, `prior.hierarchical.labels`; GPU):
+
+- `test_T9c_0_labels_exact.m` (pass/fail): linear Gaussian toy (d = 2) with
+  two FIXED label groups (labels 3 and 8), 40 voxels (6 per group with data of
+  the other group), 64 chains per voxel: posterior quantiles vs the exact
+  Gaussian posterior of the voxel's group, between-chain MC error; criteria as
+  T3.1. ~1 min on an A40.
+- `test_T9c_1_labels_r2star.m` (characterisation): R2* phantom of Phase 6a/7/9b
+  (12 echoes, SNR 10); K = 1 Normal vs K = 2 vs t vs the phantom's own tissue
+  labels (`extraData.priorLabels`): per-label RMSE/bias/coverage, hyper R-hat,
+  population mean/SD per label group. Needs `MCMC_BAYES_PHASE6_DIR` (as T9b.1);
+  `MCMC_BAYES_T9C_PILOT=1` runs it with short chains (script check only).
+
 Shared helpers:
 
 - `lingauss_fwd.m`: linear toy forward model `s = A*[u1;...;ud]`.

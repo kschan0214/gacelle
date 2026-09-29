@@ -23,7 +23,7 @@ The priors help most when a parameter is weakly determined by the data of a sing
 * **Multi-compartment diffusion (SANDI)**: RMSE of Rs, fs, f and De dropped by 34-57%.
 * **IVIM**: on the numerical phantom of Spinner et al., the hierarchical prior matched their BSP in white and grey matter.
 
-They can also **shrink atypical tissue towards the population**: iron-rich deep grey matter in R2* maps, CSF partial volume, or lesions. A two-group mixture prior (``K = 2``, see `Mixture prior`_) largely fixes this for tissue that forms its own group. For well-determined parameters (e.g. R2* from many echoes at high SNR) the priors change little.
+They can also **shrink atypical tissue towards the population**: iron-rich deep grey matter in R2* maps, CSF partial volume, or lesions. A two-group mixture prior (``K = 2``, see `Mixture prior`_) largely fixes this for tissue that forms its own group, and a segmentation can give each tissue or tract its own population (see `Segmentation labels`_). For well-determined parameters (e.g. R2* from many echoes at high SNR) the priors change little.
 
 Quick start with a model class
 ------------------------------
@@ -194,6 +194,9 @@ Hierarchical prior (BSP)
    * - ``.distribution``, ``.nu``
      - ``'normal'``, ``4``
      - ``'t'``: heavy-tailed Student-t population prior with ``nu`` degrees of freedom, see `Student-t prior`_
+   * - ``.labels``, ``.labelValues``
+     - ``[]``
+     - fixed segmentation labels: one population per label value, see `Segmentation labels`_ (model classes: ``extraData.priorLabels``)
    * - ``.fixed``
      - ``false``
      - ``true``: use the given ``.mu`` and ``.Sigma`` (and ``.pi`` for ``K > 1``) instead of learning them; voxels are then independent and can be segmented
@@ -206,6 +209,9 @@ Hierarchical prior (BSP)
    * - ``.subsetFraction``
      - ``1``
      - fraction of voxels used to learn the population prior (stage 1 of the two-stage scheme only)
+   * - ``.stage1RhatMax``
+     - ``1.1``
+     - two-stage scheme only: largest stage-1 R-hat of :math:`\mu` (and :math:`\pi` for ``K > 1``) for which stage 2 runs, see `Spatial prior (BSP + MRF)`_; ``Inf`` = no check
 
 The hierarchical parameters must use a transform that maps to the whole real line: ``'sigmoid'`` (recommended), ``'log'`` with ``lb = 0`` and ``ub = Inf``, or ``'linear'`` with infinite bounds.
 
@@ -238,6 +244,35 @@ How it differs from a mixture (``K = 2``):
 ``nu`` sets the tail weight: small ``nu`` (2-4) discounts outlying voxels strongly, ``nu`` of 30 or more is close to the Normal prior. The prior is sampled as a scale mixture: each voxel has a weight :math:`\lambda_i` (prior mean 1) with :math:`u_i \mid \lambda_i \sim N(\mu, \Sigma/\lambda_i)`, sampled exactly after every sweep, and :math:`\mu, \Sigma` are updated from the :math:`\lambda`-weighted statistics (both hyperpriors). With ``fixed = true`` (and in stage 2 of the two-stage scheme) the Student-t density is used directly.
 
 The output adds ``out.hyper.lambda`` (``[x,y,z]``), the posterior mean of :math:`\lambda_i`. Voxels the prior treats as outliers have :math:`\lambda_i` well below 1 (their prior precision is scaled down by :math:`\lambda_i`); typical voxels are near or slightly above 1. ``out.hyper.Sigma`` is the scale matrix; the population covariance is :math:`\nu/(\nu-2)\,\Sigma` for :math:`\nu > 2`. The default MRF weights use the scale matrix. ``distribution = 't'`` requires ``K = 1``.
+
+Segmentation labels
+^^^^^^^^^^^^^^^^^^^
+
+If a segmentation is available, ``prior.hierarchical.labels`` gives every labelled tissue its **own** population prior :math:`u_i \sim N(\mu_k, \Sigma_k)`, where :math:`k` is the (fixed) label of voxel :math:`i`. Each :math:`(\mu_k, \Sigma_k)` is learned from the voxels of its label only. Use it when the tissue types or tracts are known and differ systematically, for example:
+
+* a tract-specific prior: the corticospinal tract (larger axons) as its own group inside the rest of the white matter, with grey matter and CSF as further groups, so that the tract is not pulled towards the white-matter population;
+* deep grey-matter nuclei with their own R2* population.
+
+With a model class, pass the label map in ``extraData`` (like a noise map, it is taken out of ``extraData`` before the forward model, not rescaled, and sliced with the data for each GPU segment):
+
+.. code-block:: matlab
+
+    % labels: integer map [x,y,z], e.g. 1 = CST, 2 = other WM, 3 = GM, 4 = CSF
+    fitting.prior.hierarchical = struct('params', {{'a','f','fcsf','DeR'}});
+    extraData.priorLabels      = labels;
+    out = objGPU.estimate(dwi, mask, extraData, fitting);
+
+Rules:
+
+* Every distinct label value **inside the mask** is one group, including ``0``: a voxel with label 0 inside the mask belongs to the group "0" (it is not ignored). Remove unwanted voxels from the mask instead. Labels must be integer-valued and finite inside the mask; values outside the mask are never read.
+* Groups are in ascending order of the label value. ``out.hyper.labels`` lists the label value of each group, so group ``k`` (column ``k`` of ``out.hyper.mean.mu``, page ``k`` of ``.Sigma``) belongs to the label ``out.hyper.labels(k)``. With ``fixed = true``, give ``.mu`` (``[d,K]``) and ``.Sigma`` (``[d,d,K]``) in this order; ``.labelValues`` fixes the list of groups explicitly (strictly increasing).
+* The number of groups is implied by the labels; do not set ``K`` (an error if it differs). There are no group weights and no ``membership`` output: the group of every voxel is known.
+* Both hyperpriors are allowed. ``'jeffreys_half'`` needs more than :math:`2d-1` voxels in every group (:math:`d` = number of hierarchical parameters); use ``'niw'`` (the default, proper for any group size) for small groups. Not with ``distribution = 't'``.
+* With the spatial prior (two-stage), stage 1 learns :math:`(\mu_k, \Sigma_k)` for every label and stage 2 fixes them. The default MRF weight uses the pooled covariance of all groups (each weighted by its number of voxels), so there is one smoothing strength per parameter across the whole image.
+* A small group (a few tens of voxels) gets a correspondingly uncertain population; check ``out.hyper.rhat`` and ``out.hyper.groupSize``. With ``subsetFraction < 1``, stage 1 samples each group separately and keeps at least 10 voxels of every group.
+* ``extraData.priorLabels`` needs ``fitting.prior.hierarchical`` and ``fitting.mcmcClass = 'mcmc_bayes'`` (otherwise it is ignored with the warning ``mcmc_bayes:priorLabelsUnused``). With direct calls of ``mcmc_bayes``, give the map (spatial size of the mask, or one value per masked voxel) in ``prior.hierarchical.labels``.
+
+Labels versus a learned mixture: a learned ``K = 2`` mixture decides the groups from the data and can be multimodal. In an in vivo multi-echo AxCaliberSMT slab, different chains of a learned ``K = 2`` prior split the voxels differently (CSF versus tissue in some chains, grey versus white matter in others), so the population prior did not converge. Fixed labels cannot switch in this way; the price is that the segmentation must be right. For a small atypical minority without a segmentation, the Student-t prior is the alternative.
 
 Spatial prior (BSP + MRF)
 -------------------------
@@ -283,6 +318,8 @@ When ``prior.hierarchical`` is free and ``prior.mrf`` is set, the fit runs **two
 
 The uncertainty of :math:`\mu, \Sigma` is not propagated to stage 2. A stage-1 summary is returned in ``out.stage1``.
 
+**Convergence check between the stages.** Stage 2 fixes the stage-1 *posterior means*. If the stage-1 chains sit in different modes, for example a learned ``K = 2`` mixture that splits the voxels differently in different chains, that mean averages over the modes and is not the population of any of them. ``run_two_stage`` therefore stops with the error ``mcmc_bayes:stage1NotConverged`` if the largest stage-1 R-hat of :math:`\mu` (and of :math:`\pi` for a mixture) exceeds ``prior.hierarchical.stage1RhatMax`` (default 1.1). Run stage 1 longer, use segmentation labels instead of a learned mixture, or set ``stage1RhatMax = Inf`` to run stage 2 anyway. With a single chain (``repetition = 1``) there is no R-hat: the warning ``mcmc_bayes:stage1NoRhat`` is shown and stage 2 runs.
+
 .. note::
    There is no principled rule for choosing ``tau`` yet. In our semi-synthetic tests ``tau = 1`` over-smoothed (AxCaliberSMT, R2*), ``tau = 2.5-3`` kept the edges and gave a moderate gain over the hierarchical prior alone, and ``tau >= 10`` had almost no effect. The spatial prior also pulls voxels at tissue boundaries (e.g. next to CSF) towards their neighbours, which can reduce credible-interval coverage there.
 
@@ -323,7 +360,7 @@ In addition to the usual MCMC output (``out.posterior``, ``out.median``, ...; se
    * - Field
      - Description
    * - ``out.hyper``
-     - population prior: ``.params``, ``.transform``, ``.posterior.mu`` / ``.Sigma`` (samples), ``.mean`` / ``.median``, ``.ess``, ``.rhat``; ``K > 1``: also ``.pi``, ``.membership``, ``.mapLabel``; ``'t'``: also ``.distribution``, ``.nu``, ``.lambda``
+     - population prior: ``.params``, ``.transform``, ``.posterior.mu`` / ``.Sigma`` (samples), ``.mean`` / ``.median``, ``.ess``, ``.rhat``; ``K > 1``: also ``.pi``, ``.membership``, ``.mapLabel``; ``'t'``: also ``.distribution``, ``.nu``, ``.lambda``; labels: ``.K``, ``.labels`` (the label value of each group), ``.groupSize``, with ``mu`` ``[d,K]`` and ``Sigma`` ``[d,d,K]`` per group
    * - ``out.diagnostics``
      - as in :ref:`mcmc-sampler-options`
    * - ``out.settings``

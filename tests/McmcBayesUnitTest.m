@@ -171,6 +171,32 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     inactive voxels never move; fixed-mode lambda map == mean of (nu+d)/(nu+delta) over kept samples (1e-6);
     %     two-stage: stage 2 fixed t, W = 1/sqrt(diag(SigmaHat)); short exact toy (1D, fixed t, 12 voxels x 32
     %     chains): quantile z (between-chain SE) frac(|z| > 1.96) <= 0.15, max|z| <= 4.5
+    %   Phase 9c (fixed segmentation labels, prior.hierarchical.labels; per-voxel map helpers; two-stage safeguard):
+    %   resolve_labels / mask_labels: group index, ascending label values (label 0 is a group), group sizes, user
+    %     labelValues incl. an empty group: exact; errors (non-integer, NaN/Inf, labelValues not increasing, a label
+    %     not in labelValues, wrong map size, complex); option errors (K conflict, 't', pi, jeffreys_half with a group
+    %     of <= 2d-1 voxels in free mode), fixed mu [d,K]/Sigma [d,d,K]; MRF W and Huber delta from the pooled
+    %     covariance with pi_k = n_k/n: RelTol 1e-12
+    %   labels_init vs per-group mean/var of that group's voxels: RelTol 1e-12; hyper_suffstats_groups with the labels
+    %     (single input, GPU if available) vs direct: RelTol 1e-10; logprior_labels vs a per-voxel loop (double):
+    %     AbsTol 1e-10, GPU single: relative 1e-5
+    %   safeguard: synthetic out.hyper (mu R-hat 1.2 > 1.1, pi 1.3, NaN -> error; Inf -> no check; no R-hat -> warning);
+    %     GPU: 2 over-dispersed chains of 60 iterations (stage-1 R-hat > 1.1) -> error (run_two_stage and the optimisation
+    %     dispatch), stage1RhatMax = Inf runs; repetition 1 -> warning, stage 2 runs
+    %   GPU runs (mixGrid, labels 0/7, joint and componentwise, checkCache): free niw, free jeffreys_half, fixed, fixed +
+    %     MRF (subsetForward on/off): caches <= 1e-5, inactive voxels never move; outputs (labels, groupSize, no pi or
+    %     membership); free niw: every kept mu_k standardised by its exact conditional N(m_n, Sigma_k/kappa_n) from the
+    %     voxels of group k only: |mean z| <= 5/sqrt(N), |var z - 1| <= 5 sqrt(2/(N-1)); the same z with the statistics of
+    %     all voxels: mean |z| > 10 (discriminative); label order (tight fixed priors, group means within 0.05 of mu_k);
+    %     two-stage (W from the pooled covariance), stratified estimate_hyper_subset (exact group counts), no kept samples,
+    %     an empty user group (warning)
+    %   short exact toy (d = 2, fixed labels 3/8, 12 voxels incl. 4 with data of the other group, 32 chains x 6000
+    %     iterations): quantile z vs the exact Gaussian posterior, frac(|z| > 1.96) <= 0.15, max|z| <= 4.5
+    %     (full test: test_T9c_0_labels_exact.m)
+    %   helpers take_voxel_maps / voxel_maps_to_fitting / slice_voxel_maps: noise map identical to the Phase 9a helpers
+    %     (isequaln), labels not rescaled, labelValues on the mask, round-robin filler outside, slicing; errors/warning
+    %   wrapper (gpuR2starMapping, extraData.priorLabels, fixed tight per-label priors, 1 and 2 segments with one label
+    %     absent from segment 2): mean R2star per label == its prior value within 2 s^-1
     %
     % Kwok-Shing Chan @ MGH
 
@@ -1785,8 +1811,10 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             mb   = reshape(out.hyper.membership, [], 2);
             testCase.verifyEqual(mb(mask(:),:), Mref, 'AbsTol', 1e-9);
             testCase.verifyEqual(out.settings.prior.hierarchical.zStep(1:4), 'none');
-            % two-stage through the optimisation dispatch: stage 2 fixes the ordered stage-1 means
-            g = f; g.prior.mrf = struct('potential', 'huber', 'tau', 2);
+            % two-stage through the optimisation dispatch: stage 2 fixes the ordered stage-1 means. Phase 9c: these short
+            % chains (300 iterations) leave the stage-1 mixture unconverged (max R-hat 1.16 in the suite), so the two-stage
+            % safeguard (tested in testStage1Safeguard) is switched off to test the stage-2 mechanics
+            g = f; g.prior.mrf = struct('potential', 'huber', 'tau', 2); g.prior.hierarchical.stage1RhatMax = Inf;
             out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
             eb  = out.settings.empiricalBayes;
             testCase.verifyEqual(eb.muHat, out.stage1.hyper.mean.mu); testCase.verifyEqual(eb.piHat, out.stage1.hyper.mean.pi);
@@ -2534,6 +2562,407 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             for q = fieldnames(out.mean).'
                 testCase.verifyTrue(all(isfinite(out.mean.(q{1})(:))), q{1});
             end
+        end
+
+        %% Phase 9c: fixed segmentation labels, per-voxel map helpers, two-stage safeguard
+        function testLabelsResolveAndMask(testCase)
+            % group index, label values (label 0 is a group; ascending order), group sizes, errors
+            lab = [3 0 7 0 3 3];
+            [z, lv, n] = mcmc_bayes.resolve_labels(lab, []);
+            testCase.verifyEqual(lv, [0 3 7]); testCase.verifyEqual(z, [2 1 3 1 2 2]); testCase.verifyEqual(n, [2; 3; 1]);
+            [z, lv, n] = mcmc_bayes.resolve_labels(int16(lab.'), [0 3 5 7]);            % any class, user values (a group without voxels)
+            testCase.verifyEqual(lv, [0 3 5 7]); testCase.verifyEqual(z, [2 1 4 1 2 2]); testCase.verifyEqual(n, [2; 3; 0; 1]);
+            [~, lv] = mcmc_bayes.resolve_labels(logical([1 0 1]), []);
+            testCase.verifyEqual(lv, [0 1]);
+            id = 'mcmc_bayes:hierarchicalLabels';
+            testCase.verifyError(@() mcmc_bayes.resolve_labels([1 2.5], []), id);          % non-integer
+            testCase.verifyError(@() mcmc_bayes.resolve_labels([1 NaN], []), id);
+            testCase.verifyError(@() mcmc_bayes.resolve_labels([1 Inf], []), id);
+            testCase.verifyError(@() mcmc_bayes.resolve_labels(lab, [3 0 7]), id);         % not increasing
+            testCase.verifyError(@() mcmc_bayes.resolve_labels(lab, [0 3 3 7]), id);
+            testCase.verifyError(@() mcmc_bayes.resolve_labels(lab, [0 3]), id);           % label 7 not a group
+            testCase.verifyError(@() mcmc_bayes.resolve_labels(lab, [0 3.5 7]), id);
+            % masking: a map of the mask size or one value per masked voxel -> [1,Nv] in mask order
+            mask = true(2, 3, 2); mask(1,2,1) = false; mask(2,3,2) = false; idx = find(mask);
+            L    = reshape(1:12, 2, 3, 2); L(~mask) = NaN;                                 % outside the mask never read
+            h    = mcmc_bayes.mask_labels(struct('labels', L), mask, idx);
+            testCase.verifyEqual(h.labels, reshape(L(mask), 1, []));
+            h    = mcmc_bayes.mask_labels(struct('labels', L(mask)), mask, idx);
+            testCase.verifyEqual(h.labels, reshape(L(mask), 1, []));
+            testCase.verifyError(@() mcmc_bayes.mask_labels(struct('labels', L(:,:,1)), mask, idx), id);
+            testCase.verifyError(@() mcmc_bayes.mask_labels(struct('labels', 1i*L), mask, idx), id);
+            testCase.verifyError(@() mcmc_bayes.mask_labels(struct('labels', {{1}}), mask, idx), id);
+            testCase.verifyTrue(mcmc_bayes.has_labels(struct('prior', struct('hierarchical', struct('labels', 1)))));
+            testCase.verifyFalse(mcmc_bayes.has_labels(struct('prior', struct('hierarchical', struct()))));
+            testCase.verifyFalse(mcmc_bayes.has_labels(struct('prior', struct('hierarchical', true))));
+        end
+
+        function testLabelsOptionErrors(testCase)
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 1]; f.xStepSize = [0.1; 0.1; 0.01];
+            setup = @(h) mcmc_bayes.setup_hierarchical(setfield(f, 'prior', struct('hierarchical', h))); %#ok<SFLD>
+            lab = [0 0 0 0 0 1 1 1 1 1 1 5];                                               % n_k = [5 6 1], d = 2
+            h = setup(struct('labels', lab));
+            testCase.verifyEqual({h.K, h.labelValues, h.groupSize, h.labels}, {3, [0 1 5], [5; 6; 1], [1 1 1 1 1 2 2 2 2 2 2 3]});
+            testCase.verifyEmpty(h.pi);
+            h = setup(struct('labels', lab, 'K', 3));                                      % K may equal the # groups
+            testCase.verifyEqual(h.K, 3);
+            h0 = setup(struct());
+            testCase.verifyEqual({h0.labels, h0.labelValues, h0.groupSize, h0.stage1RhatMax}, {[], [], [], 1.1});
+            id = 'mcmc_bayes:hierarchicalLabels';
+            testCase.verifyError(@() setup(struct('labels', lab, 'K', 2)), id);             % K conflict
+            testCase.verifyError(@() setup(struct('labels', lab, 'distribution', 't')), id);
+            testCase.verifyError(@() setup(struct('labels', lab, 'pi', [0.2 0.3 0.5])), id);
+            testCase.verifyError(@() setup(struct('labelValues', [0 1])), id);              % labelValues without labels
+            testCase.verifyError(@() setup(struct('labels', [0 1.5])), id);
+            % jeffreys_half: every group needs n_k > 2d-1 = 3 in free mode; fixed mode has no such condition
+            testCase.verifyError(@() setup(struct('labels', lab, 'hyperprior', 'jeffreys_half')), id);
+            h = setup(struct('labels', [lab(1:11) 1 5 5 5 5], 'hyperprior', 'jeffreys_half'));   % n_k = [5 7 4]
+            testCase.verifyEqual(h.groupSize, [5; 7; 4]);
+            M = [0 1 2; 0 -1 1]; S = cat(3, eye(2), 2*eye(2), [1 0.2; 0.2 0.5]);
+            h = setup(struct('labels', lab, 'hyperprior', 'jeffreys_half', 'fixed', true, 'mu', M, 'Sigma', S));
+            testCase.verifyEqual(h.mu, M); testCase.verifyEqual(h.Sigma, S);
+            % fixed mode: mu [d,K], Sigma [d,d,K] in label order; K = 1 accepts a vector mu
+            idF = 'mcmc_bayes:hierarchicalFixed';
+            testCase.verifyError(@() setup(struct('labels', lab, 'fixed', true, 'mu', M(:,1:2), 'Sigma', S)), idF);
+            testCase.verifyError(@() setup(struct('labels', lab, 'fixed', true, 'mu', M, 'Sigma', S(:,:,1:2))), idF);
+            testCase.verifyError(@() setup(struct('labels', lab, 'fixed', true, 'mu', M, 'Sigma', cat(3, S(:,:,1:2), -eye(2)))), idF);
+            h = setup(struct('labels', 4*ones(1,5), 'fixed', true, 'mu', [1 2], 'Sigma', eye(2)));
+            testCase.verifyEqual({h.K, h.mu, h.labelValues}, {1, [1; 2], 4});
+            % stage1RhatMax: a scalar >= 1 (Inf allowed)
+            testCase.verifyEqual(setup(struct('stage1RhatMax', Inf)).stage1RhatMax, Inf);
+            for bad = {0.9, NaN, 'a', [1.1 1.2], 1i}
+                testCase.verifyError(@() setup(struct('stage1RhatMax', bad{1})), 'mcmc_bayes:invalidPrior');
+            end
+            % MRF default weights: pooled covariance of the groups with pi_k = n_k/n
+            g   = f; g.prior = struct('hierarchical', struct('labels', lab, 'fixed', true, 'mu', M, 'Sigma', S), ...
+                                      'mrf', struct('potential', 'huber', 'huberDelta', 0.7));
+            mrf = mcmc_bayes.setup_mrf(g, mcmc_bayes.setup_hierarchical(g));
+            V   = mcmc_bayes.mixture_marginal_cov(M, S, [5; 6; 1]/12);
+            testCase.verifyEqual(mrf.W, 1./sqrt(diag(V)), 'RelTol', 1e-12);
+            testCase.verifyEqual(mrf.delta, 0.7*sqrt(diag(V)), 'RelTol', 1e-12);
+            testCase.verifyTrue(contains(mrf.Wrule, 'pooled'));
+            % settings: label fields, no mixture fields (pi, zStep, membership)
+            s = mcmc_bayes.prior_settings(setup(struct('labels', lab, 'fixed', true, 'mu', M, 'Sigma', S)), []);
+            testCase.verifyEqual({s.hierarchical.K, s.hierarchical.labels, s.hierarchical.groupSize}, {3, [0 1 5], [5; 6; 1]});
+            testCase.verifyFalse(any(isfield(s.hierarchical, {'pi','zStep','membership','alpha'})));
+        end
+
+        function testLabelsGroupStatistics(testCase)
+            % labels_init: per-group moments from that group's voxels only (vs direct); the Gibbs statistics are
+            % hyper_suffstats_groups with the fixed group index (vs direct loops, CPU and GPU)
+            rng(961); d = 2; K = 3; Nv = 40;
+            z  = [1 2 3 randi(K, 1, Nv-3)]; z(5:7) = 2;
+            u  = randn(d, Nv) + 3*z;                                        % groups far apart
+            fv = [0.01; 0.02]; m0 = [7; 8];
+            [mu, Sigma] = mcmc_bayes.labels_init(u, z, K, fv, m0);
+            for k = 1:K
+                uk = u(:, z == k);
+                testCase.verifyEqual(mu(:,k), mean(uk, 2), 'RelTol', 1e-12);
+                testCase.verifyEqual(Sigma(:,:,k), diag(max(var(uk, 0, 2), fv)), 'RelTol', 1e-12);
+            end
+            us = single(u); zs = z;
+            if canUseGPU; us = gpuArray(us); zs = gpuArray(zs); end
+            [n, ub, S] = mcmc_bayes.hyper_suffstats_groups(us, zs, K);
+            for k = 1:K
+                uk = double(single(u(:, z == k)));
+                testCase.verifyEqual(n(k), size(uk, 2));
+                testCase.verifyEqual(ub(:,k), mean(uk, 2), 'RelTol', 1e-10);
+                testCase.verifyEqual(S(:,:,k), (uk - mean(uk, 2))*(uk - mean(uk, 2)).', 'RelTol', 1e-10);
+            end
+            % a group with one voxel gets the floor; an empty group m0 and diag(floorVar)
+            [mu, Sigma] = mcmc_bayes.labels_init([u, [100; 100]], [z 4], 5, fv, m0);
+            testCase.verifyEqual(mu(:,4), [100; 100]); testCase.verifyEqual(Sigma(:,:,4), diag(fv));
+            testCase.verifyEqual(mu(:,5), m0);          testCase.verifyEqual(Sigma(:,:,5), diag(fv));
+            % group log-prior: each voxel with its own group (CPU double and GPU single), subset of voxels
+            M = [0 3 6; 1 4 7]; Sg = cat(3, eye(2), [0.5 0.1; 0.1 0.3], 2*eye(2)); P = zeros(2,2,3);
+            for k = 1:K; P(:,:,k) = inv(Sg(:,:,k)); end
+            ref = zeros(1, Nv);
+            for i = 1:Nv; r = u(:,i) - M(:,z(i)); ref(i) = -0.5*r.'*P(:,:,z(i))*r; end
+            testCase.verifyEqual(mcmc_bayes.logprior_labels(u, M, P, z), ref, 'AbsTol', 1e-10);
+            testCase.verifyEqual(mcmc_bayes.logprior_hier(u, [], M, P, [], [], z), ref, 'AbsTol', 1e-10);
+            sub = [2 5 9 30];
+            testCase.verifyEqual(mcmc_bayes.logprior_labels(u(:,sub), M, P, z(sub)), ref(sub), 'AbsTol', 1e-10);
+            if canUseGPU
+                [muG, PG] = mcmc_bayes.groups_to_gpu(M, Sg);
+                lg = double(gather(mcmc_bayes.logprior_labels(gpuArray(single(u)), muG, PG, gpuArray(z))));
+                testCase.verifyLessThanOrEqual(max(abs(lg - ref) ./ max(1, abs(ref))), 1e-5);
+            end
+        end
+
+        function testStage1Safeguard(testCase)
+            % check_stage1_convergence on synthetic out.hyper structures, then run_two_stage (GPU)
+            id  = 'mcmc_bayes:stage1NotConverged';
+            chk = @(H, r) mcmc_bayes.check_stage1_convergence(H, r);
+            H = struct('rhat', struct('mu', [1.02; 1.05], 'Sigma', [3 3; 3 3]));          % Sigma is not checked
+            testCase.verifyWarningFree(@() chk(H, 1.1));
+            H.rhat.mu = [1.02; 1.2];
+            testCase.verifyError(@() chk(H, 1.1), id);
+            testCase.verifyWarningFree(@() chk(H, 1.25));
+            testCase.verifyWarningFree(@() chk(H, Inf));
+            H.rhat.mu = [1 1; 1 1]; H.rhat.pi = [1.01; 1.3];                                % K > 1 mixture: pi
+            testCase.verifyError(@() chk(H, 1.1), id);
+            H.rhat.pi = [1.01; 1.02]; H.rhat.mu(2,2) = NaN;
+            testCase.verifyError(@() chk(H, 1.1), id);
+            testCase.verifyWarning(@() chk(struct('mean', 1), 1.1), 'mcmc_bayes:stage1NoRhat');
+            testCase.verifyWarningFree(@() chk(struct('mean', 1), Inf));
+
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.linGaussGrid([6 5 3], 2);
+            f.prior.hierarchical = struct();
+            f.prior.mrf = struct('potential', 'l1', 'tau', 2);
+            % two chains started far apart (overdisp) and run very briefly: stage 1 not converged
+            g = f; g.repetition = 2; g.overdisp = 0.5; g.iteration = 60; g.burnin = 40; g.thinning = 2;
+            rng(81); parallel.gpu.rng(81);
+            testCase.verifyError(@() mcmc_bayes().run_two_stage(yy, mask, [], x0, g, fwd), id);
+            rng(81); parallel.gpu.rng(81);
+            testCase.verifyError(@() mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd), id);     % dispatch
+            g.prior.hierarchical.stage1RhatMax = Inf;                                                  % override
+            rng(81); parallel.gpu.rng(81);
+            out = mcmc_bayes().run_two_stage(yy, mask, [], x0, g, fwd);
+            testCase.verifyGreaterThan(max(out.stage1.hyper.rhat.mu(:)), 1.1);
+            testCase.verifyTrue(out.hyper.fixed && all(isfinite(out.mean.u1(:))));
+            testCase.verifyFalse(isfield(out.settings.prior.hierarchical, 'stage1RhatMax'));
+            % one chain: no R-hat, warning and stage 2 runs
+            g = f; g.repetition = 1;
+            out = testCase.verifyWarning(@() mcmc_bayes().run_two_stage(yy, mask, [], x0, g, fwd), 'mcmc_bayes:stage1NoRhat');
+            testCase.verifyTrue(out.hyper.fixed);
+        end
+
+        function testLabelsRunsOutputs(testCase, updateScheme)
+            % free (niw; jeffreys_half), fixed, fixed + MRF (subsetForward on/off) with labels 0 and 7: caches,
+            % inactive voxels, outputs; per-group statistics use only the group's voxels (exact conditional of mu)
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd, muT, labT] = McmcBayesUnitTest.mixGrid();
+            L = NaN(size(mask)); L(mask) = 7*(labT == 2);                          % group 1 <-> label 0, group 2 <-> label 7
+            nk = [nnz(labT == 1); nnz(labT == 2)];
+            f.updateScheme = updateScheme; f.checkCache = true; f.repetition = 2; f.overdisp = 0.01;
+            f.adaptStepSize = true; f.adaptInterval = 20;
+            Ns = numel(f.burnin+1:f.thinning:f.iteration);
+            SigT = cat(3, 0.04*eye(2), 0.04*eye(2));
+            hFix = struct('labels', L, 'fixed', true, 'mu', muT, 'Sigma', SigT);
+            cfgs = {struct('hierarchical', struct('labels', L)), ...
+                    struct('hierarchical', struct('labels', L, 'hyperprior', 'jeffreys_half')), ...
+                    struct('hierarchical', hFix), ...
+                    struct('hierarchical', hFix, 'mrf', struct('potential', 'l1', 'subsetForward', true)), ...
+                    struct('hierarchical', hFix, 'mrf', struct('potential', 'huber', 'subsetForward', false))};
+            for k = 1:numel(cfgs)
+                g = f; g.prior = cfgs{k};
+                rng(90 + k); parallel.gpu.rng(90 + k);
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.Ncheck, g.iteration*g.repetition);
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5, sprintf('cfg %d', k));
+                if isfield(cc, 'inactiveMoved'); testCase.verifyEqual(cc.inactiveMoved, 0, sprintf('cfg %d', k)); end
+                if k >= 4; testCase.verifyEqual(out.settings.mrf.subsetForward.used, k == 4); end
+                H = out.hyper;
+                testCase.verifyEqual({H.K, H.labels, H.groupSize}, {2, [0 7], nk});
+                testCase.verifyFalse(any(isfield(H, {'membership','mapLabel','pi'})) || isfield(H.mean, 'pi'));
+                testCase.verifyEqual(out.settings.prior.hierarchical.labels, [0 7]);
+                if k <= 2
+                    testCase.verifyEqual(size(H.posterior.mu), [2 2 Ns 2]);
+                    testCase.verifyEqual(size(H.posterior.Sigma), [2 2 2 Ns 2]);
+                    testCase.verifyEqual(size(H.rhat.mu), [2 2]); testCase.verifyEqual(size(H.ess.Sigma), [2 2 2]);
+                    testCase.verifyLessThanOrEqual(max(abs(H.mean.mu - muT), [], 'all'), 0.3);
+                else
+                    testCase.verifyEqual(H.mean.mu, muT); testCase.verifyEqual(H.mean.Sigma, SigT);
+                end
+                if k == 5
+                    V = mcmc_bayes.mixture_marginal_cov(muT, SigT, nk/sum(nk));
+                    testCase.verifyEqual(out.settings.mrf.W, 1./sqrt(diag(V)), 'RelTol', 1e-12);
+                end
+                if k == 1
+                    % every kept mu_k ~ N(m_n, Sigma_k/kappa_n) with m_n from the voxels of group k only (u = x here):
+                    % standardised residuals ~ N(0,1); with the statistics of all voxels they are far off
+                    s  = out.settings.prior.hierarchical; kap = s.kappa0;
+                    U  = cat(1, reshape(double(out.posterior.u1), 1, [], Ns*2), reshape(double(out.posterior.u2), 1, [], Ns*2));
+                    mP = reshape(H.posterior.mu, 2, 2, []); SP = reshape(H.posterior.Sigma, 2, 2, 2, []);
+                    zz = []; zw = [];
+                    for q = 1:Ns*2
+                        for c = 1:2
+                            ub = mean(U(:, labT == c, q), 2); ua = mean(U(:, :, q), 2);
+                            kn = kap + nk(c); sd = sqrt(diag(SP(:,:,c,q)) / kn);
+                            zz = [zz; (mP(:,c,q) - (kap*s.m0 + nk(c)*ub)/kn) ./ sd]; %#ok<AGROW>
+                            zw = [zw; (mP(:,c,q) - (kap*s.m0 + nk(c)*ua)/kn) ./ sd]; %#ok<AGROW>
+                        end
+                    end
+                    N = numel(zz);
+                    testCase.verifyLessThanOrEqual(abs(mean(zz)), 5/sqrt(N), sprintf('mean z %.3f (N %d)', mean(zz), N));
+                    testCase.verifyLessThanOrEqual(abs(var(zz) - 1), 5*sqrt(2/(N-1)), sprintf('var z %.3f', var(zz)));
+                    testCase.verifyGreaterThan(mean(abs(zw)), 10);
+                end
+            end
+            if ~strcmp(updateScheme, 'joint'); return; end
+            % label order: tight fixed priors pull each group to the mu column of its label
+            g = f; g.checkCache = false;
+            g.prior = struct('hierarchical', struct('labels', L, 'fixed', true, 'mu', muT, 'Sigma', cat(3, 1e-4*eye(2), 1e-4*eye(2))));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            m1 = [mean(out.mean.u1(mask & L == 0)); mean(out.mean.u2(mask & L == 0))];
+            m7 = [mean(out.mean.u1(mask & L == 7)); mean(out.mean.u2(mask & L == 7))];
+            testCase.verifyLessThanOrEqual(max(abs([m1 m7] - muT), [], 'all'), 0.05);
+            % the same labels as [1,Nv] after masking
+            g.prior.hierarchical.labels = L(mask).';
+            out2 = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            testCase.verifyEqual(out2.hyper.labels, [0 7]);
+            % two-stage through the optimisation dispatch: stage 2 fixes the stage-1 means per group (short chains, stage-1
+            % max R-hat 1.11: the safeguard is switched off here, it is tested in testStage1Safeguard)
+            g = f; g.checkCache = false;
+            g.prior = struct('hierarchical', struct('labels', L, 'stage1RhatMax', Inf), 'mrf', struct('potential', 'huber', 'tau', 2));
+            rng(97); parallel.gpu.rng(97);
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            eb  = out.settings.empiricalBayes;
+            testCase.verifyEqual(eb.labels, [0 7]); testCase.verifyEqual(out.stage1.hyper.labels, [0 7]);
+            testCase.verifyEqual(out.hyper.mean.mu, eb.muHat); testCase.verifyEqual(out.hyper.mean.Sigma, eb.SigmaHat);
+            testCase.verifyTrue(out.hyper.fixed); testCase.verifyEqual(out.hyper.labels, [0 7]);
+            V = mcmc_bayes.mixture_marginal_cov(eb.muHat, eb.SigmaHat, nk/sum(nk));
+            testCase.verifyEqual(out.settings.mrf.W, 1./sqrt(diag(V)), 'RelTol', 1e-12);
+            testCase.verifyTrue(contains(eb.stage2, 'label group'));
+            % estimate_hyper_subset: stratified per group (min(n_g, max(ceil(frac n_g), 10, 2d)) voxels each)
+            g = f; g.checkCache = false; g.repetition = 1; g.prior = struct('hierarchical', struct('labels', L, 'subsetFraction', 0.2));
+            rng(98);
+            [muHat, SigmaHat, fFixed, outSub, idxSub] = mcmc_bayes().estimate_hyper_subset(yy, mask, [], x0, g, fwd);
+            kExp = min(nk, max(max(ceil(0.2*nk), 10), 4));
+            testCase.verifyEqual(outSub.hyper.groupSize, kExp);
+            testCase.verifyEqual(numel(idxSub), sum(kExp));
+            testCase.verifyEqual([nnz(L(idxSub) == 0); nnz(L(idxSub) == 7)], kExp);
+            testCase.verifyEqual([size(muHat) size(SigmaHat)], [2 2 2 2 2]);
+            testCase.verifyTrue(isequaln(fFixed.prior.hierarchical.labels, L));
+            testCase.verifyEqual(fFixed.prior.hierarchical.labelValues, [0 7]);
+            testCase.verifyTrue(fFixed.prior.hierarchical.fixed);
+            % no kept samples (burn-in >= iterations)
+            g = f; g.checkCache = false; g.burnin = f.iteration; g.prior = struct('hierarchical', struct('labels', L));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            testCase.verifyTrue(all(isfinite(out.hyper.mean.mu(:))) && all(isfinite(out.hyper.mean.Sigma(:))));
+            % a user labelValues with a group that has no voxel: hyperprior draw with a warning (free mode)
+            g.burnin = f.burnin; g.prior.hierarchical.labelValues = [0 3 7];
+            out = testCase.verifyWarning(@() mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd), 'mcmc_bayes:hierarchicalLabelsEmpty');
+            testCase.verifyEqual(out.hyper.groupSize, [nk(1); 0; nk(2)]);
+            testCase.verifyEqual(size(out.hyper.mean.mu), [2 3]);
+        end
+
+        function testLabelsExactToyShort(testCase)
+            % short version of tests/validation/mcmc_bayes/test_T9c_0_labels_exact.m: linear Gaussian (d = 2),
+            % fixed labels 3 and 8 with fixed (mu_k, Sigma_k), 12 voxels (6 per group, 2 of them with data from the
+            % OTHER group), 32 chains per voxel; posterior marginal quantiles vs the exact Gaussian posterior
+            % N(C (A'y/s^2 + P_k mu_k), C), C = (A'A/s^2 + P_k)^-1 of the voxel's group; between-chain MC error
+            % (criteria as T3.1 / T9b.0: frac(|z| > 1.96) <= 0.15, max |z| <= 4.5)
+            gacelletest.assumeGPU(testCase);
+            d = 2; m = 4; s = 1; Nch = 32;
+            mu = [-1 1.5; 0 1]; Sig = cat(3, [0.3 0.1; 0.1 0.2], [0.25 -0.05; -0.05 0.4]); lv = [3 8];
+            rng(971); A = randn(m, d);
+            g  = [1 1 1 1 1 1 2 2 2 2 2 2]; gData = [1 1 1 1 2 2 2 2 2 2 1 1];      % group of the prior / of the data
+            u  = zeros(d, 12);
+            for i = 1:12; u(:,i) = mu(:,gData(i)) + chol(Sig(:,:,gData(i)), 'lower')*randn(d, 1); end
+            y  = A*u + s*randn(m, 12); Nv = 12;
+            qs = [0.05 0.25 0.5 0.75 0.95]; zq = -sqrt(2)*erfcinv(2*qs);
+            qx = zeros(Nv, d, numel(qs));
+            for i = 1:Nv
+                P = inv(Sig(:,:,g(i))); C = inv(A.'*A/s^2 + P); mP = C*(A.'*y(:,i)/s^2 + P*mu(:,g(i)));
+                for p = 1:d; qx(i,p,:) = mP(p) + sqrt(C(p,p))*zq; end
+            end
+            yy = reshape(repmat(y.', Nch, 1), [Nv*Nch 1 1 m]);
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 10]; f.xStepSize = [0.3; 0.3; 0.01];
+            f.algorithm = 'MH'; f.iteration = 6000; f.burnin = 1500; f.thinning = 3; f.metric = {'mean'};
+            f.fixedParams = struct('noise', s); f.adaptStepSize = true; f.adaptInterval = 50;
+            f.prior.hierarchical = struct('labels', repmat(lv(g).', Nch, 1), 'fixed', true, 'mu', mu, 'Sigma', Sig);
+            rng(972); x0.u1 = 2*randn(Nv*Nch, 1); x0.u2 = 2*randn(Nv*Nch, 1);
+            rng(973); parallel.gpu.rng(973);
+            out = mcmc_bayes().optimisation(yy, true(Nv*Nch, 1), [], x0, f, @(p) McmcBayesUnitTest.linGaussFwd(p, A));
+            z = zeros(Nv, d, numel(qs));
+            for p = 1:d
+                U = reshape(double(out.posterior.(sprintf('u%d', p))), Nv, Nch, []);
+                for k = 1:numel(qs)
+                    qc = McmcBayesUnitTest.sampleQuantile(U, qs(k), 3);
+                    qp = McmcBayesUnitTest.sampleQuantile(reshape(permute(U, [1 3 2]), Nv, []), qs(k), 2);
+                    z(:,p,k) = (qp - qx(:,p,k)) ./ (std(qc, 0, 2)/sqrt(Nch));
+                end
+            end
+            testCase.verifyLessThanOrEqual(mean(abs(z(:)) > 1.96), 0.15, sprintf('frac |z| > 1.96: %.3f', mean(abs(z(:)) > 1.96)));
+            testCase.verifyLessThanOrEqual(max(abs(z(:))), 4.5, sprintf('max |z| %.2f', max(abs(z(:)))));
+        end
+
+        function testVoxelMapHelpers(testCase)
+            % take_voxel_maps / voxel_maps_to_fitting / slice_voxel_maps: noise map exactly as the Phase 9a helpers,
+            % labels: labelValues on the mask, round-robin filler outside, not rescaled, sliced per segment
+            mask = true(2, 3, 4); mask(:,:,1) = false; mask(2,2,3) = false;
+            f    = struct('solver', 'mcmc', 'mcmcClass', 'mcmc_bayes', 'ricianSigma', []);
+            m    = 0.1*ones(2, 3, 4); m(~mask) = NaN;
+            L    = repmat(reshape([0.5 0 5 2], 1, 1, []), 2, 3); L(2,2,3) = NaN;                     % outside the mask: not integer
+            [ed, vm] = mcmc_bayes.take_voxel_maps(struct('b', 1, 'noiseSigma', m, 'priorLabels', L));
+            testCase.verifyEqual(ed, struct('b', 1));
+            testCase.verifyTrue(isequaln(vm.noiseSigma, m) && isequaln(vm.priorLabels, L));
+            [ed, vm] = mcmc_bayes.take_voxel_maps(struct('b', 1));
+            testCase.verifyEqual(ed, struct('b', 1)); testCase.verifyEmpty(vm.noiseSigma); testCase.verifyEmpty(vm.priorLabels);
+            [ed, vm] = mcmc_bayes.take_voxel_maps([]);
+            testCase.verifyEmpty(ed); testCase.verifyEmpty(vm.priorLabels);
+            % noise map only: identical to noise_map_to_fitting; no maps: fitting unchanged
+            testCase.verifyTrue(isequaln(mcmc_bayes.voxel_maps_to_fitting(f, struct('noiseSigma', m, 'priorLabels', []), mask, 2), ...
+                                         mcmc_bayes.noise_map_to_fitting(f, m, mask, 2)));
+            testCase.verifyTrue(isequal(mcmc_bayes.voxel_maps_to_fitting(f, struct('noiseSigma', [], 'priorLabels', []), mask, 2), f));
+            % labels
+            fh = f; fh.prior.hierarchical = true;
+            g  = mcmc_bayes.voxel_maps_to_fitting(fh, struct('noiseSigma', m, 'priorLabels', L), mask, 2);
+            h  = g.prior.hierarchical;
+            testCase.verifyEqual(h.labelValues, [0 2 5]);
+            testCase.verifyEqual(h.labels(mask), L(mask));                                          % not rescaled
+            out = find(~mask);
+            testCase.verifyEqual(h.labels(out), reshape([0 2 5 0 2 5 0], [], 1));                    % round-robin filler
+            testCase.verifyEqual(g.ricianSigma(mask), 0.05*ones(nnz(mask), 1));
+            gs = mcmc_bayes.slice_voxel_maps(g, 2:3, [2 3 4]);
+            testCase.verifyEqual(gs.prior.hierarchical.labels, h.labels(:,:,2:3));
+            testCase.verifyEqual(gs.prior.hierarchical.labelValues, [0 2 5]);
+            testCase.verifyEqual(gs.ricianSigma, g.ricianSigma(:,:,2:3));
+            gv = fh; gv.prior.hierarchical = struct('labels', L(mask).');                             % [1,Nv]: not sliced/resolved
+            testCase.verifyTrue(isequal(mcmc_bayes.slice_voxel_maps(gv, 2:3, [2 3 4]), gv));
+            testCase.verifyTrue(isequal(mcmc_bayes.labels_to_fitting(gv, [], mask), gv));
+            % labels already in fitting (full map): labelValues resolved on the mask as well
+            gf = fh; gf.prior.hierarchical = struct('labels', L);
+            g2 = mcmc_bayes.voxel_maps_to_fitting(gf, struct('noiseSigma', [], 'priorLabels', []), mask);
+            testCase.verifyEqual(g2.prior.hierarchical.labelValues, [0 2 5]);
+            testCase.verifyEqual(g2.prior.hierarchical.labels, h.labels);
+            % errors and the unused-map warning
+            id = 'mcmc_bayes:hierarchicalLabels';
+            testCase.verifyError(@() mcmc_bayes.voxel_maps_to_fitting(f, struct('noiseSigma', [], 'priorLabels', L), mask), id);        % no hierarchy
+            testCase.verifyError(@() mcmc_bayes.voxel_maps_to_fitting(gf, struct('noiseSigma', [], 'priorLabels', L), mask), id);       % both set
+            testCase.verifyError(@() mcmc_bayes.voxel_maps_to_fitting(fh, struct('noiseSigma', [], 'priorLabels', L(:,:,1:3)), mask), id);
+            bad = L; bad(1,1,2) = 1.5;
+            testCase.verifyError(@() mcmc_bayes.voxel_maps_to_fitting(fh, struct('noiseSigma', [], 'priorLabels', bad), mask), id);
+            fm = fh; fm.mcmcClass = 'mcmc';
+            gm = testCase.verifyWarning(@() mcmc_bayes.voxel_maps_to_fitting(fm, struct('noiseSigma', [], 'priorLabels', L), mask), ...
+                                        'mcmc_bayes:priorLabelsUnused');
+            testCase.verifyTrue(isequal(gm, fm));
+        end
+
+        function testLabelsThroughWrapper(testCase)
+            % extraData.priorLabels through gpuR2starMapping, fixed per-label priors on R2star, 1 and 2 GPU segments
+            % (NSegmentUser = 2); label 3 only in the first two slices, so segment 2 has one group: labelValues set
+            % on the whole mask keep the groups (and the mu/Sigma columns) the same in both segments. Tight priors
+            % dominate: the posterior mean R2star of each label is its prior value
+            gacelletest.assumeGPU(testCase);
+            rng(29); gpurng(29);
+            dims = [4 3 4]; Nv = prod(dims);
+            L    = zeros(dims); L(1:2, :, 1:2) = 3;
+            R2   = 20 + 40*(L(:).' == 3);
+            te   = linspace(2e-3, 40e-3, 8); obj = gpuR2starMapping(te);
+            s    = double(obj.FWD(struct('M0', ones(1, Nv), 'R2star', R2)));
+            y    = reshape((abs(s + 0.01*(randn(size(s)) + 1i*randn(size(s))))).', [dims numel(te)]);
+            mask = true(dims);
+            lg   = @(r) log((r - 0.1)./(200 - r));                             % u of R2star (sigmoid on [0.1, 200])
+            rT   = [25 70];                                                    % prior values of labels 0 and 3
+            f    = struct('solver','mcmc','algorithm','MH','iteration',300,'thinning',2,'burnin',0.3, ...
+                          'metric',{{'mean'}},'mcmcClass','mcmc_bayes','likelihood','marginal_noise', ...
+                          'parameterTransform',{{'sigmoid','sigmoid','linear'}});
+            f.prior.hierarchical = struct('params', {{'R2star'}}, 'fixed', true, 'mu', lg(rT), 'Sigma', reshape([1e-4 1e-4], 1, 1, 2));
+            for nseg = [1 2]
+                g = f; if nseg == 2; g.NSegmentUser = 2; end
+                out = gpuR2starMapping(te).estimate(y, mask, g, struct('priorLabels', L));
+                r   = double(out.mean.R2star);
+                testCase.verifyEqual([mean(r(L == 0)) mean(r(L == 3))], rT, 'AbsTol', 2, sprintf('%d segment(s)', nseg));
+                % (utils.restore_segment_structure concatenates the non-voxel out.hyper fields of the segments)
+                testCase.verifyEqual(out.hyper.labels, repmat([0 3], 1, nseg));
+            end
+            % not mcmc_bayes: warning, labels ignored
+            g = f; g.mcmcClass = 'mcmc'; g = rmfield(g, {'likelihood','parameterTransform','prior'}); g.iteration = 20;
+            testCase.verifyWarning(@() gpuR2starMapping(te).estimate(y, mask, g, struct('priorLabels', L)), 'mcmc_bayes:priorLabelsUnused');
         end
     end
 

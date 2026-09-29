@@ -72,6 +72,18 @@ classdef mcmc_bayes < mcmc
 %                                           run_two_stage. See "Phase 9b" below
 %           .nu             : 4             degrees of freedom of 't' (positive finite scalar, fixed, not sampled);
 %                                           only allowed with distribution = 't'
+%           .labels         : []            fixed segmentation labels (Phase 9c): one integer label per voxel, a map
+%                                           with the spatial size of the mask or [1,Nv] after masking. Every distinct
+%                                           value inside the mask (0 included) is one group with its own N(mu_k, Sigma_k);
+%                                           K is implied (error mcmc_bayes:hierarchicalLabels if .K is set to another
+%                                           value); no z-step, no pi; 'normal' only. See "Phase 9c" below. Model
+%                                           classes take the map from extraData.priorLabels (take_voxel_maps)
+%           .labelValues    : []            label value of each group, strictly increasing [1,K]; [] -> the sorted
+%                                           distinct labels inside the mask (group k <-> labelValues(k), also the
+%                                           order of a fixed .mu [d,K] / .Sigma [d,d,K]; out.hyper.labels)
+%           .stage1RhatMax  : 1.1           run_two_stage only: largest stage-1 split-R-hat of mu (K > 1 mixture:
+%                                           also pi) for which stage 2 runs; above it error mcmc_bayes:stage1NotConverged
+%                                           (Inf switches the check off). See "Phase 9c" below
 %       .mrf            : []            MRF prior on the hierarchical parameters (Phase 4), a structure
 %                                       (struct() or true for all defaults) with the fields below.
 %                                       Requires .hierarchical with fixed = true (use run_two_stage
@@ -81,10 +93,11 @@ classdef mcmc_bayes < mcmc
 %           .W              : []            [d,1] per-parameter weights W_p > 0, [] -> 1./sqrt(diag(Sigma))
 %                                           of the fixed Sigma (fixed for the whole run); K > 1: Sigma is
 %                                           replaced by the mixture's marginal covariance (Phase 7); 't': the
-%                                           scale matrix Sigma (Phase 9b)
+%                                           scale matrix Sigma (Phase 9b); labels: the pooled covariance of the
+%                                           label groups, pi_k = n_k/n (Phase 9c)
 %           .huberDelta     : 1             Huber threshold in units of sqrt(Sigma_pp): delta_p =
 %                                           huberDelta * sqrt(Sigma_pp) (scalar or [d,1]; 'huber' only;
-%                                           K > 1: the same mixture scale as W)
+%                                           K > 1 and labels: the same scale as W)
 %           .edgeWeights    : []            [K,Nv] fixed symmetric edge weights w_ij >= 0 in the layout of
 %                                           build_neighbours (entries of absent neighbours ignored), [] -> 1
 %           .mode           : '3d'          '3d' | '2d' (in-plane only: dims 1-2 of the same slice)
@@ -637,6 +650,63 @@ classdef mcmc_bayes < mcmc
 %   .distribution, .nu, .mhPrior, .lambda (and .lambdaStep/.gibbs in free mode). For distribution 'normal'
 %   none of these fields is added (bitwise-identical output).
 %
+% Phase 9c (fixed segmentation labels, prior.hierarchical.labels; two-stage safeguard)
+% ------------------------------------------------------------------------------------
+% Target. The group of every voxel is KNOWN (a tissue or tract segmentation, e.g. CST / other WM / GM / CSF):
+%       u_i | g_i = k ~ N(mu_k, Sigma_k),   (mu_k, Sigma_k) ~ p(mu, Sigma) independently for every k,
+%   with g_i the fixed group of voxel i. This is the Phase 7 model with z observed: there is no z-step and no group
+%   weight pi (the labels are data, pi would only describe the segmentation), and the MH prior term of voxel i is
+%   the Normal of its own group,  lp_i = -(u_i - mu_{g_i})' Sigma_{g_i}^-1 (u_i - mu_{g_i}) / 2  (logprior_labels;
+%   -log|Sigma_k|/2 is constant given the labels), NOT the mixture density. Unlike a learned K = 2 mixture it cannot
+%   swap groups between chains (in vivo, learned K = 2 split CSF-vs-tissue in some chains and GM-vs-WM in others).
+% Groups. Every distinct label value inside the mask is one group, label 0 included (0 inside the mask is a group like
+%   any other; voxels outside the mask are never read). labelValues (strictly increasing; default: the sorted distinct
+%   labels inside the mask of this call) defines the groups: group k <-> labelValues(k), the order of a fixed .mu [d,K]
+%   / .Sigma [d,d,K] and of out.hyper; every label inside the mask must be one of them. K = numel(labelValues); .K may
+%   be omitted or equal K. Labels must be finite and integer-valued inside the mask (any class); they are never
+%   rescaled. Not with distribution 't' or .pi (error mcmc_bayes:hierarchicalLabels).
+% One sweep (free mode): the MH block on u | theta with the group prior term above (all update paths unchanged), then
+%   per group k in order: n_k, ubar_k, S_k of the voxels with label k (hyper_suffstats_groups with the fixed labels,
+%   GPU double) and the Phase 3 conjugate draw of (mu_k, Sigma_k) (gibbs_hyper, host rng), then the log-prior cache.
+%   Exact Gibbs: the groups are conditionally independent given u. Hyperprior: the same resolved NIW (m0, kappa0,
+%   Psi0, nu0 from the starting u of ALL voxels) for every group, as Phase 7. A group without voxels in the call is
+%   drawn from that hyperprior (warning mcmc_bayes:hierarchicalLabelsEmpty; only possible with a user labelValues,
+%   a voxel subset or a model-class memory probe).
+%   'jeffreys_half' (disallowed for a LEARNED mixture, where an emptied group has no proper conditional) is allowed:
+%   with fixed labels every n_k is known before sampling, and the per-group conditionals Sigma_k | u, mu_k ~
+%   IW(S_mu,k, n_k - d), mu_k | Sigma_k, u ~ N(ubar_k, Sigma_k/n_k) are those of Phase 3 on the voxels of group k.
+%   It needs n_k > 2d - 1 in EVERY group (else error mcmc_bayes:hierarchicalLabels before any GPU work).
+%   Initialisation of every repetition (no random numbers): mu_k = ubar_k, Sigma_k = diag(max(S_k,pp/(n_k-1), floorVar))
+%   (the K = 1 rule per group; n_k = 1 gives the floor; an empty group m0 and diag(floorVar)).
+% Fixed mode (fixed = true, .mu [d,K], .Sigma [d,d,K] in labelValues order; also stage 2 of run_two_stage): the group
+%   prior term only; voxels are conditionally independent and may be segmented (labelValues must then be the same in
+%   every segment: the model classes set it from the whole mask).
+% MRF weights (two-stage stage 2): W_p = 1/sqrt(V_pp) (Huber delta_p = huberDelta sqrt(V_pp)) with V the pooled
+%   covariance of the labelled population, the Phase 7 mixture marginal covariance with pi_k = n_k/n (the fraction of
+%   the voxels of this call in group k): one weight per parameter keeps the MRF symmetric across group boundaries,
+%   and it measures the spread of the whole image (between-group differences included), as K = 1 and K > 1 do.
+% Two-stage (run_two_stage, estimate_hyper_subset): stage 1 learns (mu_k, Sigma_k), stage 2 fixes their posterior means
+%   with the same labels and labelValues. estimate_hyper_subset draws the voxel subset per group (stratified,
+%   k_g = min(n_g, max(ceil(frac n_g), 10, 2d)) voxels of group g, randperm per group in labelValues order), so that a
+%   small group (e.g. a tract) keeps enough voxels.
+% Output: out.hyper.K, .labels (= labelValues, group k <-> label value labels(k)), .groupSize [K,1] (n_k in this call),
+%   .posterior.mu [d,K,Ns,Nrep], .posterior.Sigma [d,d,K,Ns,Nrep], .mean/.median (.mu [d,K], .Sigma [d,d,K]), .ess/.rhat
+%   (per group); no .pi, .membership or .mapLabel (the group of every voxel is known). out.settings.prior.hierarchical
+%   gains .labels, .groupSize, .mhPrior and the rules. Without .labels nothing changes (bitwise-identical output).
+% Model classes: extraData.priorLabels (map with the spatial size of the input mask) is taken out of extraData
+%   (take_voxel_maps, with extraData.noiseSigma: one mechanism for the per-voxel mcmc_bayes inputs), put in
+%   fitting.prior.hierarchical.labels with labelValues resolved on the final mask of the whole volume and a filler
+%   outside the mask (labelValues in turn, round-robin; only the GPU memory probe reaches those voxels), and sliced
+%   per GPU segment (voxel_maps_to_fitting, slice_voxel_maps). Needs fitting.prior.hierarchical and mcmc_bayes (else
+%   error / warning mcmc_bayes:priorLabelsUnused).
+% Two-stage safeguard (run_two_stage, any prior). After stage 1, R = max over the split-R-hat of every mu entry (K > 1
+%   mixture: and every pi entry). If R > prior.hierarchical.stage1RhatMax (default 1.1) or R is NaN: error
+%   mcmc_bayes:stage1NotConverged. Reason: stage 2 fixes the stage-1 POSTERIOR MEANS; if the chains sit in different
+%   modes (in vivo: learned K = 2 split CSF-vs-tissue in some chains and GM-vs-WM in others), that mean averages over
+%   the modes and is not a population prior of any of them. With repetition = 1 or fewer than 4 kept samples there is
+%   no R-hat: warning mcmc_bayes:stage1NoRhat and stage 2 runs. stage1RhatMax = Inf disables the check. The output of a
+%   run that passes is unchanged.
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
@@ -649,6 +719,7 @@ classdef mcmc_bayes < mcmc
 %                                   check moved to mcmc as opt-in options/static helpers; location-shift move removed)
 % Date modified: 29 September 2026 (Phase 9a: 'rician' and 'gaussian_ricianmean' likelihoods, ricianNav/ricianSigma)
 % Date modified: 29 September 2026 (Phase 9b: Student-t population prior, prior.hierarchical.distribution/nu)
+% Date modified: 29 September 2026 (Phase 9c: fixed segmentation labels, extraData.priorLabels, two-stage safeguard)
 %
 
     methods
@@ -676,6 +747,11 @@ classdef mcmc_bayes < mcmc
             end
 
             fitting = this.check_set_default_bayes(fitting);
+
+            % fixed segmentation labels (Phase 9c): masked like the data, [1,Nv], before the prior is set up
+            if mcmc_bayes.has_labels(fitting)
+                fitting.prior.hierarchical = this.mask_labels(fitting.prior.hierarchical, mask, find(mask>0));
+            end
 
             % only Metropolis-Hastings on the new path
             if ~strcmpi(fitting.algorithm,'mh')
@@ -731,14 +807,17 @@ classdef mcmc_bayes < mcmc
         % fixed); .subsetFraction in (0,1] is the fraction of masked voxels
         % used (at least min(Nmask, 10) voxels). The subset is drawn with the
         % global rng (randperm). Limitation: FWDfunc's varargin is passed
-        % unchanged, so it must not contain voxel-dimensioned inputs.
+        % unchanged, so it must not contain voxel-dimensioned inputs. With fixed
+        % labels (prior.hierarchical.labels, Phase 9c) the subset is stratified
+        % per group (see the class header).
         %
         % Output
         % ------
         % muHat         : [d,1] posterior mean of mu (u space); K > 1: [d,K], ordered groups (Phase 7)
         % SigmaHat      : [d,d] posterior mean of Sigma (u space); K > 1: [d,d,K]
         % fittingFixed  : fitting with prior.hierarchical.fixed = true, .mu = muHat,
-        %                 .Sigma = SigmaHat, .subsetFraction = 1 (stage 2 input); K > 1: also .pi = piHat
+        %                 .Sigma = SigmaHat, .subsetFraction = 1 (stage 2 input); K > 1: also .pi = piHat;
+        %                 labels: the user's labels and .labelValues of the stage-1 groups
         % outSub        : mcmc_bayes output of the subset run (image dims [Nsub,1,1])
         % idxSub        : linear indices (into mask) of the subset voxels
         % piHat         : posterior mean of the group weights [K,1] (1 for K = 1)
@@ -762,8 +841,31 @@ classdef mcmc_bayes < mcmc
             % random voxel subset
             mask_idx = find(mask>0);
             N        = numel(mask_idx);
-            k        = min(N, max(ceil(frac*N), min(N,10)));
-            idxSub   = mask_idx(sort(randperm(N, k)));
+            isLab    = mcmc_bayes.has_labels(fitting);
+            if isLab
+                % fixed labels (Phase 9c): stratified, every group keeps min(n_g, max(ceil(frac n_g), 10, 2d)) voxels;
+                % labelValues of the whole mask are kept for the subset run and for stage 2
+                hFull   = this.mask_labels(h, mask, mask_idx);
+                [z, lv] = mcmc_bayes.resolve_labels(hFull.labels, field_or_default(hFull, 'labelValues', []));
+                fL      = fitting; fL.prior.hierarchical = hFull;
+                [fS, ~] = this.setup_likelihood(this.check_set_default_bayes(fL));
+                dH      = this.setup_hierarchical(fS).d;
+                pos     = [];
+                for g = 1:numel(lv)
+                    ig  = find(z == g);
+                    ng  = numel(ig);
+                    kg  = min(ng, max([ceil(frac*ng), 10, 2*dH]));
+                    pos = [pos, ig(randperm(ng, kg))]; %#ok<AGROW>
+                end
+                pos     = sort(pos);
+                idxSub  = mask_idx(pos);
+                k       = numel(idxSub);
+                h.labels      = reshape(hFull.labels(pos), k, 1);
+                h.labelValues = lv;
+            else
+                k        = min(N, max(ceil(frac*N), min(N,10)));
+                idxSub   = mask_idx(sort(randperm(N, k)));
+            end
 
             % subset data as [k,1,1,...] images (or [Nm,k] if data is given as a matrix, as in mcmc)
             maskSub = true(k,1);
@@ -793,6 +895,8 @@ classdef mcmc_bayes < mcmc
             fittingFixed = fitting;
             h.fixed = true; h.mu = muHat; h.Sigma = SigmaHat; h.subsetFraction = 1;
             if numel(piHat) > 1; h.pi = piHat; end
+            % fixed labels: stage 2 uses the labels of the whole volume and the same groups
+            if isLab; h.labels = fitting.prior.hierarchical.labels; h.labelValues = outSub.hyper.labels; end
             fittingFixed.prior.hierarchical = h;
         end
 
@@ -808,6 +912,11 @@ classdef mcmc_bayes < mcmc
         %            voxels outside the stage-1 subset start from pars0.
         % This is NOT the full joint posterior p(u, mu, Sigma | y): the hyperparameter
         % uncertainty is not propagated to stage 2.
+        % Safeguard (Phase 9c): stage 2 runs only if the stage-1 population prior has converged,
+        % max split-R-hat of mu (K > 1 mixture: and pi) <= prior.hierarchical.stage1RhatMax
+        % (default 1.1, Inf = no check), else error mcmc_bayes:stage1NotConverged; without an
+        % R-hat (repetition = 1) warning mcmc_bayes:stage1NoRhat. Fixed labels: stage 2 uses
+        % the same labels and groups (labelValues) as stage 1.
         %
         % Input
         % -----
@@ -836,6 +945,7 @@ classdef mcmc_bayes < mcmc
                     'estimates mu and Sigma); with known mu/Sigma call optimisation directly.']);
             end
             frac = field_or_default(h, 'subsetFraction', 1);
+            rhatMax = mcmc_bayes.check_stage1_rhat_max(field_or_default(h, 'stage1RhatMax', 1.1));
 
             % stage 1: hierarchical prior only (the test-only mrfUpdate is a stage-2 option)
             f1 = fitting;
@@ -853,6 +963,9 @@ classdef mcmc_bayes < mcmc
                 if isfield(out1.hyper.mean, 'pi'); piHat = out1.hyper.mean.pi; else; piHat = 1; end
                 idxSub  = mask_idx;
             end
+
+            % safeguard (Phase 9c): stage 2 would fix the prior at a mean over the modes of unconverged chains
+            mcmc_bayes.check_stage1_convergence(out1.hyper, rhatMax);
 
             % stage-2 start: per voxel, posterior mean of u of every sampled parameter
             [fS, ~] = this.setup_likelihood(this.check_set_default_bayes(fitting));
@@ -877,7 +990,10 @@ classdef mcmc_bayes < mcmc
             h2 = h; h2.fixed = true; h2.mu = muHat; h2.Sigma = SigmaHat; h2.subsetFraction = 1;
             isMixEB = numel(piHat) > 1;
             if isMixEB; h2.pi = piHat; end
-            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0','alpha','init'}));
+            % fixed labels (Phase 9c): the groups of stage 1 (the labels themselves are unchanged in h2)
+            isLabEB = isfield(out1.hyper, 'labels');
+            if isLabEB; h2.labelValues = out1.hyper.labels; end
+            h2 = rmfield(h2, intersect(fieldnames(h2), {'hyperprior','m0','kappa0','Psi0','nu0','alpha','init','stage1RhatMax'}));
             f2.prior.hierarchical = h2;
             out = this.optimisation(data, mask, weights, pars2, f2, FWDfunc, varargin{:});
 
@@ -898,6 +1014,11 @@ classdef mcmc_bayes < mcmc
                 out.settings.empiricalBayes.piHat  = piHat;
                 out.settings.empiricalBayes.stage2 = ['mu_k, Sigma_k, pi fixed at the stage-1 posterior means of the ordered groups ' ...
                                                       '(z still sampled); hierarchical mixture + MRF prior; same likelihood'];
+            end
+            if isLabEB
+                out.settings.empiricalBayes.labels = out1.hyper.labels;
+                out.settings.empiricalBayes.stage2 = ['mu_k, Sigma_k of every label group fixed at the stage-1 posterior means; ' ...
+                                                      'same fixed labels; hierarchical + MRF prior; same likelihood'];
             end
         end
 
@@ -937,8 +1058,10 @@ classdef mcmc_bayes < mcmc
             hier            = this.setup_hierarchical(fitting);
             isHier          = hier.on;
             isGibbs         = isHier && ~hier.fixed;
+            % fixed segmentation labels (Phase 9c): one Normal per label group, no z, no pi
+            isLab           = isHier && ~isempty(hier.labels);
             % Gaussian-mixture prior (Phase 7), K > 1 only; K = 1 runs the Phase 3 code unchanged
-            isMix           = isHier && hier.K > 1;
+            isMix           = isHier && hier.K > 1 && ~isLab;
             % Student-t population prior (Phase 9b, K = 1): tNu = nu ([] for the Normal prior), tLam = the
             % current scale weights lambda_i of the free mode ([] otherwise: fixed mode uses the collapsed t)
             isT             = isHier && strcmp(hier.distribution, 't');
@@ -984,6 +1107,16 @@ classdef mcmc_bayes < mcmc
                     error('mcmc_bayes:hierarchicalMixture', ...
                         'mcmc_bayes: prior.hierarchical.K = %d groups need at least K voxels (got %d).', hier.K, Nv);
                 end
+                if isLab && any(hier.groupSize == 0)
+                    warning('mcmc_bayes:hierarchicalLabelsEmpty', ...
+                        ['mcmc_bayes: label group(s) %s have no voxel in this call; their (mu_k, Sigma_k) are drawn from the ' ...
+                         'hyperprior.'], mat2str(hier.labelValues(hier.groupSize == 0)));
+                end
+            end
+            % fixed labels: one group index per voxel of this call
+            if isLab && numel(hier.labels) ~= Nv
+                error('mcmc_bayes:hierarchicalLabels', ...
+                    'mcmc_bayes: prior.hierarchical.labels has %d entries for %d voxels (after masking).', numel(hier.labels), Nv);
             end
 
             % MRF: neighbour table, colour classes and edge weights (host), memory guard
@@ -1143,7 +1276,17 @@ classdef mcmc_bayes < mcmc
                 d       = hier.d;
                 floorVar = (10 .* median(double(gather(sigmaStart(hIdx,:))), 2)).^2;   % [d,1]
                 hp      = this.resolve_hyperprior(hier, double(gather(uStart(hIdx,:))), floorVar);
-                if isMix
+                if isLab
+                    % fixed labels (Phase 9c): group index of every voxel on the GPU, per-group kept samples
+                    Klab        = hier.K;
+                    zLab        = gpuArray(double(hier.labels(:).'));
+                    if isGibbs
+                        muPost      = zeros(d, Klab, Ns, fitting.repetition);
+                        SigmaPost   = zeros(d, d, Klab, Ns, fitting.repetition);
+                        muLast      = zeros(d, Klab, fitting.repetition);
+                        SigmaLast   = zeros(d, d, Klab, fitting.repetition);
+                    end
+                elseif isMix
                     % mixture (Phase 7): ordered kept samples, final state, membership counts
                     Kmix        = hier.K;
                     if isGibbs
@@ -1169,6 +1312,8 @@ classdef mcmc_bayes < mcmc
                 end
             end
             lpC   = [];     % mixture log-prior constants log pi_k - log|Sigma_k|/2 (K > 1 only; [] selects the single-Normal log-prior)
+            if ~(isHier && isLab); zLab = []; end   % group index per voxel (labels only; [] selects the other log-priors)
+            labA  = [];     % the same for the voxels of the active colour (subsetForward)
             if fitting.checkCache
                 cacheErr = struct('loglik', 0, 'logprior', 0, 'logjac', 0, 'Ncheck', 0);
                 if isMRF; cacheErr.inactiveMoved = 0; end
@@ -1193,6 +1338,10 @@ classdef mcmc_bayes < mcmc
                 end
                 clear selfIdx nbrSelf
                 mrfCoef  = gpuArray(single(mrf.W(:) ./ mrf.tau));  % [d,1] W_p/tau
+                if isLab
+                    labC = cell(1, Ncol);
+                    for kc = 1:Ncol; labC{kc} = zLab(mrfAct{kc}); end
+                end
                 mrfDelta = gpuArray(single(mrf.delta(:)));          % [d,1] Huber thresholds (u space)
 
                 % Phase 4b: forward model and likelihood on the active colour only (see the header)
@@ -1282,7 +1431,17 @@ classdef mcmc_bayes < mcmc
             end
 
             % hyperparameters and cached per-voxel log-prior
-            if isMix
+            if isLab
+                % fixed labels (Phase 9c): free mode from the per-group moments of the current u, fixed mode from
+                % the user values; the MH prior term is the Normal of the voxel's own group
+                if isGibbs
+                    [mu, Sigma] = this.labels_init(uCurr(hIdx,:), zLab, Klab, floorVar, hp.m0);
+                else
+                    mu = hier.mu; Sigma = hier.Sigma;
+                end
+                [muG, PG]   = this.groups_to_gpu(mu, Sigma);
+                lpCurr      = this.logprior_hier(uCurr(hIdx,:), lpC, muG, PG, tLam, tNu, zLab);
+            elseif isMix
                 % mixture (Phase 7): free mode from k-means on the current u, fixed mode from the user values
                 % with z = the most probable group of the current u
                 if isGibbs
@@ -1348,6 +1507,7 @@ classdef mcmc_bayes < mcmc
                 for kc = 1:Ncol
                 if isMRF
                     act = mrfAct{kc};
+                    if isLab; labA = labC{kc}; end
                     if fitting.checkCache; uBefore = uCurr; end
                 end
 
@@ -1378,7 +1538,7 @@ classdef mcmc_bayes < mcmc
                     % forward model and likelihood on the active voxels only
                     if isMarginal; [logLProposed, statsProposed] = loglikC{kc}(xProposed); else; logLProposed = loglikC{kc}(xProposed); end
                     % the MRF requires the hierarchical prior in fixed mode, so tLam = [] here (collapsed t or Normal)
-                    lpProposed  = this.logprior_hier(uProposed(hIdx,:), lpC, muG, PG, tLam, tNu);
+                    lpProposed  = this.logprior_hier(uProposed(hIdx,:), lpC, muG, PG, tLam, tNu, labA);
                     dPhi        = this.mrf_local_delta(uProposed(hIdx,:), uA(hIdx,:), uCurr(hIdx,:), ...
                                                        mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential, mrf.stateWeight);
                     if hasJac
@@ -1432,7 +1592,7 @@ classdef mcmc_bayes < mcmc
                         if isHierRow(kp)
                             uProposedH          = uA(hIdx,:);
                             uProposedH(hIdx==kp,:) = uProposed_p;
-                            lpProposed          = this.logprior_hier(uProposedH, lpC, muG, PG, tLam, tNu);   % tLam = [] (fixed mode)
+                            lpProposed          = this.logprior_hier(uProposedH, lpC, muG, PG, tLam, tNu, labA);   % tLam = [] (fixed mode)
                             logRatio            = logRatio + (lpProposed - lpA);
                             pH                  = find(hIdx==kp);
                             dPhi                = this.mrf_local_delta(uProposed_p, uA(kp,:), uCurr(kp,:), ...
@@ -1486,7 +1646,7 @@ classdef mcmc_bayes < mcmc
                     % 2. Metropolis sampling
                     % 2.1 proposal probability (+ log-Jacobian of the transform, + hierarchical log-prior)
                     if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
-                    if isHier; lpProposed = this.logprior_hier(uProposed(hIdx,:), lpC, muG, PG, tLam, tNu); end
+                    if isHier; lpProposed = this.logprior_hier(uProposed(hIdx,:), lpC, muG, PG, tLam, tNu, zLab); end
                     % MRF: change of the local term of the active voxels, current neighbours (never cached)
                     if isMRF
                         dPhi = this.mrf_local_delta(uProposed(hIdx,act), uCurr(hIdx,act), uCurr(hIdx,:), ...
@@ -1549,7 +1709,7 @@ classdef mcmc_bayes < mcmc
                         if isHierRow(kp)
                             uProposedH          = uCurr(hIdx,:);
                             uProposedH(hIdx==kp,:) = uProposed_p;
-                            lpProposed          = this.logprior_hier(uProposedH, lpC, muG, PG, tLam, tNu);
+                            lpProposed          = this.logprior_hier(uProposedH, lpC, muG, PG, tLam, tNu, zLab);
                             logRatio            = logRatio + (lpProposed - lpCurr);
                             % MRF: change of the local term of parameter kp of the active voxels
                             if isMRF
@@ -1584,7 +1744,19 @@ classdef mcmc_bayes < mcmc
                 if isMRF && ~isComponent; isAccepted = isAccSweep; end
 
                 % 3. Gibbs block: exact conditional draws of (mu, Sigma), then refresh the log-prior cache
-                if isMix && isGibbs
+                if isLab && isGibbs
+                    % fixed labels (Phase 9c): per group, the conjugate draw from the voxels with that label
+                    % (groups conditionally independent given u), then the group log-prior cache
+                    uH          = uCurr(hIdx,:);
+                    [nk, ubarK, SK] = this.hyper_suffstats_groups(uH, zLab, Klab);
+                    for kk = 1:Klab
+                        [mu(:,kk), Sigma(:,:,kk)] = this.gibbs_hyper(ubarK(:,kk), SK(:,:,kk), nk(kk), mu(:,kk), Sigma(:,:,kk), hp);
+                    end
+                    [muG, PG]   = this.groups_to_gpu(mu, Sigma);
+                    lpCurr      = this.logprior_hier(uH, lpC, muG, PG, tLam, tNu, zLab);
+                elseif isLab
+                    % fixed mode: nothing to update
+                elseif isMix && isGibbs
                     % mixture (Phase 7, partially collapsed Gibbs): the MH block above moved u given theta with
                     % z collapsed; now z | u, theta (exact, all voxels), per-group NIW | u, z, pi | z, then the
                     % collapsed log-prior cache. Fixed mode: no z at all (u updates do not need it)
@@ -1624,7 +1796,7 @@ classdef mcmc_bayes < mcmc
                     cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(lFresh, logLCurr));
                     if isMarginal; cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(sFresh, statsCurr)); end
                     if isHier
-                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_hier(uCurr(hIdx,:), lpC, muG, PG, tLam, tNu), lpCurr));
+                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_hier(uCurr(hIdx,:), lpC, muG, PG, tLam, tNu, zLab), lpCurr));
                     end
                     if hasJac
                         jFresh = this.transform_logjac(uCurr, method, lb, ub);
@@ -1681,7 +1853,10 @@ classdef mcmc_bayes < mcmc
                     counter = counter+1;
                     if hasJac; xPosterior(:,:,counter,ii) = gather(xCurr); else; xPosterior(:,:,counter,ii) = gather(uCurr); end
                     if isMarginal; statsPost(:,:,counter,ii) = gather(statsCurr); end
-                    if isMix
+                    if isLab
+                        % fixed labels: groups in labelValues order (no label switching)
+                        if isGibbs; muPost(:,:,counter,ii) = mu; SigmaPost(:,:,:,counter,ii) = Sigma; end
+                    elseif isMix
                         % ordered groups (label switching); Rao-Blackwellised membership P(z_i = k | u_i, theta)
                         % of this kept state, rows in the ordered labelling
                         ord = this.mixture_order(mu, isGibbs);
@@ -1721,7 +1896,9 @@ classdef mcmc_bayes < mcmc
                 acLambda(:,ii)      = gather(acLam(:));
                 acValidOut(:,ii)    = gather(acValid(:));
             end
-            if isMix
+            if isLab
+                if isGibbs; muLast(:,:,ii) = mu; SigmaLast(:,:,:,ii) = Sigma; end
+            elseif isMix
                 ord = this.mixture_order(mu, isGibbs);
                 if isGibbs; muLast(:,:,ii) = mu(:,ord); SigmaLast(:,:,:,ii) = Sigma(:,:,ord); piLast(:,ii) = piW(ord); end
                 Rk      = this.mixture_responsibilities(uCurr(hIdx,:), mixD);
@@ -1764,7 +1941,21 @@ classdef mcmc_bayes < mcmc
                 hyper = struct('params', {hier.params}, ...
                                'transform', {this.transform_description(method(hIdx), fitting.lb(hIdx), fitting.ub(hIdx))}, ...
                                'hyperprior', hier.hyperprior, 'fixed', hier.fixed);
-                if isMix
+                if isLab
+                    % fixed labels (Phase 9c): groups in labelValues order, no membership
+                    hyper.K         = Klab;
+                    hyper.labels    = hier.labelValues;
+                    hyper.groupSize = hier.groupSize;
+                    if isGibbs
+                        hyper.muPost    = muPost;
+                        hyper.SigmaPost = SigmaPost;
+                        hyper.muLast    = muLast;
+                        hyper.SigmaLast = SigmaLast;
+                    else
+                        hyper.mu        = hier.mu;
+                        hyper.Sigma     = hier.Sigma;
+                    end
+                elseif isMix
                     % mixture (Phase 7): ordered samples, membership frequency [Nv,K] over the kept samples
                     % of all repetitions (final z if there is none)
                     hyper.K         = Kmix;
@@ -1937,7 +2128,12 @@ classdef mcmc_bayes < mcmc
             if isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical') && ~isempty(fitting.prior.hierarchical) && ...
                     ~(islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
                 h = fitting.prior.hierarchical;
-                if isstruct(h) && isfield(h,'distribution') && strcmpi(h.distribution, 't')
+                if isstruct(h) && isfield(h,'labels') && ~isempty(h.labels)
+                    nG = numel(field_or_default(h, 'labelValues', []));
+                    if nG == 0; nG = numel(unique(h.labels(:))); end
+                    disp(['Prior             : hierarchical Normal per fixed label group on u, ', num2str(nG), ' group(s), fixed = ', ...
+                          num2str(isfield(h,'fixed') && ~isempty(h.fixed) && logical(h.fixed))]);
+                elseif isstruct(h) && isfield(h,'distribution') && strcmpi(h.distribution, 't')
                     disp(['Prior             : hierarchical Student-t on u, nu = ', num2str(field_or_default(h,'nu',4)), ...
                           ', fixed = ', num2str(isfield(h,'fixed') && ~isempty(h.fixed) && logical(h.fixed))]);
                 elseif isstruct(h) && isfield(h,'K') && ~isempty(h.K) && isnumeric(h.K) && isscalar(h.K) && h.K > 1
@@ -2450,6 +2646,96 @@ classdef mcmc_bayes < mcmc
             end
         end
 
+        %% per-voxel mcmc_bayes inputs through the model classes (Phase 9c): one mechanism for
+        %% extraData.noiseSigma (-> fitting.ricianSigma, Phase 9a) and extraData.priorLabels
+        %% (-> fitting.prior.hierarchical.labels). A model class calls, in estimate:
+        %%   [extraData, voxelMaps] = mcmc_bayes.take_voxel_maps(extraData);             before any data preparation
+        %%   fitting = mcmc_bayes.voxel_maps_to_fitting(fitting, voxelMaps, mask, scale); on the final mask
+        %%   fittingSeg = mcmc_bayes.slice_voxel_maps(fitting, fitRange, size(mask,1:3)); per GPU segment
+        %% Without these extraData fields nothing changes (the noise-map path is exactly Phase 9a's).
+        % take the per-voxel mcmc_bayes inputs out of extraData (so that no forward model or data preparation sees
+        % them): voxelMaps.noiseSigma and .priorLabels ([] if absent); extraData unchanged without these fields
+        function [extraData, voxelMaps] = take_voxel_maps(extraData)
+            [extraData, noiseMap] = mcmc_bayes.take_noise_map(extraData);
+            voxelMaps = struct('noiseSigma', {noiseMap}, 'priorLabels', {[]});
+            if isstruct(extraData) && isfield(extraData, 'priorLabels')
+                voxelMaps.priorLabels = extraData.priorLabels;
+                extraData = rmfield(extraData, 'priorLabels');
+            end
+        end
+
+        % put the per-voxel maps into fitting: noiseSigma as noise_map_to_fitting (rescaled by scale), priorLabels
+        % as labels_to_fitting (not rescaled)
+        function fitting = voxel_maps_to_fitting(fitting, voxelMaps, mask, scale)
+            if nargin < 4; scale = []; end
+            if ~isempty(voxelMaps.noiseSigma)
+                fitting = mcmc_bayes.noise_map_to_fitting(fitting, voxelMaps.noiseSigma, mask, scale);
+            end
+            fitting = mcmc_bayes.labels_to_fitting(fitting, voxelMaps.priorLabels, mask);
+        end
+
+        % per-segment copy of fitting: the ricianSigma map (slice_noise_map) and a prior.hierarchical.labels map with
+        % the spatial size of the full volume are sliced along dim 3 like the data (fitRange, halo slices included)
+        function fittingSeg = slice_voxel_maps(fitting, fitRange, dims)
+            fittingSeg = mcmc_bayes.slice_noise_map(fitting, fitRange, dims);
+            if mcmc_bayes.has_labels(fitting)
+                lab = fitting.prior.hierarchical.labels;
+                if ndims(lab) <= 3 && isequal(size(lab, 1:3), dims(1:3))
+                    fittingSeg.prior.hierarchical.labels = lab(:, :, fitRange);
+                end
+            end
+        end
+
+        % segmentation labels of a model class (extraData.priorLabels, or a map already in
+        % fitting.prior.hierarchical.labels) for the whole volume: labelValues resolved on the final mask (so that
+        % every GPU segment has the same groups), and a filler outside the mask (labelValues in turn, round-robin;
+        % only the GPU memory probe reaches those voxels, and so every group has voxels there); labels are not
+        % rescaled. fitting is unchanged without labels, and for a labels vector ([1,Nv], already masked)
+        function fitting = labels_to_fitting(fitting, labelMap, mask)
+            if isempty(labelMap) && ~mcmc_bayes.has_labels(fitting); return; end
+            isBayes = isfield(fitting, 'solver') && strcmpi(fitting.solver, 'mcmc') && ...
+                      isfield(fitting, 'mcmcClass') && strcmpi(fitting.mcmcClass, 'mcmc_bayes');
+            if ~isempty(labelMap)
+                if ~isBayes
+                    warning('mcmc_bayes:priorLabelsUnused', ...
+                        'extraData.priorLabels is only used by fitting.mcmcClass = ''mcmc_bayes'' with fitting.prior.hierarchical; ignored.');
+                    return
+                end
+                hasHier = isfield(fitting, 'prior') && isstruct(fitting.prior) && isfield(fitting.prior, 'hierarchical') && ...
+                          ~isempty(fitting.prior.hierarchical) && ~(islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical);
+                if ~hasHier
+                    error('mcmc_bayes:hierarchicalLabels', ...
+                        'mcmc_bayes: extraData.priorLabels needs fitting.prior.hierarchical (the labels define its groups).');
+                end
+                if islogical(fitting.prior.hierarchical); fitting.prior.hierarchical = struct(); end
+                if mcmc_bayes.has_labels(fitting)
+                    error('mcmc_bayes:hierarchicalLabels', ...
+                        'mcmc_bayes: set either extraData.priorLabels or fitting.prior.hierarchical.labels, not both.');
+                end
+                if ~((isnumeric(labelMap) || islogical(labelMap)) && isreal(labelMap)) || ...
+                        ~(ndims(labelMap) <= 3 && isequal(size(labelMap, 1:3), size(mask, 1:3)))
+                    error('mcmc_bayes:hierarchicalLabels', ...
+                        'mcmc_bayes: extraData.priorLabels must be a real numeric map with the spatial size of the mask (%s), got %s.', ...
+                        mat2str(size(mask, 1:3)), mat2str(size(labelMap)));
+                end
+                fitting.prior.hierarchical.labels = labelMap;
+            elseif ~isBayes
+                return
+            end
+            h   = fitting.prior.hierarchical;
+            lab = h.labels;
+            % only a map of the whole volume is resolved here (a [1,Nv] vector is used by mcmc_bayes as given)
+            if ~(ndims(lab) <= 3 && isequal(size(lab, 1:3), size(mask, 1:3))); return; end
+            lab = double(lab);
+            in  = mask > 0;
+            [~, lv] = mcmc_bayes.resolve_labels(lab(in), field_or_default(h, 'labelValues', []));
+            out = find(~in);
+            if ~isempty(lv); lab(out) = lv(mod(0:numel(out)-1, numel(lv)) + 1); end
+            h.labels      = lab;
+            h.labelValues = lv;
+            fitting.prior.hierarchical = h;
+        end
+
         % per-voxel ricianSigma map -> [1,Nv] in mask order (like the data); errors if it does not
         % match the mask passed to mcmc_bayes (e.g. a wrapper split the volume into segments)
         function rs = mask_rician_sigma(rs, mask, mask_idx)
@@ -2582,11 +2868,16 @@ classdef mcmc_bayes < mcmc
         %                               initialisation, fixed group weights [K,1] (K > 1 only, else [])
         %   .distribution, .nu        : population distribution (Phase 9b): 'normal' | 't', and the
         %                               degrees of freedom of 't' ([] for 'normal')
+        %   .labels, .labelValues, .groupSize : fixed segmentation labels (Phase 9c): group index 1..K of
+        %                               every voxel [1,Nv] (labels as given, e.g. masked by optimisation), the
+        %                               label value of each group [1,K], and n_k [K,1]; all [] without labels
+        %   .stage1RhatMax            : run_two_stage safeguard threshold (Phase 9c)
         %
             hier = struct('on', false, 'params', {{}}, 'idx', [], 'd', 0, 'hyperprior', '', ...
                           'm0', [], 'kappa0', [], 'Psi0', [], 'nu0', [], 'fixed', false, 'mu', [], 'Sigma', [], ...
                           'subsetFraction', 1, 'maxGPUMemory', [], 'K', 1, 'alpha', 1, 'init', 'kmeans', 'pi', [], ...
-                          'distribution', 'normal', 'nu', []);
+                          'distribution', 'normal', 'nu', [], 'labels', [], 'labelValues', [], 'groupSize', [], ...
+                          'stage1RhatMax', 1.1);
             if ~isfield(fitting,'prior') || isempty(fitting.prior); return; end
             prior = fitting.prior;
             if ~isstruct(prior) || ~isscalar(prior)
@@ -2606,7 +2897,7 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: fitting.prior.hierarchical must be a structure (or true).');
             end
             valid = {'hyperprior','m0','kappa0','Psi0','nu0','fixed','mu','Sigma','params','subsetFraction','maxGPUMemory', ...
-                     'K','alpha','init','pi','distribution','nu'};
+                     'K','alpha','init','pi','distribution','nu','labels','labelValues','stage1RhatMax'};
             bad   = setdiff(fieldnames(h), valid);
             if ~isempty(bad)
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior.hierarchical: %s (valid: %s).', ...
@@ -2685,6 +2976,31 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:hierarchicalMixture', 'mcmc_bayes: prior.hierarchical.K must be a positive integer.');
             end
             K       = double(K);
+
+            % fixed segmentation labels (Phase 9c): K is implied by the groups
+            labels  = field_or_default(h, 'labels', []);
+            isLab   = ~isempty(labels);
+            if ~isLab && isfield(h, 'labelValues') && ~isempty(h.labelValues)
+                error('mcmc_bayes:hierarchicalLabels', 'mcmc_bayes: prior.hierarchical.labelValues is only used with prior.hierarchical.labels.');
+            end
+            if isLab
+                [zLab, labelValues, groupSize] = mcmc_bayes.resolve_labels(labels, field_or_default(h, 'labelValues', []));
+                if isfield(h, 'K') && ~isempty(h.K) && K ~= numel(labelValues)
+                    error('mcmc_bayes:hierarchicalLabels', ...
+                        ['mcmc_bayes: prior.hierarchical.K = %d, but the labels define %d group(s) (label values %s). With labels, ' ...
+                         'K is implied by the groups: omit K.'], K, numel(labelValues), mat2str(labelValues));
+                end
+                K   = numel(labelValues);
+                if isfield(h, 'pi') && ~isempty(h.pi)
+                    error('mcmc_bayes:hierarchicalLabels', ...
+                        'mcmc_bayes: prior.hierarchical.pi is not used with labels (the group of every voxel is known; there are no group weights).');
+                end
+                if isfield(h, 'distribution') && ~isempty(h.distribution) && strcmpi(char(string(h.distribution)), 't')
+                    error('mcmc_bayes:hierarchicalLabels', ...
+                        'mcmc_bayes: prior.hierarchical.labels supports distribution ''normal'' only (the Student-t prior is K = 1).');
+                end
+            end
+            rhatMax = mcmc_bayes.check_stage1_rhat_max(field_or_default(h, 'stage1RhatMax', 1.1));
             alpha   = field_or_default(h, 'alpha', 1);
             if ~(isnumeric(alpha) && isscalar(alpha) && isfinite(alpha) && alpha > 0)
                 error('mcmc_bayes:hierarchicalMixture', 'mcmc_bayes: prior.hierarchical.alpha must be a positive finite scalar.');
@@ -2693,7 +3009,14 @@ classdef mcmc_bayes < mcmc
             if ~strcmp(init, 'kmeans')
                 error('mcmc_bayes:hierarchicalMixture', 'mcmc_bayes: prior.hierarchical.init must be ''kmeans'' (got ''%s'').', init);
             end
-            if K > 1 && strcmp(hyperprior, 'jeffreys_half')
+            if isLab && strcmp(hyperprior, 'jeffreys_half') && ~logical(field_or_default(h, 'fixed', false)) && any(groupSize <= 2*d - 1)
+                % fixed labels: jeffreys_half per group needs n_k > 2d-1 in every group (Phase 3 condition)
+                error('mcmc_bayes:hierarchicalLabels', ...
+                    ['mcmc_bayes: hyperprior ''jeffreys_half'' with labels needs more than 2d-1 = %d voxels in every group; ' ...
+                     'group(s) with label %s have %s voxel(s). Use ''niw'' (proper for any group size) or merge the small groups.'], ...
+                    2*d - 1, mat2str(labelValues(groupSize <= 2*d - 1)), mat2str(groupSize(groupSize <= 2*d - 1).'));
+            end
+            if K > 1 && ~isLab && strcmp(hyperprior, 'jeffreys_half')
                 error('mcmc_bayes:hierarchicalMixture', ...
                     ['mcmc_bayes: hyperprior ''jeffreys_half'' is not supported with K > 1 (improper per group: an empty or ' ...
                      'small group has no proper conditional). Use ''niw''.']);
@@ -2731,7 +3054,23 @@ classdef mcmc_bayes < mcmc
             if ~isempty(piFix) && (~fixed || (K == 1 && ~isequal(double(piFix), 1)))
                 error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: prior.hierarchical.pi is only used with fixed = true and K > 1.');
             end
-            if fixed && K > 1
+            if fixed && isLab
+                % fixed labels (Phase 9c): one (mu_k, Sigma_k) per group, in labelValues order; no pi
+                if K == 1 && isnumeric(mu) && numel(mu) == d; mu = reshape(mu, d, 1); end
+                if ~(isnumeric(mu) && isequal(size(mu), [d K]) && all(isfinite(mu(:))))
+                    error('mcmc_bayes:hierarchicalFixed', ['mcmc_bayes: fixed mode with labels (K = %d groups, label values %s) needs ' ...
+                        'prior.hierarchical.mu [d,K] = [%d,%d], finite (u space), columns in label order.'], K, mat2str(labelValues), d, K);
+                end
+                mu      = double(mu);
+                if ~(isnumeric(Sigma) && size(Sigma,1) == d && size(Sigma,2) == d && size(Sigma,3) == K && ndims(Sigma) <= 3)
+                    error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode with labels (K = %d groups) needs prior.hierarchical.Sigma [d,d,K] = [%d,%d,%d].', K, d, d, K);
+                end
+                SigmaK  = zeros(d, d, K);
+                for k = 1:K
+                    SigmaK(:,:,k) = mcmc_bayes.check_spd(double(Sigma(:,:,k)), d, 'mcmc_bayes:hierarchicalFixed', sprintf('prior.hierarchical.Sigma(:,:,%d)', k));
+                end
+                Sigma   = SigmaK;
+            elseif fixed && K > 1
                 if ~(isnumeric(mu) && isequal(size(mu), [d K]) && all(isfinite(mu(:))))
                     error('mcmc_bayes:hierarchicalFixed', 'mcmc_bayes: fixed mode with K = %d needs prior.hierarchical.mu [d,K] = [%d,%d], finite (u space).', K, d, K);
                 end
@@ -2780,9 +3119,15 @@ classdef mcmc_bayes < mcmc
             hier.K              = K;
             hier.alpha          = double(alpha);
             hier.init           = init;
-            if K > 1; hier.pi = piFix; else; hier.pi = []; end
+            if K > 1 && ~isLab; hier.pi = piFix; else; hier.pi = []; end
             hier.distribution   = distribution;
             hier.nu             = nuT;
+            if isLab
+                hier.labels         = zLab;
+                hier.labelValues    = labelValues;
+                hier.groupSize      = groupSize;
+            end
+            hier.stage1RhatMax  = rhatMax;
         end
 
         % symmetric positive definite d x d check (returns the symmetrised matrix)
@@ -2925,7 +3270,13 @@ classdef mcmc_bayes < mcmc
         %                         scale weights): lam_i * (-(u-mu)' P (u-mu)/2)
         %   tNu, lam = []       : collapsed multivariate t (fixed mode, two-stage stage 2):
         %                         -(nu+d)/2 log(1 + (u-mu)' P (u-mu)/nu)
-        function lp = logprior_hier(uH, c, mu, P, lam, tNu)
+        %   z = [1,N] (Phase 9c): fixed labels, the Normal of each voxel's group (logprior_labels; mu [d,K],
+        %                         P [d,d,K]); z omitted or [] -> the rules above
+        function lp = logprior_hier(uH, c, mu, P, lam, tNu, z)
+            if nargin >= 7 && ~isempty(z)
+                lp = mcmc_bayes.logprior_labels(uH, mu, P, z);
+                return
+            end
             if isempty(tNu)
                 lp = mcmc_bayes.logprior_mix(uH, c, mu, P);
                 return
@@ -3179,6 +3530,154 @@ classdef mcmc_bayes < mcmc
             end
         end
 
+        %% fixed segmentation labels (Phase 9c), see the class header
+        % true if prior.hierarchical.labels is set (non-empty)
+        function tf = has_labels(fitting)
+            tf = isstruct(fitting) && isfield(fitting,'prior') && isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical') && ...
+                 isstruct(fitting.prior.hierarchical) && isscalar(fitting.prior.hierarchical) && ...
+                 isfield(fitting.prior.hierarchical,'labels') && ~isempty(fitting.prior.hierarchical.labels);
+        end
+
+        % prior.hierarchical.labels -> [1,Nv] in mask order (like the data): a map with the spatial size of the
+        % mask, or one value per masked voxel; errors if it matches neither (e.g. a wrapper split the volume
+        % and the map was not sliced)
+        function h = mask_labels(h, mask, mask_idx)
+            lab = h.labels;
+            Nv  = numel(mask_idx);
+            if ~(isnumeric(lab) || islogical(lab)) || ~isreal(lab)
+                error('mcmc_bayes:hierarchicalLabels', 'mcmc_bayes: prior.hierarchical.labels must be a real numeric (or logical) map.');
+            end
+            if numel(lab) == numel(mask) && isequal(size(lab, 1:3), size(mask, 1:3))
+                lab = lab(mask_idx);
+            elseif isvector(lab) && numel(lab) == Nv
+                % one value per masked voxel (mask order)
+            else
+                error('mcmc_bayes:hierarchicalLabels', ...
+                    ['mcmc_bayes: prior.hierarchical.labels has size %s, but the mask passed to mcmc_bayes has size %s (%d voxels); ' ...
+                     'the labels must have the spatial size of the mask, or one value per masked voxel.'], ...
+                    mat2str(size(lab)), mat2str(size(mask)), Nv);
+            end
+            h.labels = reshape(double(lab), 1, []);
+        end
+
+        % group index z [1,N] (1..K), the label value of each group lv [1,K] and n_k [K,1] of a label vector;
+        % lv = [] -> the sorted distinct labels. Labels must be finite and integer-valued, lv strictly increasing,
+        % and every label one of lv
+        function [z, lv, n] = resolve_labels(lab, lv)
+            lab = double(reshape(lab, 1, []));
+            if ~(isreal(lab) && all(isfinite(lab)) && all(lab == round(lab)))
+                error('mcmc_bayes:hierarchicalLabels', ...
+                    'mcmc_bayes: prior.hierarchical.labels must be finite and integer-valued inside the mask (%d voxel(s) are not).', ...
+                    nnz(~(isfinite(lab) & lab == round(lab))));
+            end
+            if isempty(lv)
+                lv = unique(lab);
+            else
+                if ~(isnumeric(lv) && isreal(lv) && isvector(lv) && all(isfinite(lv(:))) && all(lv(:) == round(lv(:))) && all(diff(double(lv(:))) > 0))
+                    error('mcmc_bayes:hierarchicalLabels', 'mcmc_bayes: prior.hierarchical.labelValues must be finite integers in strictly increasing order.');
+                end
+                lv = double(reshape(lv, 1, []));
+            end
+            [isIn, z] = ismember(lab, lv);
+            if ~all(isIn)
+                error('mcmc_bayes:hierarchicalLabels', ...
+                    'mcmc_bayes: label value(s) %s inside the mask are not in prior.hierarchical.labelValues %s.', ...
+                    mat2str(unique(lab(~isIn))), mat2str(lv));
+            end
+            n = accumarray(z(:), 1, [numel(lv) 1]);
+        end
+
+        % group hyperparameters on the GPU: single mu [d,K] and precision [d,d,K] (per group exactly prior_to_gpu)
+        function [muG, PG] = groups_to_gpu(mu, Sigma)
+            [d, K]  = size(mu);
+            muG     = zeros(d, K, 'single', 'gpuArray');
+            PG      = zeros(d, d, K, 'single', 'gpuArray');
+            for k = 1:K
+                [muG(:,k), PG(:,:,k)] = mcmc_bayes.prior_to_gpu(mu(:,k), Sigma(:,:,k));
+            end
+        end
+
+        % per-voxel log-prior (u-dependent part) under fixed labels: the Normal of the voxel's own group,
+        % -(u_i - mu_{z_i})' P_{z_i} (u_i - mu_{z_i})/2, [1,N] in the class of uH; z [1,N] group indices
+        % of the same voxels (uH may be the voxels of one colour)
+        function lp = logprior_labels(uH, mu, P, z)
+            K = size(mu, 2);
+            if K == 1
+                lp = mcmc_bayes.logprior_normal(uH, mu, P);
+                return
+            end
+            lp = zeros(1, size(uH, 2), 'like', uH);
+            for k = 1:K
+                ik = (z == k);
+                lp(ik) = mcmc_bayes.logprior_normal(uH(:, ik), mu(:,k), P(:,:,k));
+            end
+        end
+
+        % free-mode initial hyperparameters per label group (no random numbers): mu_k = ubar_k,
+        % Sigma_k = diag(max(S_k,pp/(n_k-1), floorVar)) (the K = 1 rule; n_k = 1 gives the floor);
+        % an empty group m0 and diag(floorVar). Host double output
+        function [mu, Sigma] = labels_init(uH, z, K, floorVar, m0)
+            [n, ubar, S] = mcmc_bayes.hyper_suffstats_groups(uH, z, K);
+            d       = size(ubar, 1);
+            mu      = zeros(d, K); Sigma = zeros(d, d, K);
+            for k = 1:K
+                if n(k) > 0
+                    mu(:,k) = ubar(:,k);
+                else
+                    mu(:,k) = m0(:);
+                end
+                v = diag(S(:,:,k)) ./ max(n(k) - 1, 1);
+                Sigma(:,:,k) = diag(max(v, floorVar(:)));
+            end
+        end
+
+        %% two-stage safeguard (Phase 9c)
+        % prior.hierarchical.stage1RhatMax: a scalar >= 1 (Inf switches the check off)
+        function r = check_stage1_rhat_max(r)
+            if ~(isnumeric(r) && isreal(r) && isscalar(r) && ~isnan(r) && r >= 1)
+                error('mcmc_bayes:invalidPrior', 'mcmc_bayes: prior.hierarchical.stage1RhatMax must be a scalar >= 1 (Inf: no check).');
+            end
+            r = double(r);
+        end
+
+        % error if the stage-1 population prior has not converged: max split-R-hat of mu (K > 1 mixture: and pi)
+        % > rhatMax, or NaN; warning if no R-hat is available (repetition = 1 or < 4 kept samples)
+        function check_stage1_convergence(H, rhatMax)
+            if isinf(rhatMax); return; end
+            if ~isfield(H, 'rhat') || ~isfield(H.rhat, 'mu')
+                warning('mcmc_bayes:stage1NoRhat', ...
+                    ['mcmc_bayes.run_two_stage: the convergence of the stage-1 population prior cannot be checked (no R-hat: ' ...
+                     'repetition = 1 or fewer than 4 kept samples). Stage 2 fixes the stage-1 posterior means; use repetition >= 2 ' ...
+                     '(with overdisp > 0) to check that they are not a mean over different modes.']);
+                return
+            end
+            names = {'mu'};
+            if isfield(H.rhat, 'pi'); names{end+1} = 'pi'; end
+            worst = -Inf; where = ''; isBad = false;
+            for q = 1:numel(names)
+                r = H.rhat.(names{q});
+                if any(isnan(r(:)))
+                    isBad = true; worst = NaN; where = sprintf('%s (NaN)', names{q});
+                    break
+                end
+                [rq, iq] = max(r(:));
+                if rq > worst
+                    worst = rq;
+                    [i1, i2] = ind2sub([size(r, 1), numel(r)/size(r, 1)], iq);     % mu [d,K] (parameter, group), pi [K,1]
+                    where = sprintf('%s(%d,%d)', names{q}, i1, i2);
+                end
+            end
+            if isBad || worst > rhatMax
+                error('mcmc_bayes:stage1NotConverged', ...
+                    ['mcmc_bayes.run_two_stage: the stage-1 population prior has not converged (max split-R-hat %.3g at %s > ' ...
+                     'prior.hierarchical.stage1RhatMax = %.3g). Stage 2 would fix mu, Sigma at the stage-1 posterior means, which for ' ...
+                     'chains in different modes (e.g. a learned K = 2 mixture that splits CSF-vs-tissue in some chains and GM-vs-WM ' ...
+                     'in others) is a mean over the modes and not a population prior of any of them. Run stage 1 longer (iteration, ' ...
+                     'burnin), use fixed segmentation labels (prior.hierarchical.labels) instead of a learned mixture, or set ' ...
+                     'prior.hierarchical.stage1RhatMax = Inf to run stage 2 anyway.'], worst, where, rhatMax);
+            end
+        end
+
         % heuristic GPU memory (bytes) of one sampler call, see the class header
         function bytes = estimate_gpu_memory(Nm, Nv, Nvar)
             bytes = 2 * 4 * Nv * (8*Nm + 24*Nvar + 16);
@@ -3241,8 +3740,24 @@ classdef mcmc_bayes < mcmc
                 s.hierarchical.init     = 'every repetition: mu = mean(u), Sigma = diag(max(var(u), floorVar))';
                 s.hierarchical.floorVar = hp.floorVar;
             end
+            % fixed segmentation labels (Phase 9c): fields added with labels only
+            isLab = isfield(hier, 'labels') && ~isempty(hier.labels);
+            if isLab
+                s.hierarchical.K        = hier.K;
+                s.hierarchical.labels   = hier.labelValues;
+                s.hierarchical.groupSize = hier.groupSize;
+                s.hierarchical.space    = ['u_i | g_i = k ~ N(mu_k, Sigma_k) on the transformed parameters, g_i the FIXED label group of voxel i ' ...
+                                           '(group k <-> label value labels(k)); no log-Jacobian and no bound rejection for these parameters'];
+                s.hierarchical.mhPrior  = 'the Normal of the voxel''s own group: -(u-mu_g)''Sigma_g^-1(u-mu_g)/2 (no z, no pi)';
+                if ~hier.fixed
+                    s.hierarchical.gibbs    = ['after every MH sweep, per label group k: the Phase 3 draw (' hier.hyperprior ') from the voxels ' ...
+                                               'with label k (group without voxels: the hyperprior)'];
+                    s.hierarchical.init     = ['every repetition: per group, mu_k = mean of u, Sigma_k = diag(max(var_k(u), floorVar)) ' ...
+                                               '(empty group: m0, diag(floorVar))'];
+                end
+            end
             % mixture (Phase 7): fields added for K > 1 only
-            if hier.K > 1
+            if hier.K > 1 && ~isLab
                 s.hierarchical.K        = hier.K;
                 s.hierarchical.space    = ['u_i | z_i = k ~ N(mu_k, Sigma_k), z_i ~ Categorical(pi) on the transformed parameters; ' ...
                                            'no log-Jacobian and no bound rejection for these parameters'];
@@ -3360,7 +3875,12 @@ classdef mcmc_bayes < mcmc
             if ~(isnumeric(tau) && isscalar(tau) && isfinite(tau) && tau > 0)
                 error('mcmc_bayes:invalidMrf', 'mcmc_bayes: prior.mrf.tau must be a positive finite scalar.');
             end
-            if hier.K > 1
+            if isfield(hier, 'labels') && ~isempty(hier.labels)
+                % fixed labels (Phase 9c): pooled covariance of the label groups, pi_k = n_k/n of this call
+                sdPrior = sqrt(diag(mcmc_bayes.mixture_marginal_cov(hier.mu, hier.Sigma, hier.groupSize ./ sum(hier.groupSize))));
+                WruleDefault = ['1./sqrt(diag(V)), V = sum_k pi_k (Sigma_k + mu_k mu_k'') - mubar mubar'', pi_k = n_k/n ' ...
+                                '(pooled covariance of the fixed label groups)'];
+            elseif hier.K > 1
                 % mixture (Phase 7): marginal covariance of the fixed mixture
                 sdPrior = sqrt(diag(mcmc_bayes.mixture_marginal_cov(hier.mu, hier.Sigma, hier.pi)));
                 WruleDefault = ['1./sqrt(diag(V)), V = sum_k pi_k (Sigma_k + mu_k mu_k'') - mubar mubar'' ' ...
@@ -3875,6 +4395,10 @@ classdef mcmc_bayes < mcmc
 
         % out.hyper from the hyperparameter samples, see the class header
         function H = hyper2out(hyper)
+            if isfield(hyper, 'labels')
+                H = mcmc_bayes.hyper2out_labels(hyper);
+                return
+            end
             if isfield(hyper, 'K') && hyper.K > 1
                 H = mcmc_bayes.hyper2out_mixture(hyper);
                 return
@@ -3917,6 +4441,50 @@ classdef mcmc_bayes < mcmc
                 if Nrep > 1
                     H.rhat.mu       = mcmc_bayes.rhat(mu);
                     H.rhat.Sigma    = reshape(mcmc_bayes.rhat(SigmaF), d, d);
+                end
+            end
+        end
+
+        % out.hyper of the fixed-label prior (Phase 9c): groups in labelValues order, no pi and no membership
+        function H = hyper2out_labels(hyper)
+            H.params        = hyper.params;
+            H.transform     = hyper.transform;
+            H.hyperprior    = hyper.hyperprior;
+            H.fixed         = hyper.fixed;
+            H.K             = hyper.K;
+            H.labels        = hyper.labels;
+            H.groupSize     = hyper.groupSize;
+            if hyper.fixed
+                H.mean.mu   = hyper.mu;     H.mean.Sigma    = hyper.Sigma;
+                H.median    = H.mean;
+                return
+            end
+            mu      = hyper.muPost;                     % [d, K, Ns, Nrep]
+            Sigma   = hyper.SigmaPost;                  % [d, d, K, Ns, Nrep]
+            d       = size(mu, 1); K = hyper.K;
+            Ns      = size(mu, 3); Nrep = size(mu, 4);
+            muF     = reshape(mu, d*K, Ns, Nrep);
+            SigmaF  = reshape(Sigma, d*d*K, Ns, Nrep);
+            H.posterior.mu      = mu;
+            H.posterior.Sigma   = Sigma;
+            if Ns == 0
+                % no kept samples: final Gibbs state, averaged over chains
+                H.mean.mu       = mean(hyper.muLast, 3);
+                H.mean.Sigma    = mean(hyper.SigmaLast, 4);
+                H.median        = H.mean;
+                H.summary       = 'no kept samples: mean/median are the final Gibbs state averaged over chains';
+                return
+            end
+            H.mean.mu           = reshape(mean(reshape(muF, d*K, []), 2), d, K);
+            H.mean.Sigma        = reshape(mean(reshape(SigmaF, d*d*K, []), 2), d, d, K);
+            H.median.mu         = reshape(median(reshape(muF, d*K, []), 2), d, K);
+            H.median.Sigma      = reshape(median(reshape(SigmaF, d*d*K, []), 2), d, d, K);
+            if Ns >= 4
+                H.ess.mu        = reshape(mcmc_bayes.ess(muF), d, K);
+                H.ess.Sigma     = reshape(mcmc_bayes.ess(SigmaF), d, d, K);
+                if Nrep > 1
+                    H.rhat.mu       = reshape(mcmc_bayes.rhat(muF), d, K);
+                    H.rhat.Sigma    = reshape(mcmc_bayes.rhat(SigmaF), d, d, K);
                 end
             end
         end

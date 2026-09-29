@@ -12,6 +12,10 @@ mcmc_bayes.run_two_stage
 
 The hyperparameter uncertainty is not propagated to stage 2, so this is an approximation of the full joint posterior.
 
+**Convergence check.** Before stage 2, the largest split-R-hat of the stage-1 ``mu`` (for a ``K > 1`` mixture also ``pi``; for segmentation labels over all groups) must not exceed ``fitting.prior.hierarchical.stage1RhatMax`` (default ``1.1``); otherwise the error ``mcmc_bayes:stage1NotConverged`` is raised, because stage 2 would fix the prior at a mean over chains in different modes. ``stage1RhatMax = Inf`` disables the check. With ``fitting.repetition = 1`` (or fewer than 4 kept samples) there is no R-hat: warning ``mcmc_bayes:stage1NoRhat``, and stage 2 runs.
+
+**Segmentation labels** (``prior.hierarchical.labels``): stage 1 learns ``mu_k, Sigma_k`` per label group, stage 2 fixes them with the same labels and groups (``out.settings.empiricalBayes.labels``); with ``subsetFraction < 1`` the stage-1 subset is drawn per group.
+
 Usage
 -----
 
