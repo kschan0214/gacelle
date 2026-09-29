@@ -191,6 +191,9 @@ Hierarchical prior (BSP)
    * - ``.K``
      - ``1``
      - number of groups of a mixture prior, see `Mixture prior`_
+   * - ``.distribution``, ``.nu``
+     - ``'normal'``, ``4``
+     - ``'t'``: heavy-tailed Student-t population prior with ``nu`` degrees of freedom, see `Student-t prior`_
    * - ``.fixed``
      - ``false``
      - ``true``: use the given ``.mu`` and ``.Sigma`` (and ``.pi`` for ``K > 1``) instead of learning them; voxels are then independent and can be segmented
@@ -215,6 +218,26 @@ With ``K > 1`` the population prior is a mixture of ``K`` Normal distributions w
 * In multi-echo AxCaliberSMT, ``K = 2`` separated CSF partial-volume voxels from tissue without any labels and restored their credible-interval coverage.
 
 ``K = 3`` was not well determined in our tests. ``'jeffreys_half'`` is not allowed with ``K > 1``. The output adds ``out.hyper.membership`` (``[x,y,z,K]``, the posterior probability of each group) and ``out.hyper.mapLabel`` (the most likely group). Groups are ordered by the mean of the first hierarchical parameter.
+
+Student-t prior
+^^^^^^^^^^^^^^^
+
+With ``distribution = 't'`` the population prior is a multivariate Student-t, :math:`u_i \sim t_\nu(\mu, \Sigma)`, with ``nu`` degrees of freedom (default 4, fixed) and scale matrix :math:`\Sigma`:
+
+.. code-block:: matlab
+
+    fitting.prior.hierarchical = struct('params', {{'R2star'}}, 'distribution', 't', 'nu', 4);
+
+Its heavy tails let a small or atypical group of voxels sit away from the population mean without being pulled towards it as strongly as under the Normal prior. Use it when the tissue has a dominant population plus a minority that is not a well-defined group of its own, for example iron-rich nuclei among grey and white matter, a lesion, or a small tract inside white matter (e.g. larger axons in the corticospinal tract).
+
+How it differs from a mixture (``K = 2``):
+
+* There is no group choice and no label that can switch between groups, so the fit cannot become multimodal over group assignments, and it does not need a second group large enough to estimate its own mean and covariance.
+* It does not model a second population: every voxel is shrunk towards the same :math:`\mu`, only less strongly in the tails. If the tissue really has two populations of similar size, use ``K = 2``.
+
+``nu`` sets the tail weight: small ``nu`` (2-4) discounts outlying voxels strongly, ``nu`` of 30 or more is close to the Normal prior. The prior is sampled as a scale mixture: each voxel has a weight :math:`\lambda_i` (prior mean 1) with :math:`u_i \mid \lambda_i \sim N(\mu, \Sigma/\lambda_i)`, sampled exactly after every sweep, and :math:`\mu, \Sigma` are updated from the :math:`\lambda`-weighted statistics (both hyperpriors). With ``fixed = true`` (and in stage 2 of the two-stage scheme) the Student-t density is used directly.
+
+The output adds ``out.hyper.lambda`` (``[x,y,z]``), the posterior mean of :math:`\lambda_i`. Voxels the prior treats as outliers have :math:`\lambda_i` well below 1 (their prior precision is scaled down by :math:`\lambda_i`); typical voxels are near or slightly above 1. ``out.hyper.Sigma`` is the scale matrix; the population covariance is :math:`\nu/(\nu-2)\,\Sigma` for :math:`\nu > 2`. The default MRF weights use the scale matrix. ``distribution = 't'`` requires ``K = 1``.
 
 Spatial prior (BSP + MRF)
 -------------------------
@@ -300,7 +323,7 @@ In addition to the usual MCMC output (``out.posterior``, ``out.median``, ...; se
    * - Field
      - Description
    * - ``out.hyper``
-     - population prior: ``.params``, ``.transform``, ``.posterior.mu`` / ``.Sigma`` (samples), ``.mean`` / ``.median``, ``.ess``, ``.rhat``; ``K > 1``: also ``.pi``, ``.membership``, ``.mapLabel``
+     - population prior: ``.params``, ``.transform``, ``.posterior.mu`` / ``.Sigma`` (samples), ``.mean`` / ``.median``, ``.ess``, ``.rhat``; ``K > 1``: also ``.pi``, ``.membership``, ``.mapLabel``; ``'t'``: also ``.distribution``, ``.nu``, ``.lambda``
    * - ``out.diagnostics``
      - as in :ref:`mcmc-sampler-options`
    * - ``out.settings``

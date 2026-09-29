@@ -157,6 +157,20 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
     %     run_two_stage + MRF (subsetForward used): caches <= 1e-5, inactive voxels never move (exactly 0),
     %     finite means, 'noise' in the output, out.settings.rician present; wrappers gpuR2starMapping ('rician')
     %     and gpumcmicro ('gaussian_ricianmean', ricianNav per measurement): finite output, noise present
+    %   Phase 9b (Student-t population prior, prior.hierarchical.distribution = 't'):
+    %   lambda | u draw (host and GPU), delta in {0,1,10,100}, nu = 4, d = 3, N = 2e5: mean and variance within
+    %     5 SE of the Gamma((nu+d)/2, rate (nu+delta)/2) moments; Mahalanobis distances vs direct (RelTol 1e-12)
+    %   lambda-weighted mean/scatter vs loops (RelTol 1e-12); weighted NIW update vs the direct form Psi_n = Psi0 +
+    %     sum lam u u' + k0 m0 m0' - kn mn mn' (RelTol 1e-10); log NIW_post - log NIW_prior - sum log N(u_i|mu,Sigma/lam_i)
+    %     constant over 6 random (mu,Sigma) (<= 1e-8); gibbs_hyper without wSum == with wSum = n (bitwise);
+    %     Monte Carlo (N = 4e4) of the weighted draws: niw E[mu] = m_n, E[Sigma] = Psi_n/(nu_n-d-1); jeffreys_half at
+    %     a fixed mu: E[mu] = ubar_w, E[Sigma] = S_mu,w/(n-2d-1); all within 5 SE; degenerate state -> finite, PD
+    %   collapsed t log-prior vs the direct log-density, differences to voxel 1 (double, AbsTol 1e-10), GPU single
+    %     relative 1e-5; scale-mixture identity by quadrature (RelTol 1e-8); option errors
+    %   GPU runs (mixGrid, checkCache): free niw/jeffreys, fixed, fixed + MRF (subsetForward on/off): caches <= 1e-5,
+    %     inactive voxels never move; fixed-mode lambda map == mean of (nu+d)/(nu+delta) over kept samples (1e-6);
+    %     two-stage: stage 2 fixed t, W = 1/sqrt(diag(SigmaHat)); short exact toy (1D, fixed t, 12 voxels x 32
+    %     chains): quantile z (between-chain SE) frac(|z| > 1.96) <= 0.15, max|z| <= 4.5
     %
     % Kwok-Shing Chan @ MGH
 
@@ -1843,6 +1857,260 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             testCase.verifyLessThanOrEqual(max(abs(z(:))), 4.5, sprintf('max |z| %.2f', max(abs(z(:)))));
         end
 
+        %% Phase 9b: Student-t population prior
+        function testStudentTLambdaConditional(testCase)
+            % lambda | u, mu, Sigma ~ Gamma((nu+d)/2, rate (nu+delta)/2): mean (nu+d)/(nu+delta),
+            % variance 2(nu+d)/(nu+delta)^2; N = 2e5 draws per delta, within 5 SE (host and GPU stream)
+            nu = 4; d = 3; N = 2e5;
+            for delta = [0 1 10 100]
+                a = (nu + d)/2; b = (nu + delta)/2;
+                testCase.verifyEqual(mcmc_bayes.t_lambda_mean(delta, nu, d), a/b, 'RelTol', 1e-14);
+                dl = delta .* ones(1, N);
+                if canUseGPU; dl = gpuArray(dl); end
+                rng(901); parallel.gpu.rng(901);
+                x  = double(gather(mcmc_bayes.t_lambda_draw(dl, nu, d)));
+                testCase.verifyEqual(size(x), [1 N]);
+                seM = std(x)/sqrt(N);
+                seV = std((x - mean(x)).^2)/sqrt(N);
+                testCase.verifyLessThanOrEqual(abs(mean(x) - a/b), 5*seM, sprintf('mean, delta %g', delta));
+                testCase.verifyLessThanOrEqual(abs(var(x) - a/b^2), 5*seV, sprintf('var, delta %g', delta));
+            end
+            % Mahalanobis distances (double) vs a direct evaluation
+            rng(902); Sig = [1 0.3 0; 0.3 0.5 0.1; 0 0.1 2]; mu = [1; -1; 0.5]; u = randn(3, 20).*2;
+            ref = sum((u - mu) .* (Sig \ (u - mu)), 1);
+            testCase.verifyEqual(mcmc_bayes.t_mahalanobis(u, mu, Sig), ref, 'RelTol', 1e-12, 'AbsTol', 1e-12);
+            if canUseGPU
+                testCase.verifyEqual(gather(mcmc_bayes.t_mahalanobis(gpuArray(single(u)), mu, Sig)), ...
+                                     mcmc_bayes.t_mahalanobis(double(single(u)), mu, Sig), 'RelTol', 1e-10, 'AbsTol', 1e-12);
+            end
+        end
+
+        function testStudentTWeightedHyperUpdate(testCase)
+            % lambda-weighted statistics and conjugate updates vs direct closed forms (double, host)
+            rng(910);
+            d = 2; n = 12; u = randn(d, n).*[1; 2] + [1; -1]; lam = 0.2 + 2*rand(1, n);
+            [ubar, S, w] = mcmc_bayes.hyper_suffstats_weighted(u, lam);
+            ubRef = zeros(d,1); for i = 1:n; ubRef = ubRef + lam(i)*u(:,i); end; ubRef = ubRef/sum(lam);
+            SRef  = zeros(d);   for i = 1:n; SRef = SRef + lam(i)*(u(:,i) - ubRef)*(u(:,i) - ubRef).'; end
+            testCase.verifyEqual(w, sum(lam), 'RelTol', 1e-14);
+            testCase.verifyEqual(ubar, ubRef, 'RelTol', 1e-12, 'AbsTol', 1e-12);
+            testCase.verifyEqual(S, SRef, 'RelTol', 1e-12, 'AbsTol', 1e-12);
+            % lambda = 1: exactly the unweighted statistics
+            [u1, S1, w1] = mcmc_bayes.hyper_suffstats_weighted(u, ones(1, n));
+            [u0, S0]     = mcmc_bayes.hyper_suffstats(u);
+            testCase.verifyEqual(w1, n); testCase.verifyEqual(u1, u0, 'RelTol', 1e-12); testCase.verifyEqual(S1, S0, 'RelTol', 1e-12);
+            % NIW: weighted update vs the direct form Psi_n = Psi0 + sum lam u u' + k0 m0 m0' - kn mn mn'
+            m0 = [0.3; -0.2]; k0 = 0.5; Psi0 = [2 0.3; 0.3 1]; nu0 = 5;
+            [mn, kn, Psin, nun] = mcmc_bayes.niw_posterior(ubar, S, w, m0, k0, Psi0, nu0, n);
+            knR  = k0 + sum(lam); mnR = (k0*m0 + u*lam.')/knR;
+            PsiR = Psi0 + (u.*lam)*u.' + k0*(m0*m0.') - knR*(mnR*mnR.');
+            testCase.verifyEqual([kn nun], [knR nu0 + n], 'RelTol', 1e-14);
+            testCase.verifyEqual(mn, mnR, 'RelTol', 1e-12);
+            testCase.verifyEqual(Psin, PsiR, 'RelTol', 1e-10);
+            % proportionality: log NIW_post - log NIW_prior - sum_i log N(u_i | mu, Sigma/lam_i) is constant in (mu, Sigma)
+            c = zeros(1, 6);
+            for t = 1:6
+                muT = randn(d,1); A = randn(d); SigT = A*A.' + 0.5*eye(d);
+                ll  = 0;
+                for i = 1:n; r = u(:,i) - muT; ll = ll - 0.5*log(det(SigT/lam(i))) - 0.5*lam(i)*(r.'/SigT)*r; end
+                c(t) = McmcBayesUnitTest.logNIW(muT, SigT, mn, kn, Psin, nun) - McmcBayesUnitTest.logNIW(muT, SigT, m0, k0, Psi0, nu0) - ll;
+            end
+            testCase.verifyLessThanOrEqual(max(c) - min(c), 1e-8);
+            % omitted wSum (Normal prior) == wSum = n, bitwise (same random stream)
+            hp = struct('hyperprior', 'niw', 'm0', m0, 'kappa0', k0, 'Psi0', Psi0, 'nu0', nu0, 'floorVar', [0.01; 0.01]);
+            for hpName = {'niw', 'jeffreys_half'}
+                hp.hyperprior = hpName{1};
+                rng(911); [ma, Sa] = mcmc_bayes.gibbs_hyper(u0, S0, n, [0;0], eye(d), hp);
+                rng(911); [mb, Sb] = mcmc_bayes.gibbs_hyper(u0, S0, n, [0;0], eye(d), hp, n);
+                testCase.verifyTrue(isequal(ma, mb) && isequal(Sa, Sb), hpName{1});
+            end
+            % Monte Carlo (N = 4e4 draws, within 5 SE) of gibbs_hyper with weights:
+            %   niw: E[mu] = m_n, E[Sigma] = Psi_n/(nu_n-d-1)
+            %   jeffreys_half at a fixed current mu: E[Sigma] = S_mu,w/(n-2d-1), E[mu_out] = ubar_w
+            N = 4e4; rng(912);
+            muC = [0.5; -0.5];
+            dm  = ubar - muC; Smu = S + w*(dm*dm.');
+            refs = {mn, Psin/(nun-d-1); ubar, Smu/(n-2*d-1)};
+            hpNames = {'niw', 'jeffreys_half'};
+            for kh = 1:2
+                hp.hyperprior = hpNames{kh};
+                M = zeros(d, N); Sg = zeros(d*d, N);
+                for t = 1:N
+                    [mt, St] = mcmc_bayes.gibbs_hyper(ubar, S, n, muC, eye(d), hp, w);
+                    M(:,t) = mt; Sg(:,t) = St(:);
+                end
+                zM = (mean(M, 2) - refs{kh,1}) ./ (std(M, 0, 2)/sqrt(N));
+                zS = (mean(Sg, 2) - refs{kh,2}(:)) ./ (std(Sg, 0, 2)/sqrt(N));
+                testCase.verifyLessThanOrEqual(max(abs([zM; zS])), 5, sprintf('%s: max|z| %.2f', hp.hyperprior, max(abs([zM; zS]))));
+            end
+            % jeffreys_half degenerate state with weights: falls back to the floor, finite PD output
+            uD = repmat([1; 2], 1, n);
+            [ubD, SD, wD] = mcmc_bayes.hyper_suffstats_weighted(uD, lam);
+            hp.hyperprior = 'jeffreys_half';
+            [mD, SgD] = mcmc_bayes.gibbs_hyper(ubD, SD, n, ubD, eye(d), hp, wD);
+            [~, notPD] = chol(SgD);
+            testCase.verifyTrue(all(isfinite(mD)) && ~notPD);
+        end
+
+        function testStudentTCollapsedLogPrior(testCase)
+            % collapsed t log-prior vs a direct log-density (constants removed by differencing)
+            rng(920);
+            d = 3; nu = 4.5; mu = [0.5; -1; 2]; A = randn(d); Sig = A*A.' + 0.3*eye(d);
+            u  = [mu + 2*randn(d, 30), mu + [50; -40; 30]];
+            ld = gammaln((nu+d)/2) - gammaln(nu/2) - d/2*log(nu*pi) - 0.5*log(det(Sig)) ...
+                 - (nu+d)/2*log(1 + sum((u - mu) .* (Sig \ (u - mu)), 1)/nu);
+            P  = inv(Sig); P = (P + P.')/2;
+            lp = mcmc_bayes.logprior_hier(u, [], mu, P, [], nu);
+            testCase.verifyEqual(lp - lp(1), ld - ld(1), 'AbsTol', 1e-10);
+            % conditional Normal (free mode): lam .* logprior_normal; tNu = []: exactly logprior_mix
+            lam = rand(1, size(u, 2));
+            testCase.verifyEqual(mcmc_bayes.logprior_hier(u, [], mu, P, lam, nu), lam .* mcmc_bayes.logprior_normal(u, mu, P), 'RelTol', 1e-14);
+            testCase.verifyTrue(isequal(mcmc_bayes.logprior_hier(u, [], mu, P, [], []), mcmc_bayes.logprior_mix(u, [], mu, P)));
+            % scale-mixture identity by quadrature (d = 1): int N(u | mu, s2/lam) Gamma(lam | nu/2, nu/2) dlam = t_nu(u | mu, s2)
+            s2 = 0.7; uu = [-3 0.2 5];
+            for k = 1:3
+                f  = @(l) sqrt(l/(2*pi*s2)) .* exp(-l*(uu(k) - 0.1)^2/(2*s2)) .* ...
+                         exp((nu/2)*log(nu/2) - gammaln(nu/2) + (nu/2 - 1)*log(l) - nu*l/2);
+                tv = exp(gammaln((nu+1)/2) - gammaln(nu/2) - 0.5*log(nu*pi*s2) - (nu+1)/2*log(1 + (uu(k) - 0.1)^2/(nu*s2)));
+                testCase.verifyEqual(integral(f, 0, Inf, 'RelTol', 1e-12, 'AbsTol', 0), tv, 'RelTol', 1e-8);
+            end
+            if canUseGPU
+                [muG, PG] = mcmc_bayes.prior_to_gpu(mu, Sig);
+                us  = single(u);
+                lpG = gather(mcmc_bayes.logprior_hier(gpuArray(us), [], muG, PG, [], nu));
+                lpD = mcmc_bayes.logprior_hier(double(us), [], mu, P, [], nu);
+                testCase.verifyTrue(all(isfinite(lpG)));
+                testCase.verifyLessThanOrEqual(max(abs(double(lpG) - lpD) ./ max(1, abs(lpD))), 1e-5);
+            end
+        end
+
+        function testStudentTOptionErrors(testCase)
+            f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 1]; f.xStepSize = [0.1; 0.1; 0.01];
+            setup = @(h) mcmc_bayes.setup_hierarchical(setfield(f, 'prior', struct('hierarchical', h))); %#ok<SFLD>
+            h = setup(struct());
+            testCase.verifyEqual(h.distribution, 'normal'); testCase.verifyEqual(h.nu, []);
+            h = setup(struct('distribution', 't'));
+            testCase.verifyEqual(h.distribution, 't'); testCase.verifyEqual(h.nu, 4);
+            h = setup(struct('distribution', "T", 'nu', 7, 'hyperprior', 'jeffreys_half'));
+            testCase.verifyEqual({h.distribution, h.nu, h.hyperprior}, {'t', 7, 'jeffreys_half'});
+            h = setup(struct('distribution', 'normal', 'K', 3));
+            testCase.verifyEqual(h.K, 3);
+            id = 'mcmc_bayes:hierarchicalStudentT';
+            testCase.verifyError(@() setup(struct('distribution', 't', 'K', 2)), id);
+            testCase.verifyError(@() setup(struct('distribution', 'cauchy')), id);
+            testCase.verifyError(@() setup(struct('distribution', 3)), id);
+            for nu = {0, -1, Inf, NaN, [1 2], 'a', 1i}
+                testCase.verifyError(@() setup(struct('distribution', 't', 'nu', nu{1})), id);
+            end
+            testCase.verifyError(@() setup(struct('nu', 4)), id);                           % nu without 't'
+            testCase.verifyError(@() setup(struct('distribution', 'normal', 'nu', 4)), id);
+            % settings: no t fields for 'normal'; t fields for 't' (fixed)
+            s = mcmc_bayes.prior_settings(setup(struct('fixed', true, 'mu', [0 0], 'Sigma', eye(2))), []);
+            testCase.verifyFalse(isfield(s.hierarchical, 'distribution') || isfield(s.hierarchical, 'nu'));
+            s = mcmc_bayes.prior_settings(setup(struct('fixed', true, 'mu', [0 0], 'Sigma', eye(2), 'distribution', 't', 'nu', 3)), []);
+            testCase.verifyEqual({s.hierarchical.distribution, s.hierarchical.nu}, {'t', 3});
+            testCase.verifyTrue(contains(s.hierarchical.mhPrior, 'collapsed'));
+            % MRF default weights: the scale matrix Sigma (not nu/(nu-2) Sigma)
+            Sig = [0.5 0.1; 0.1 2];
+            g = f; g.prior = struct('hierarchical', struct('fixed', true, 'mu', [0 0], 'Sigma', Sig, 'distribution', 't'), ...
+                                    'mrf', struct('potential', 'huber', 'huberDelta', 0.7));
+            mrf = mcmc_bayes.setup_mrf(g, mcmc_bayes.setup_hierarchical(g));
+            testCase.verifyEqual(mrf.W, 1./sqrt(diag(Sig)), 'RelTol', 1e-12);
+            testCase.verifyEqual(mrf.delta, 0.7*sqrt(diag(Sig)), 'RelTol', 1e-12);
+            testCase.verifyTrue(contains(mrf.Wrule, 'scale matrix'));
+        end
+
+        function testStudentTRunsOutputs(testCase)
+            % free (niw joint, jeffreys_half componentwise), fixed, fixed + MRF (subsetForward) and two-stage runs:
+            % caches (checkCache) <= 1e-5, inactive voxels never move, output fields and the lambda map
+            gacelletest.assumeGPU(testCase);
+            [yy, mask, x0, f, fwd] = McmcBayesUnitTest.mixGrid();
+            f.checkCache = true; f.repetition = 2; f.overdisp = 0.01; f.adaptStepSize = true; f.adaptInterval = 20;
+            Nv = nnz(mask); Ns = numel(f.burnin+1:f.thinning:f.iteration);
+            muF = [0; 0.5]; SigF = [1.5 0.3; 0.3 0.5];
+            cfgs = {{'joint', struct('hierarchical', struct('distribution', 't'))}, ...
+                    {'componentwise', struct('hierarchical', struct('distribution', 't', 'nu', 2, 'hyperprior', 'jeffreys_half'))}, ...
+                    {'joint', struct('hierarchical', struct('distribution', 't', 'fixed', true, 'mu', muF, 'Sigma', SigF))}, ...
+                    {'componentwise', struct('hierarchical', struct('distribution', 't', 'fixed', true, 'mu', muF, 'Sigma', SigF), ...
+                                             'mrf', struct('potential', 'l1', 'subsetForward', true))}, ...
+                    {'joint', struct('hierarchical', struct('distribution', 't', 'fixed', true, 'mu', muF, 'Sigma', SigF), ...
+                                     'mrf', struct('potential', 'huber', 'subsetForward', false))}};
+            for k = 1:numel(cfgs)
+                g = f; g.updateScheme = cfgs{k}{1}; g.prior = cfgs{k}{2};
+                out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+                cc  = out.diagnostics.cacheCheck;
+                testCase.verifyEqual(cc.Ncheck, g.iteration*g.repetition);
+                testCase.verifyLessThanOrEqual(max([cc.loglik cc.logprior cc.logjac]), 1e-5, sprintf('cfg %d', k));
+                if isfield(cc, 'inactiveMoved'); testCase.verifyEqual(cc.inactiveMoved, 0, sprintf('cfg %d', k)); end
+                H = out.hyper;
+                testCase.verifyEqual(H.distribution, 't');
+                testCase.verifyEqual(size(H.lambda), size(mask));
+                testCase.verifyTrue(all(H.lambda(mask) > 0 & isfinite(H.lambda(mask))) && all(H.lambda(~mask) == 0));
+                testCase.verifyEqual(out.settings.prior.hierarchical.distribution, 't');
+                if k <= 2
+                    testCase.verifyEqual(size(H.posterior.mu), [2 Ns 2]);
+                    testCase.verifyEqual(size(H.rhat.Sigma), [2 2]);
+                    testCase.verifyTrue(isfield(out.settings.prior.hierarchical, 'lambdaStep'));
+                else
+                    % fixed mode: lambda map == mean over kept samples of (nu+d)/(nu+delta)
+                    U   = [reshape(double(out.posterior.u1), 1, []); reshape(double(out.posterior.u2), 1, [])];
+                    ref = mean(reshape(mcmc_bayes.t_lambda_mean(mcmc_bayes.t_mahalanobis(U, muF, SigF), 4, 2), Nv, []), 2);
+                    testCase.verifyEqual(H.lambda(mask), ref, 'AbsTol', 1e-6);
+                    testCase.verifyEqual(H.mean.Sigma, SigF);
+                end
+                if k == 4; testCase.verifyTrue(out.settings.mrf.subsetForward.used); end
+            end
+            % the two-group data under one t prior: the minority group (u1 ~ 2) is down-weighted
+            g = f; g.checkCache = false; g.prior = struct('hierarchical', struct('distribution', 't'));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            [~, ~, ~, ~, ~, ~, labT] = McmcBayesUnitTest.mixGrid();
+            lamV = out.hyper.lambda(mask);
+            testCase.verifyLessThan(median(lamV(labT == 2)), median(lamV(labT == 1)));
+            % two-stage through the optimisation dispatch: stage 2 is the fixed t prior with the stage-1 means
+            g.prior.mrf = struct('potential', 'huber', 'tau', 2);
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            eb  = out.settings.empiricalBayes;
+            testCase.verifyEqual(out.stage1.hyper.distribution, 't');
+            testCase.verifyEqual(out.hyper.distribution, 't'); testCase.verifyTrue(out.hyper.fixed);
+            testCase.verifyEqual(out.hyper.mean.Sigma, eb.SigmaHat);
+            testCase.verifyEqual(out.settings.mrf.W, 1./sqrt(diag(eb.SigmaHat)), 'RelTol', 1e-12);
+            testCase.verifyTrue(contains(out.settings.prior.hierarchical.mhPrior, 'collapsed'));
+            % no kept samples (burn-in >= iterations): lambda map from the final state
+            g = f; g.checkCache = false; g.burnin = f.iteration; g.prior = struct('hierarchical', struct('distribution', 't'));
+            out = mcmc_bayes().optimisation(yy, mask, [], x0, g, fwd);
+            testCase.verifyTrue(all(isfinite(out.hyper.lambda(mask))) && all(isfinite(out.hyper.mean.mu)));
+        end
+
+        function testStudentTExactToyShort(testCase)
+            % short version of tests/validation/mcmc_bayes/test_T9b_0_studentt_exact.m: 1D linear Gaussian,
+            % fixed t prior (nu = 4), 12 voxels (6 typical, 6 in the tail), 32 chains per voxel; posterior
+            % quantiles vs numerical integration, between-chain MC error (criteria as T3.1)
+            gacelletest.assumeGPU(testCase);
+            nu = 4; mu = 0.5; sg = 1; m = 4; s = 1; Nch = 32;
+            rng(930); a = randn(m, 1); a = a/norm(a)*2;                       % likelihood SD of u: s/2
+            uT = [mu + sg*randn(1, 6), mu + [3 4 5 6 7 8]];
+            y  = a*uT + s*randn(m, numel(uT)); Nv = numel(uT);
+            qs = [0.05 0.25 0.5 0.75 0.95];
+            qx = McmcBayesUnitTest.tPostQuantiles(y, a, s, mu, sg, nu, qs);     % [Nv, 5]
+            yy = reshape(repmat(y.', Nch, 1), [Nv*Nch 1 1 m]);
+            f.modelParams = {'u1';'noise'}; f.lb = [-Inf; 0]; f.ub = [Inf; 10]; f.xStepSize = [0.3; 0.01];
+            f.algorithm = 'MH'; f.iteration = 6000; f.burnin = 1500; f.thinning = 3; f.metric = {'mean'};
+            f.fixedParams = struct('noise', s); f.adaptStepSize = true; f.adaptInterval = 50;
+            f.prior.hierarchical = struct('distribution', 't', 'nu', nu, 'fixed', true, 'mu', mu, 'Sigma', sg^2);
+            rng(931); x0.u1 = mu + 3*randn(Nv*Nch, 1);
+            rng(932); parallel.gpu.rng(932);
+            out = mcmc_bayes().optimisation(yy, true(Nv*Nch, 1), [], x0, f, @(p) McmcBayesUnitTest.linGaussFwd(p, a));
+            U   = reshape(double(out.posterior.u1), Nv, Nch, []);              % [Nv, Nch, Ns]
+            z   = zeros(Nv, numel(qs));
+            for k = 1:numel(qs)
+                qc = McmcBayesUnitTest.sampleQuantile(U, qs(k), 3);                                    % per chain [Nv, Nch]
+                qp = McmcBayesUnitTest.sampleQuantile(reshape(permute(U, [1 3 2]), Nv, []), qs(k), 2); % pooled
+                z(:,k) = (qp - qx(:,k)) ./ (std(qc, 0, 2)/sqrt(Nch));
+            end
+            testCase.verifyLessThanOrEqual(mean(abs(z(:)) > 1.96), 0.15, sprintf('frac |z| > 1.96: %.3f', mean(abs(z(:)) > 1.96)));
+            testCase.verifyLessThanOrEqual(max(abs(z(:))), 4.5, sprintf('max |z| %.2f', max(abs(z(:)))));
+        end
+
         %% the experimental location-shift move was removed (Phase 8): its options are unknown fields
         function testShiftMoveRemoved(testCase)
             f.modelParams = {'u1';'u2';'noise'}; f.lb = [-Inf; -Inf; 0]; f.ub = [Inf; Inf; 1]; f.xStepSize = [0.1; 0.1; 0.01];
@@ -2564,6 +2832,33 @@ classdef McmcBayesUnitTest < matlab.unittest.TestCase
             x0.u1 = zeros(dims); x0.u2 = zeros(dims);
             x0.u1(mask) = u(1,:) + 0.1*randn(1, Nv); x0.u2(mask) = u(2,:) + 0.1*randn(1, Nv);
             fwd  = @(p) McmcBayesUnitTest.linGaussFwd(p, A);
+        end
+
+        % exact posterior quantiles [Nv, numel(qs)] of the 1D linear Gaussian model y = a u + e, e ~ N(0, s^2 I),
+        % under a fixed t_nu(mu, sg^2) prior: trapezoid CDF on a fine grid (2e5 nodes over +-12 posterior scales)
+        function qx = tPostQuantiles(y, a, s, mu, sg, nu, qs)
+            Nv = size(y, 2); qx = zeros(Nv, numel(qs));
+            for v = 1:Nv
+                uh  = (a.'*y(:,v))/(a.'*a); sl = s/norm(a);
+                x   = linspace(min(uh, mu) - 12*max(sl, sg), max(uh, mu) + 12*max(sl, sg), 2e5).';
+                lp  = -(uh - x).^2/(2*sl^2) - (nu+1)/2*log1p((x - mu).^2/(nu*sg^2));
+                p   = exp(lp - max(lp));
+                cdf = [0; cumsum(0.5*(p(1:end-1) + p(2:end)).*diff(x))]; cdf = cdf/cdf(end);
+                [cu, iu] = unique(cdf);
+                qx(v,:) = interp1(cu, x(iu), qs);
+            end
+        end
+
+        % sample quantile along dimension dim: linear interpolation between order statistics at
+        % h = p (n-1) + 1 (no Statistics toolbox)
+        function q = sampleQuantile(x, p, dim)
+            x  = sort(x, dim);
+            n  = size(x, dim);
+            h  = p*(n - 1) + 1; lo = floor(h); hi = min(lo + 1, n); t = h - lo;
+            idx = repmat({':'}, 1, ndims(x));
+            idx{dim} = lo; xl = x(idx{:});
+            idx{dim} = hi; xh = x(idx{:});
+            q  = xl + t .* (xh - xl);
         end
 
         % exact posterior means [d,Nv] and P(z = k | y) [K,Nv] of the linear Gaussian model under a fixed mixture prior

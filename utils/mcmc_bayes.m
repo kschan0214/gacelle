@@ -66,6 +66,12 @@ classdef mcmc_bayes < mcmc
 %           .init           : 'kmeans'      initial z, mu_k, Sigma_k, pi of the free mode (K > 1), see Phase 7
 %           .pi             : []            fixed group weights [K,1] (fixed = true and K > 1; then .mu is
 %                                           [d,K] and .Sigma is [d,d,K])
+%           .distribution   : 'normal'      'normal' | 't' (Phase 9b): multivariate Student-t population prior
+%                                           t_nu(mu, Sigma) with scale matrix Sigma; K = 1 only (else error
+%                                           mcmc_bayes:hierarchicalStudentT); both hyperpriors, fixed mode and
+%                                           run_two_stage. See "Phase 9b" below
+%           .nu             : 4             degrees of freedom of 't' (positive finite scalar, fixed, not sampled);
+%                                           only allowed with distribution = 't'
 %       .mrf            : []            MRF prior on the hierarchical parameters (Phase 4), a structure
 %                                       (struct() or true for all defaults) with the fields below.
 %                                       Requires .hierarchical with fixed = true (use run_two_stage
@@ -74,7 +80,8 @@ classdef mcmc_bayes < mcmc
 %           .tau            : 1             temperature, > 0 (coupling strength 1/tau)
 %           .W              : []            [d,1] per-parameter weights W_p > 0, [] -> 1./sqrt(diag(Sigma))
 %                                           of the fixed Sigma (fixed for the whole run); K > 1: Sigma is
-%                                           replaced by the mixture's marginal covariance (Phase 7)
+%                                           replaced by the mixture's marginal covariance (Phase 7); 't': the
+%                                           scale matrix Sigma (Phase 9b)
 %           .huberDelta     : 1             Huber threshold in units of sqrt(Sigma_pp): delta_p =
 %                                           huberDelta * sqrt(Sigma_pp) (scalar or [d,1]; 'huber' only;
 %                                           K > 1: the same mixture scale as W)
@@ -565,6 +572,71 @@ classdef mcmc_bayes < mcmc
 %   (noise_map_to_fitting; only the GPU memory probe reaches those voxels), put in fitting.ricianSigma, and
 %   sliced with the data per GPU segment (slice_noise_map). Without extraData.noiseSigma nothing changes.
 %
+% Phase 9b (Student-t population prior, prior.hierarchical.distribution = 't', K = 1)
+% -----------------------------------------------------------------------------------
+% Target. The Normal population prior of Phase 3 is replaced by a multivariate t with nu degrees of
+%   freedom (fixed, user-set, default 4), location mu and SCALE matrix Sigma, on the transformed
+%   hierarchical parameters u_i [d,1]:
+%       t_nu(u | mu, Sigma) = Gamma((nu+d)/2) / (Gamma(nu/2) (nu pi)^(d/2) |Sigma|^(1/2)) (1 + delta/nu)^(-(nu+d)/2),
+%       delta = (u-mu)' Sigma^-1 (u-mu).
+%   Its heavy tails let a small, atypical sub-population (e.g. a tract inside WM) sit away from mu
+%   without being pulled towards it as strongly as under the Normal (whose pull grows linearly with
+%   the distance; the t pull decays beyond ~sqrt(nu) scale units). Covariance nu/(nu-2) Sigma (nu > 2).
+%   Scale mixture (exact, used by the free mode): with lambda_i ~ Gamma(nu/2, rate nu/2) (mean 1),
+%       u_i | lambda_i, mu, Sigma ~ N(mu, Sigma/lambda_i),   int N(u | mu, Sigma/lambda) Gamma(lambda) dlambda = t_nu(u | mu, Sigma),
+%   so the augmented posterior p(u, lambda, mu, Sigma | y) has the t-prior posterior as its (u, mu, Sigma)
+%   marginal. K > 1 with 't' is an error (mcmc_bayes:hierarchicalStudentT).
+% One sweep (free mode), a Gibbs sampler over the blocks u, lambda, theta = (mu, Sigma):
+%   1. MH block on u | lambda, theta: unchanged except the prior term, which is the conditional Normal
+%          lp_i = -lambda_i (u_i-mu)' Sigma^-1 (u_i-mu)/2   (logprior_hier; the |Sigma/lambda_i| factor
+%      does not depend on u). All update paths and the cache logic are as for the Normal prior.
+%   2. lambda-step, exact, independent over voxels. p(lambda_i | u_i, theta) ∝
+%          lambda^(nu/2-1) e^(-nu lambda/2) * lambda^(d/2) e^(-lambda delta_i/2)      (|Sigma/lambda|^(-1/2) = lambda^(d/2) |Sigma|^(-1/2))
+%      i.e. lambda_i | u_i, theta ~ Gamma((nu+d)/2, rate (nu+delta_i)/2): lambda_i = 2 G_i/(nu+delta_i),
+%      G_i ~ Gamma((nu+d)/2, 1) (one randg per voxel on the GPU; delta_i in double on the GPU).
+%   3. theta | u, lambda. With w = sum_i lambda_i, the weighted mean ubar_w = sum_i lambda_i u_i / w and
+%      scatter S_w = sum_i lambda_i (u_i-ubar_w)(u_i-ubar_w)' (hyper_suffstats_weighted, GPU double),
+%          prod_i N(u_i | mu, Sigma/lambda_i) ∝ |Sigma|^(-n/2) exp(-tr(Sigma^-1 [S_w + w (ubar_w-mu)(ubar_w-mu)'])/2)
+%      (sum_i lambda_i (u_i-mu)(u_i-mu)' = S_w + w (ubar_w-mu)(ubar_w-mu)', the weighted parallel-axis identity).
+%      This is the Phase 3 likelihood with n replaced by w wherever it counts the precision of mu, while the
+%      power of |Sigma| still counts voxels (n). Hence (host, double, gibbs_hyper with wSum = w):
+%      'niw'  : completing the square kappa0 (mu-m0)(mu-m0)' + w (mu-ubar_w)(mu-ubar_w)' =
+%               kappa_n (mu-m_n)(mu-m_n)' + (kappa0 w/kappa_n)(ubar_w-m0)(ubar_w-m0)',
+%                   kappa_n = kappa0 + w,  m_n = (kappa0 m0 + sum_i lambda_i u_i)/kappa_n,  nu_n = nu0 + n,
+%                   Psi_n   = Psi0 + S_w + (kappa0 w/kappa_n)(ubar_w - m0)(ubar_w - m0)',
+%               Sigma | u,lambda ~ IW(Psi_n, nu_n), mu | Sigma,u,lambda ~ N(m_n, Sigma/kappa_n) (exact joint draw).
+%      'jeffreys_half' : |Sigma|^(-1/2) |Sigma|^(-n/2) exp(-tr(Sigma^-1 S_mu,w)/2) gives
+%               Sigma | u,mu,lambda ~ IW(S_mu,w, n - d),  S_mu,w = sum_i lambda_i (u_i-mu)(u_i-mu)' = S_w + w (ubar_w-mu)(ubar_w-mu)',
+%               mu | Sigma,u,lambda ~ N(ubar_w, Sigma/w);
+%               the degenerate-state fallback of Phase 3 (IW(S_mu,w + max(n-d,1) diag(floorVar), n-d)) is kept.
+%               (Posterior propriety of the improper hyperprior is not re-derived for the t prior; the
+%               conditionals are exact. 'niw' is the proper default.)
+%      With lambda = 1 all of this reduces exactly to Phase 3 (same arithmetic).
+%   4. The per-voxel log-prior cache is recomputed with the new lambda and theta.
+%   Order: every step draws one block from its full conditional given the current others, so the order
+%   does not affect the stationary distribution (no collapsing is involved). Initialisation of every
+%   repetition: lambda_i = 1, mu and Sigma as in Phase 3.
+% Random-number stream per sweep (after the MH block, whose draws are unchanged): one GPU randg
+%   [1,Nv] (lambda), then the host draws of step 3 (Bartlett randg/randn, then randn of mu), as Phase 3.
+%   The kept-sample bookkeeping draws nothing.
+% Fixed mode (fixed = true, .mu [d,1], .Sigma [d,d]; also stage 2 of run_two_stage, which passes
+%   distribution and nu on and fixes mu, Sigma at the stage-1 posterior means): no lambda; the MH prior term is
+%   the collapsed t,  lp_i = -(nu+d)/2 log(1 + delta_i/nu)  (log1p, GPU single); voxels are conditionally
+%   independent (they may be segmented).
+% MRF weights (two-stage stage 2): the default W_p = 1/sqrt(Sigma_pp) and Huber delta_p use the SCALE matrix
+%   Sigma, not the covariance nu/(nu-2) Sigma: the scale exists for every nu > 0 (the covariance only for
+%   nu > 2), it describes the bulk of the population that the t prior is centred on (the tails are what the
+%   t is meant to discount), and for the same Sigma the MRF strength is then the same as with the Normal prior.
+%   (With nu = 4 the covariance would give W smaller by sqrt(2).)
+% Output: out.hyper.distribution = 't', .nu, and .lambda [x,y,z] (0 outside the mask): the Rao-Blackwellised
+%   posterior mean of the scale weight, the mean over the kept samples (all repetitions) of
+%   E[lambda_i | u_i, mu, Sigma] = (nu+d)/(nu+delta_i) at that sample's mu, Sigma (fixed mode: the fixed ones;
+%   final state if there is no kept sample). lambda ~ 1 for typical voxels (prior mean 1); lambda << 1 marks a
+%   voxel that the prior treats as an outlier (its effective prior precision lambda Sigma^-1 is small).
+%   The .posterior/.mean/.median Sigma are the scale matrix. out.settings.prior.hierarchical gains
+%   .distribution, .nu, .mhPrior, .lambda (and .lambdaStep/.gibbs in free mode). For distribution 'normal'
+%   none of these fields is added (bitwise-identical output).
+%
 % Date created: 26 September 2026
 % Date modified: 26 September 2026 (Phase 1: transforms, update schemes, adaptation, overdisp, diagnostics)
 % Date modified: 26 September 2026 (Phase 2: marginal likelihoods, S0Param injection, nuisance recovery)
@@ -576,6 +648,7 @@ classdef mcmc_bayes < mcmc
 % Date modified: 28 September 2026 (Phase 8: transforms, adaptation, adaptive covariance, R-hat/ESS and the forward-size
 %                                   check moved to mcmc as opt-in options/static helpers; location-shift move removed)
 % Date modified: 29 September 2026 (Phase 9a: 'rician' and 'gaussian_ricianmean' likelihoods, ricianNav/ricianSigma)
+% Date modified: 29 September 2026 (Phase 9b: Student-t population prior, prior.hierarchical.distribution/nu)
 %
 
     methods
@@ -866,6 +939,12 @@ classdef mcmc_bayes < mcmc
             isGibbs         = isHier && ~hier.fixed;
             % Gaussian-mixture prior (Phase 7), K > 1 only; K = 1 runs the Phase 3 code unchanged
             isMix           = isHier && hier.K > 1;
+            % Student-t population prior (Phase 9b, K = 1): tNu = nu ([] for the Normal prior), tLam = the
+            % current scale weights lambda_i of the free mode ([] otherwise: fixed mode uses the collapsed t)
+            isT             = isHier && strcmp(hier.distribution, 't');
+            tNu             = [];
+            tLam            = [];
+            if isT; tNu = hier.nu; end
             % MRF prior on the hierarchical parameters (fixed mu/Sigma only)
             mrf             = this.setup_mrf(fitting, hier);
             isMRF           = mrf.on;
@@ -1083,6 +1162,11 @@ classdef mcmc_bayes < mcmc
                     muLast      = zeros(d, fitting.repetition);         % final Gibbs state per chain
                     SigmaLast   = zeros(d, d, fitting.repetition);
                 end
+                if isT
+                    % Rao-Blackwellised sum over kept samples of E[lambda_i | u_i, mu, Sigma] (and at the final state)
+                    lamSum      = zeros(1, Nv, 'gpuArray');
+                    lamLastSum  = zeros(1, Nv, 'gpuArray');
+                end
             end
             lpC   = [];     % mixture log-prior constants log pi_k - log|Sigma_k|/2 (K > 1 only; [] selects the single-Normal log-prior)
             if fitting.checkCache
@@ -1220,7 +1304,14 @@ classdef mcmc_bayes < mcmc
                     Sigma   = hier.Sigma;
                 end
                 [muG, PG]   = this.prior_to_gpu(mu, Sigma);
-                lpCurr      = this.logprior_normal(uCurr(hIdx,:), muG, PG);
+                if isT
+                    % Student-t: free mode starts at lambda_i = 1 (the Normal prior of the initial mu, Sigma),
+                    % fixed mode uses the collapsed t (tLam = [])
+                    if isGibbs; tLam = ones(1, Nv, 'gpuArray'); end
+                    lpCurr  = this.logprior_hier(uCurr(hIdx,:), lpC, muG, PG, tLam, tNu);
+                else
+                    lpCurr  = this.logprior_normal(uCurr(hIdx,:), muG, PG);
+                end
             end
 
             % initial proposal scale in u space: xStepSize / |dx/du| at the start point
@@ -1286,7 +1377,8 @@ classdef mcmc_bayes < mcmc
 
                     % forward model and likelihood on the active voxels only
                     if isMarginal; [logLProposed, statsProposed] = loglikC{kc}(xProposed); else; logLProposed = loglikC{kc}(xProposed); end
-                    lpProposed  = this.logprior_mix(uProposed(hIdx,:), lpC, muG, PG);   % the MRF requires the hierarchical prior
+                    % the MRF requires the hierarchical prior in fixed mode, so tLam = [] here (collapsed t or Normal)
+                    lpProposed  = this.logprior_hier(uProposed(hIdx,:), lpC, muG, PG, tLam, tNu);
                     dPhi        = this.mrf_local_delta(uProposed(hIdx,:), uA(hIdx,:), uCurr(hIdx,:), ...
                                                        mrfNbr{kc}, mrfW{kc}, mrfCoef, mrfDelta, mrf.potential, mrf.stateWeight);
                     if hasJac
@@ -1340,7 +1432,7 @@ classdef mcmc_bayes < mcmc
                         if isHierRow(kp)
                             uProposedH          = uA(hIdx,:);
                             uProposedH(hIdx==kp,:) = uProposed_p;
-                            lpProposed          = this.logprior_mix(uProposedH, lpC, muG, PG);
+                            lpProposed          = this.logprior_hier(uProposedH, lpC, muG, PG, tLam, tNu);   % tLam = [] (fixed mode)
                             logRatio            = logRatio + (lpProposed - lpA);
                             pH                  = find(hIdx==kp);
                             dPhi                = this.mrf_local_delta(uProposed_p, uA(kp,:), uCurr(kp,:), ...
@@ -1394,7 +1486,7 @@ classdef mcmc_bayes < mcmc
                     % 2. Metropolis sampling
                     % 2.1 proposal probability (+ log-Jacobian of the transform, + hierarchical log-prior)
                     if isMarginal; [logLProposed, statsProposed] = loglik(xProposed); else; logLProposed = loglik(xProposed); end
-                    if isHier; lpProposed = this.logprior_mix(uProposed(hIdx,:), lpC, muG, PG); end
+                    if isHier; lpProposed = this.logprior_hier(uProposed(hIdx,:), lpC, muG, PG, tLam, tNu); end
                     % MRF: change of the local term of the active voxels, current neighbours (never cached)
                     if isMRF
                         dPhi = this.mrf_local_delta(uProposed(hIdx,act), uCurr(hIdx,act), uCurr(hIdx,:), ...
@@ -1457,7 +1549,7 @@ classdef mcmc_bayes < mcmc
                         if isHierRow(kp)
                             uProposedH          = uCurr(hIdx,:);
                             uProposedH(hIdx==kp,:) = uProposed_p;
-                            lpProposed          = this.logprior_mix(uProposedH, lpC, muG, PG);
+                            lpProposed          = this.logprior_hier(uProposedH, lpC, muG, PG, tLam, tNu);
                             logRatio            = logRatio + (lpProposed - lpCurr);
                             % MRF: change of the local term of parameter kp of the active voxels
                             if isMRF
@@ -1508,6 +1600,16 @@ classdef mcmc_bayes < mcmc
                     lpCurr      = this.logprior_mix(uH, lpC, muG, PG);
                 elseif isMix
                     % fixed mode: nothing to update
+                elseif isGibbs && isT
+                    % Student-t (Phase 9b): lambda | u, mu, Sigma (GPU randg, one Gamma variate per voxel),
+                    % then (mu, Sigma) | u, lambda from the lambda-weighted statistics (host rng), then the
+                    % conditional log-prior cache N(u | mu, Sigma/lambda)
+                    uH          = uCurr(hIdx,:);
+                    tLam        = this.t_lambda_draw(this.t_mahalanobis(uH, mu, Sigma), tNu, d);
+                    [ubar, S, wSum] = this.hyper_suffstats_weighted(uH, tLam);
+                    [mu, Sigma] = this.gibbs_hyper(ubar, S, Nv, mu, Sigma, hp, wSum);
+                    [muG, PG]   = this.prior_to_gpu(mu, Sigma);
+                    lpCurr      = this.logprior_hier(uH, lpC, muG, PG, tLam, tNu);
                 elseif isGibbs
                     [ubar, S]   = this.hyper_suffstats(uCurr(hIdx,:));
                     [mu, Sigma] = this.gibbs_hyper(ubar, S, Nv, mu, Sigma, hp);
@@ -1522,7 +1624,7 @@ classdef mcmc_bayes < mcmc
                     cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(lFresh, logLCurr));
                     if isMarginal; cacheErr.loglik = max(cacheErr.loglik, this.max_abs_diff(sFresh, statsCurr)); end
                     if isHier
-                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_mix(uCurr(hIdx,:), lpC, muG, PG), lpCurr));
+                        cacheErr.logprior = max(cacheErr.logprior, this.max_abs_diff(this.logprior_hier(uCurr(hIdx,:), lpC, muG, PG, tLam, tNu), lpCurr));
                     end
                     if hasJac
                         jFresh = this.transform_logjac(uCurr, method, lb, ub);
@@ -1589,6 +1691,8 @@ classdef mcmc_bayes < mcmc
                         Rk       = this.mixture_responsibilities(uCurr(hIdx,:), mixD);
                         memCount = memCount + Rk(ord,:);
                     elseif isGibbs; muPost(:,counter,ii) = mu; SigmaPost(:,:,counter,ii) = Sigma; end
+                    % Student-t: Rao-Blackwellised E[lambda_i | u_i, mu, Sigma] of this kept state
+                    if isT; lamSum = lamSum + this.t_lambda_mean(this.t_mahalanobis(uCurr(hIdx,:), mu, Sigma), tNu, d); end
                 end
 
                 % display message at 1000 iteration and every 10000 iteration
@@ -1623,6 +1727,7 @@ classdef mcmc_bayes < mcmc
                 Rk      = this.mixture_responsibilities(uCurr(hIdx,:), mixD);
                 memLast = memLast + Rk(ord,:);
             elseif isHier && isGibbs; muLast(:,ii) = mu; SigmaLast(:,:,ii) = Sigma; end
+            if isT; lamLastSum = lamLastSum + this.t_lambda_mean(this.t_mahalanobis(uCurr(hIdx,:), mu, Sigma), tNu, d); end
             end
 
             % convert final posterior distribution into structure
@@ -1690,6 +1795,17 @@ classdef mcmc_bayes < mcmc
                 else
                     hyper.mu        = hier.mu;
                     hyper.Sigma     = hier.Sigma;
+                end
+                if isT
+                    % Student-t (Phase 9b): E[lambda_i | y] per voxel [Nv,1], mean over the kept samples of all
+                    % repetitions of (nu+d)/(nu+delta_i) (final state if there is none)
+                    hyper.distribution  = 't';
+                    hyper.nu            = tNu;
+                    if Ns > 0
+                        hyper.lambdaMean = gather(lamSum.' ./ (Ns * fitting.repetition));
+                    else
+                        hyper.lambdaMean = gather(lamLastSum.' ./ fitting.repetition);
+                    end
                 end
                 diagnostics.hyper = hyper;
                 priorSettings = this.prior_settings(hier, hp);
@@ -1821,7 +1937,10 @@ classdef mcmc_bayes < mcmc
             if isstruct(fitting.prior) && isfield(fitting.prior,'hierarchical') && ~isempty(fitting.prior.hierarchical) && ...
                     ~(islogical(fitting.prior.hierarchical) && ~fitting.prior.hierarchical)
                 h = fitting.prior.hierarchical;
-                if isstruct(h) && isfield(h,'K') && ~isempty(h.K) && isnumeric(h.K) && isscalar(h.K) && h.K > 1
+                if isstruct(h) && isfield(h,'distribution') && strcmpi(h.distribution, 't')
+                    disp(['Prior             : hierarchical Student-t on u, nu = ', num2str(field_or_default(h,'nu',4)), ...
+                          ', fixed = ', num2str(isfield(h,'fixed') && ~isempty(h.fixed) && logical(h.fixed))]);
+                elseif isstruct(h) && isfield(h,'K') && ~isempty(h.K) && isnumeric(h.K) && isscalar(h.K) && h.K > 1
                     disp(['Prior             : hierarchical Gaussian mixture on u, K = ', num2str(h.K), ...
                           ', fixed = ', num2str(isfield(h,'fixed') && ~isempty(h.fixed) && logical(h.fixed))]);
                 elseif isstruct(h) && isfield(h,'fixed') && ~isempty(h.fixed) && h.fixed
@@ -2461,10 +2580,13 @@ classdef mcmc_bayes < mcmc
         %   .subsetFraction, .maxGPUMemory
         %   .K, .alpha, .init, .pi    : mixture (Phase 7): # groups, Dirichlet concentration, free-mode
         %                               initialisation, fixed group weights [K,1] (K > 1 only, else [])
+        %   .distribution, .nu        : population distribution (Phase 9b): 'normal' | 't', and the
+        %                               degrees of freedom of 't' ([] for 'normal')
         %
             hier = struct('on', false, 'params', {{}}, 'idx', [], 'd', 0, 'hyperprior', '', ...
                           'm0', [], 'kappa0', [], 'Psi0', [], 'nu0', [], 'fixed', false, 'mu', [], 'Sigma', [], ...
-                          'subsetFraction', 1, 'maxGPUMemory', [], 'K', 1, 'alpha', 1, 'init', 'kmeans', 'pi', []);
+                          'subsetFraction', 1, 'maxGPUMemory', [], 'K', 1, 'alpha', 1, 'init', 'kmeans', 'pi', [], ...
+                          'distribution', 'normal', 'nu', []);
             if ~isfield(fitting,'prior') || isempty(fitting.prior); return; end
             prior = fitting.prior;
             if ~isstruct(prior) || ~isscalar(prior)
@@ -2484,7 +2606,7 @@ classdef mcmc_bayes < mcmc
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: fitting.prior.hierarchical must be a structure (or true).');
             end
             valid = {'hyperprior','m0','kappa0','Psi0','nu0','fixed','mu','Sigma','params','subsetFraction','maxGPUMemory', ...
-                     'K','alpha','init','pi'};
+                     'K','alpha','init','pi','distribution','nu'};
             bad   = setdiff(fieldnames(h), valid);
             if ~isempty(bad)
                 error('mcmc_bayes:invalidPrior', 'mcmc_bayes: unknown field(s) in fitting.prior.hierarchical: %s (valid: %s).', ...
@@ -2577,6 +2699,30 @@ classdef mcmc_bayes < mcmc
                      'small group has no proper conditional). Use ''niw''.']);
             end
 
+            % Student-t population prior (Phase 9b), K = 1 only
+            distribution = field_or_default(h, 'distribution', 'normal');
+            if ~((ischar(distribution) && isrow(distribution)) || (isstring(distribution) && isscalar(distribution))) || ...
+                    ~any(strcmpi(distribution, {'normal','t'}))
+                error('mcmc_bayes:hierarchicalStudentT', 'mcmc_bayes: prior.hierarchical.distribution must be ''normal'' or ''t''.');
+            end
+            distribution = lower(char(distribution));
+            isT     = strcmp(distribution, 't');
+            nuT     = field_or_default(h, 'nu', []);
+            if isT
+                if isempty(nuT); nuT = 4; end
+                if ~(isnumeric(nuT) && isreal(nuT) && isscalar(nuT) && isfinite(nuT) && nuT > 0)
+                    error('mcmc_bayes:hierarchicalStudentT', 'mcmc_bayes: prior.hierarchical.nu must be a positive finite scalar (degrees of freedom of the t prior).');
+                end
+                nuT = double(nuT);
+                if K > 1
+                    error('mcmc_bayes:hierarchicalStudentT', ...
+                        ['mcmc_bayes: prior.hierarchical.distribution = ''t'' supports K = 1 only (got K = %d). Use either the ' ...
+                         'Student-t prior (K = 1) or the Gaussian mixture (distribution ''normal'', K > 1).'], K);
+                end
+            elseif ~isempty(nuT)
+                error('mcmc_bayes:hierarchicalStudentT', 'mcmc_bayes: prior.hierarchical.nu is only used with distribution = ''t''.');
+            end
+
             % fixed mode
             fixed   = logical(field_or_default(h, 'fixed', false));
             mu      = field_or_default(h, 'mu', []);
@@ -2635,6 +2781,8 @@ classdef mcmc_bayes < mcmc
             hier.alpha          = double(alpha);
             hier.init           = init;
             if K > 1; hier.pi = piFix; else; hier.pi = []; end
+            hier.distribution   = distribution;
+            hier.nu             = nuT;
         end
 
         % symmetric positive definite d x d check (returns the symmetrised matrix)
@@ -2698,19 +2846,23 @@ classdef mcmc_bayes < mcmc
         end
 
         % one Gibbs block of the hyperparameters given ubar, S of n voxels (host, double)
-        function [mu, Sigma] = gibbs_hyper(ubar, S, n, mu, Sigma, hp)
-        % hp : resolved hyperprior (resolve_hyperprior); mu/Sigma are the current values
+        function [mu, Sigma] = gibbs_hyper(ubar, S, n, mu, Sigma, hp, wSum)
+        % hp   : resolved hyperprior (resolve_hyperprior); mu/Sigma are the current values
+        % wSum : Student-t prior (Phase 9b) only: sum_i lambda_i; ubar and S are then the lambda-weighted
+        %        mean and scatter (hyper_suffstats_weighted) and n stays the number of voxels (it sets
+        %        the IW degrees of freedom). Omitted: wSum = n (Normal prior, unchanged arithmetic)
+            if nargin < 7; wSum = n; end
             d = numel(ubar);
             switch hp.hyperprior
                 case 'niw'
                     % exact joint draw from the conjugate posterior
-                    [mn, kn, Psin, nun] = mcmc_bayes.niw_posterior(ubar, S, n, hp.m0, hp.kappa0, hp.Psi0, hp.nu0);
+                    [mn, kn, Psin, nun] = mcmc_bayes.niw_posterior(ubar, S, wSum, hp.m0, hp.kappa0, hp.Psi0, hp.nu0, n);
                     Sigma   = mcmc_bayes.draw_iw_bartlett(Psin, nun);
                     mu      = mcmc_bayes.draw_mvn(mn, Sigma ./ kn);
                 case 'jeffreys_half'
                     % Sigma | u, mu (current mu), then mu | Sigma, u
                     dm      = ubar - mu;
-                    Smu     = S + n .* (dm * dm.');
+                    Smu     = S + wSum .* (dm * dm.');
                     Smu     = (Smu + Smu.')/2;
                     % degenerate state (e.g. all voxels at, or next to, the same start, as in the
                     % memory probe): Smu or the drawn Sigma is not numerically positive definite and
@@ -2720,22 +2872,25 @@ classdef mcmc_bayes < mcmc
                     if ~notPD
                         Sigma       = mcmc_bayes.draw_iw_bartlett(Smu, n - d);
                         [~, pU]     = chol(Sigma);                  % prior_to_gpu reads the upper triangle,
-                        [~, pL]     = chol(Sigma ./ n, 'lower');    % draw_mvn the lower one of Sigma/n
+                        [~, pL]     = chol(Sigma ./ wSum, 'lower'); % draw_mvn the lower one of Sigma/wSum
                         notPD       = pU > 0 || pL > 0;
                     end
                     if notPD && isfield(hp, 'floorVar') && ~isempty(hp.floorVar)
                         Sigma = mcmc_bayes.draw_iw_bartlett(Smu + max(n - d, 1) .* diag(hp.floorVar(:)), n - d);
                     end
-                    mu      = mcmc_bayes.draw_mvn(ubar, Sigma ./ n);
+                    mu      = mcmc_bayes.draw_mvn(ubar, Sigma ./ wSum);
             end
         end
 
         % NIW posterior parameters from the sufficient statistics
-        function [mn, kn, Psin, nun] = niw_posterior(ubar, S, n, m0, kappa0, Psi0, nu0)
+        function [mn, kn, Psin, nun] = niw_posterior(ubar, S, n, m0, kappa0, Psi0, nu0, nNu)
         % ubar [d,1], S [d,d] = sum_i (u_i-ubar)(u_i-ubar)', n # voxels; NIW(m0, kappa0, Psi0, nu0)
+        % Student-t prior (Phase 9b): n = sum_i lambda_i, ubar/S lambda-weighted, nNu = # voxels
+        % (nun = nu0 + nNu); nNu omitted -> n
+            if nargin < 8; nNu = n; end
             ubar    = ubar(:); m0 = m0(:);
             kn      = kappa0 + n;
-            nun     = nu0 + n;
+            nun     = nu0 + nNu;
             mn      = (kappa0 .* m0 + n .* ubar) ./ kn;
             dm      = ubar - m0;
             Psin    = Psi0 + S + (kappa0 * n / kn) .* (dm * dm.');
@@ -2761,6 +2916,70 @@ classdef mcmc_bayes < mcmc
         % multivariate normal draw (host)
         function x = draw_mvn(m, C)
             x = m(:) + chol(C, 'lower') * randn(numel(m), 1);
+        end
+
+        %% Student-t population prior (Phase 9b), see the class header
+        % per-voxel log-prior (u-dependent part) of the hierarchical parameters, [1,Nv] in the class of uH:
+        %   tNu = []            : Normal prior (and mixture), exactly logprior_mix
+        %   tNu, lam = [1,Nv]   : conditional Normal N(u | mu, Sigma/lam_i) (free mode, lam the current
+        %                         scale weights): lam_i * (-(u-mu)' P (u-mu)/2)
+        %   tNu, lam = []       : collapsed multivariate t (fixed mode, two-stage stage 2):
+        %                         -(nu+d)/2 log(1 + (u-mu)' P (u-mu)/nu)
+        function lp = logprior_hier(uH, c, mu, P, lam, tNu)
+            if isempty(tNu)
+                lp = mcmc_bayes.logprior_mix(uH, c, mu, P);
+                return
+            end
+            q = mcmc_bayes.logprior_normal(uH, mu, P);             % -delta/2
+            if ~isempty(lam)
+                lp = cast(lam, 'like', q) .* q;
+            else
+                d  = size(uH, 1);
+                lp = -((tNu + d)/2) .* log1p((-2/tNu) .* q);
+            end
+        end
+
+        % squared Mahalanobis distances delta_i = (u_i-mu)' Sigma^-1 (u_i-mu), [1,Nv] double (on the
+        % GPU for gpuArray uH); mu [d,1], Sigma [d,d] host double
+        function delta = t_mahalanobis(uH, mu, Sigma)
+            d   = numel(mu);
+            R   = chol(Sigma);
+            Ri  = R \ eye(d);
+            P   = Ri * Ri.'; P = (P + P.')/2;
+            mu  = mu(:);
+            if isgpuarray(uH); P = gpuArray(P); mu = gpuArray(mu); end
+            r   = double(uH) - mu;
+            delta = max(sum(r .* (P*r), 1), 0);
+        end
+
+        % exact draw lambda_i | u_i, mu, Sigma ~ Gamma((nu+d)/2, rate (nu+delta_i)/2), [1,Nv] double:
+        % one Gamma((nu+d)/2, 1) variate per voxel (randg; the GPU stream for gpuArray delta), then
+        % lambda_i = 2 G_i / (nu + delta_i)
+        function lam = t_lambda_draw(delta, nu, d)
+            if isgpuarray(delta)
+                G = randg((nu + d)/2, 1, numel(delta), 'gpuArray');
+            else
+                G = randg((nu + d)/2, 1, numel(delta));
+            end
+            lam = 2 .* G ./ (nu + reshape(delta, 1, []));
+        end
+
+        % Rao-Blackwellised E[lambda_i | u_i, mu, Sigma] = (nu+d)/(nu+delta_i), [1,Nv] double
+        function e = t_lambda_mean(delta, nu, d)
+            e = (nu + d) ./ (nu + delta);
+        end
+
+        % lambda-weighted statistics (double, on the GPU for gpuArray input), gathered:
+        %   wSum = sum_i lam_i, ubar = sum_i lam_i u_i / wSum, S = sum_i lam_i (u_i-ubar)(u_i-ubar)'
+        function [ubar, S, wSum] = hyper_suffstats_weighted(uH, lam)
+            ud      = double(uH);
+            lam     = double(reshape(lam, 1, []));
+            wSum    = sum(lam);
+            ubar    = (ud * lam.') ./ wSum;
+            rc      = ud - ubar;
+            S       = (rc .* lam) * rc.';
+            [ubar, S, wSum] = gather(ubar, S, wSum);
+            S       = (S + S.')/2;
         end
 
         %% Gaussian-mixture hierarchical prior (Phase 7), see the class header
@@ -3046,6 +3265,32 @@ classdef mcmc_bayes < mcmc
                     s.hierarchical.emptyGroup = 'n_k = 0: (mu_k, Sigma_k) drawn from the hyperprior NIW(m0, kappa0, Psi0, nu0)';
                 end
             end
+            % Student-t population prior (Phase 9b): fields added for distribution 't' only
+            if strcmp(hier.distribution, 't')
+                s.hierarchical.distribution = 't';
+                s.hierarchical.nu       = hier.nu;
+                s.hierarchical.space    = ['u_i ~ t_nu(mu, Sigma) on the transformed parameters (Sigma the scale matrix; scale mixture ' ...
+                                           'u_i | lambda_i ~ N(mu, Sigma/lambda_i), lambda_i ~ Gamma(nu/2, rate nu/2)); no log-Jacobian and ' ...
+                                           'no bound rejection for these parameters'];
+                s.hierarchical.lambda   = 'out.hyper.lambda: Rao-Blackwellised mean over kept samples of E[lambda_i | u_i, mu, Sigma] = (nu+d)/(nu+delta_i)';
+                if hier.fixed
+                    s.hierarchical.mhPrior  = 'collapsed multivariate t: -(nu+d)/2 log(1 + (u-mu)''Sigma^-1(u-mu)/nu) (no lambda)';
+                else
+                    s.hierarchical.mhPrior  = 'conditional N(u | mu, Sigma/lambda_i): -lambda_i (u-mu)''Sigma^-1(u-mu)/2, lambda_i the current state';
+                    s.hierarchical.lambdaStep = ['after the MH block: lambda_i | u_i, mu, Sigma ~ Gamma((nu+d)/2, rate (nu+delta_i)/2), ' ...
+                                                 'delta_i = (u_i-mu)''Sigma^-1(u_i-mu), one GPU randg per voxel (GPU stream); then theta | u, lambda'];
+                    switch hier.hyperprior
+                        case 'niw'
+                            s.hierarchical.gibbs = ['after the lambda-step: Sigma|u,lambda ~ IW(Psi_n, nu0+n), mu|Sigma,u,lambda ~ N(m_n, Sigma/kappa_n), ' ...
+                                                    'kappa_n = kappa0 + sum lambda, m_n = (kappa0 m0 + sum lambda_i u_i)/kappa_n, ' ...
+                                                    'Psi_n = Psi0 + S_w + (kappa0 sum lambda/kappa_n)(ubar_w-m0)(ubar_w-m0)'''];
+                        case 'jeffreys_half'
+                            s.hierarchical.gibbs = ['after the lambda-step: Sigma|u,mu,lambda ~ IW(S_mu,w, n-d), S_mu,w = sum lambda_i (u_i-mu)(u_i-mu)'', ' ...
+                                                    'then mu|Sigma,u,lambda ~ N(ubar_w, Sigma/sum lambda); p(mu) flat, p(Sigma) ∝ |Sigma|^(-1/2)'];
+                    end
+                    s.hierarchical.init = [s.hierarchical.init, '; lambda_i = 1'];
+                end
+            end
             s.mrf = [];
         end
 
@@ -3120,6 +3365,10 @@ classdef mcmc_bayes < mcmc
                 sdPrior = sqrt(diag(mcmc_bayes.mixture_marginal_cov(hier.mu, hier.Sigma, hier.pi)));
                 WruleDefault = ['1./sqrt(diag(V)), V = sum_k pi_k (Sigma_k + mu_k mu_k'') - mubar mubar'' ' ...
                                 '(marginal covariance of the fixed mixture)'];
+            elseif strcmp(hier.distribution, 't')
+                % Student-t (Phase 9b): the scale matrix Sigma, not the covariance nu/(nu-2) Sigma (see the class header)
+                sdPrior = sqrt(diag(hier.Sigma));
+                WruleDefault = '1./sqrt(diag(Sigma)) of the fixed Sigma (Student-t prior: the scale matrix, not the covariance nu/(nu-2) Sigma)';
             else
                 sdPrior = sqrt(diag(hier.Sigma));
                 WruleDefault = '1./sqrt(diag(Sigma)) of the fixed Sigma';
@@ -3615,6 +3864,10 @@ classdef mcmc_bayes < mcmc
                     out.hyper.membership = mcmc_bayes.vec2image(memb, mask);
                     out.hyper.mapLabel   = mcmc_bayes.vec2image(lab, mask);
                 end
+                % Student-t (Phase 9b): posterior mean of the scale weight lambda per voxel [x,y,z] (0 outside the mask)
+                if isfield(diagnostics.hyper, 'lambdaMean')
+                    out.hyper.lambda     = mcmc_bayes.vec2image(diagnostics.hyper.lambdaMean, mask);
+                end
             end
 
             out.settings = diagnostics.settings;
@@ -3630,6 +3883,11 @@ classdef mcmc_bayes < mcmc
             H.transform     = hyper.transform;
             H.hyperprior    = hyper.hyperprior;
             H.fixed         = hyper.fixed;
+            % Student-t prior (Phase 9b) only, so that the Normal-prior output is unchanged
+            if isfield(hyper, 'distribution')
+                H.distribution  = hyper.distribution;
+                H.nu            = hyper.nu;
+            end
             if hyper.fixed
                 H.mean.mu       = hyper.mu;     H.mean.Sigma    = hyper.Sigma;
                 H.median.mu     = hyper.mu;     H.median.Sigma  = hyper.Sigma;

@@ -103,6 +103,12 @@ A structure, or ``true`` for all defaults.
    * - ``.pi``
      - ``[]``
      - fixed group weights ``[K,1]`` (``fixed = true``, ``K > 1``)
+   * - ``.distribution``
+     - ``'normal'``
+     - population distribution: ``'normal'`` | ``'t'`` (multivariate Student-t with scale matrix ``Sigma``; ``K = 1`` only)
+   * - ``.nu``
+     - ``4``
+     - degrees of freedom of ``'t'`` (positive, fixed; only with ``distribution = 't'``)
    * - ``.subsetFraction``
      - ``1``
      - fraction of voxels for stage 1 (two-stage / ``estimate_hyper_subset`` only)
@@ -130,7 +136,7 @@ A structure, or ``true`` for all defaults. Requires ``fitting.prior.hierarchical
      - temperature (coupling strength ``1/tau``)
    * - ``.W``
      - ``[]``
-     - per-parameter weights ``[d,1]``; ``[]`` = ``1./sqrt(diag(Sigma))`` (``K > 1``: of the mixture's marginal covariance)
+     - per-parameter weights ``[d,1]``; ``[]`` = ``1./sqrt(diag(Sigma))`` (``K > 1``: of the mixture's marginal covariance; ``'t'``: of the scale matrix)
    * - ``.huberDelta``
      - ``1``
      - Huber threshold in units of ``sqrt(Sigma_pp)`` (``'huber'`` only)
@@ -167,7 +173,7 @@ Output
    * - ``out.diagnostics``
      - ``.acceptance``, ``.stepSize``, ``.rhat``, ``.ess``, ``.adaptCovariance`` (see :ref:`mcmc-sampler-options`)
    * - ``out.hyper``
-     - hierarchical prior: ``.params``, ``.transform``, ``.posterior.mu``/``.Sigma`` (``.pi``), ``.mean``, ``.median``, ``.ess``, ``.rhat``; ``K > 1``: ``.membership [x,y,z,K]``, ``.mapLabel [x,y,z]``
+     - hierarchical prior: ``.params``, ``.transform``, ``.posterior.mu``/``.Sigma`` (``.pi``), ``.mean``, ``.median``, ``.ess``, ``.rhat``; ``K > 1``: ``.membership [x,y,z,K]``, ``.mapLabel [x,y,z]``; ``'t'``: ``.distribution``, ``.nu``, ``.lambda [x,y,z]`` (posterior mean of the per-voxel scale weight)
    * - ``out.settings``
      - resolved options (``.likelihood``, ``.prior``, ``.mrf``, ``.nuisance``, RNG states, ...); ``.rician`` (log-likelihood form, resolved ``ricianNav`` / ``ricianSigma``) for ``'rician'`` and ``'gaussian_ricianmean'``
 
@@ -184,6 +190,8 @@ Errors
      - a Bayesian option with ``fitting.algorithm`` other than ``'MH'``
    * - ``mcmc_bayes:hierarchicalTransform``
      - a hierarchical parameter whose transform does not map to the whole real line
+   * - ``mcmc_bayes:hierarchicalStudentT``
+     - ``prior.hierarchical.distribution`` not ``'normal'`` / ``'t'``; ``.nu`` not a positive finite scalar or set without ``'t'``; ``'t'`` with ``K > 1``
    * - ``mcmc_bayes:hierarchicalMemory``, ``mcmc_bayes:mrfMemory``
      - the coupled run does not fit in GPU memory
    * - ``mcmc_bayes:ricianOption``, ``mcmc_bayes:ricianNav``, ``mcmc_bayes:ricianSigma``
