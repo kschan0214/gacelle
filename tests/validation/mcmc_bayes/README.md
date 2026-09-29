@@ -85,6 +85,21 @@ Chains are run in parallel as copies of the volume stacked along dim 3 and
 separated by an empty slice, so that no MRF edge connects two copies.
 `MCMC_BAYES_T4_ITER` overrides the iterations of T4.2, T4.3 and T4.5 (pilots).
 
+Phase 9a scripts (Rician likelihoods; characterisation, no pass/fail; GPU):
+
+- `test_T9a_1_rician_r2star.m`: monoexponential R2* phantom (12 echoes,
+  R2* 20-150 1/s) with Rician noise at SNR 5 and 10; `'rician'` vs
+  `'gaussian'` vs `'marginal_S0noise_flat'`: bias (posterior mean and
+  median), RMSE and 90% coverage of R2*, M0 and sigma.
+- `test_T9a_2_ricianmean_sphericalmean.m`: gpumcmicro spherical-mean phantom
+  simulated per direction (30 directions per shell, complex noise, magnitude,
+  then direction average) at SNR 5 and 10; `'gaussian_ricianmean'`
+  (`ricianNav` = 30, or known `ricianSigma`) vs `'gaussian'`: high-b floor and
+  prediction bias, f and D bias/RMSE/coverage.
+
+`MCMC_BAYES_T9A_PILOT=1` runs both with small sizes and short chains (a
+script check that gives the time per run).
+
 Shared helpers:
 
 - `lingauss_fwd.m`: linear toy forward model `s = A*[u1;...;ud]`.

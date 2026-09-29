@@ -148,6 +148,7 @@ classdef gpuIVIM < handle
 
             % get all fitting algorithm parameters
             fitting = this.check_set_default(fitting);
+            [extraData, noiseMap] = mcmc_bayes.take_noise_map(extraData);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % if no pars input at all (not even empty) then use prior
@@ -169,6 +170,7 @@ classdef gpuIVIM < handle
 
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
+            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, signalScale);   % -> fitting.ricianSigma, fitted-data units
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -193,7 +195,7 @@ classdef gpuIVIM < handle
                 [dataSeg, maskSeg,extraDataSeg,pars0Seg]    = this.slice_segment(data, mask, fitRange, extraData, pars0);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg,pars0Seg);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)),extraDataSeg,pars0Seg);
 
                 % discard halo slices from this segment's output before restoring
                 outSeg = utils.crop_segment_output(outSeg, seg(kseg));

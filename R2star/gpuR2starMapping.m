@@ -91,7 +91,7 @@ classdef gpuR2starMapping < handle
 
         %% higher-level data fitting functions
         % Wrapper function of fit to handle image data; automatically segment data and fitting in case the data cannot fit in the GPU in one go
-        function  [out] = estimate(this, data, mask, fitting)
+        function  [out] = estimate(this, data, mask, fitting, extraData)
         % Perform R2* model parameter estimation
         % Input data are expected in multi-dimensional image format
         % 
@@ -100,6 +100,9 @@ classdef gpuR2starMapping < handle
         % data      : 4D image data, [x,y,z,echoes]
         % mask      : 3D signal mask, [x,y,z]
         % fitting   : fitting algorithm parameters (see fit function)
+        % extraData : (optional) structure
+        %   .noiseSigma : noise sigma of one magnitude measurement (data units), scalar or 3D map [x,y,z];
+        %                 mcmc_bayes 'rician' (fixed noise) / 'gaussian_ricianmean' only
         % 
         % Output
         % -----------
@@ -108,11 +111,14 @@ classdef gpuR2starMapping < handle
         % R2star    : R2* map
         % 
 
+            if nargin < 5; extraData = []; end
+
             % display basic info
             this.display_data_model_info;
             
             % get all fitting algorithm parameters 
             fitting                     = this.check_set_default(fitting);
+            [extraData, noiseMap] = mcmc_bayes.take_noise_map(extraData);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
 
             % normalised data if needed
             [data, mask, scaleFactor]   = this.prepare_data( data, mask);
@@ -125,6 +131,7 @@ classdef gpuR2starMapping < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
+            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, scaleFactor);   % -> fitting.ricianSigma, fitted-data units
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -149,7 +156,7 @@ classdef gpuR2starMapping < handle
                 [dataSeg, maskSeg]              = this.slice_segment(data, mask, fitRange);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)));
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's

@@ -7,7 +7,7 @@ classdef DWIutility
 
     methods
 
-        function [dwi_out, bval_out, ldelta_out, BDELTA_out, te_out] = compute_rotationally_invariant_signal(this, dwi, bval, bvec, ldelta, BDELTA, te, lmax)
+        function [dwi_out, bval_out, ldelta_out, BDELTA_out, te_out, normMap] = compute_rotationally_invariant_signal(this, dwi, bval, bvec, ldelta, BDELTA, te, lmax)
         % COMPUTE_ROTATIONALLY_INVARIANT_SIGNAL
         %   Wrapper around get_Sl_all_no_normalise that handles b=0 normalisation,
         %   removes higher-order Sl from b=0 shells, and returns shell descriptors
@@ -46,6 +46,8 @@ classdef DWIutility
         %   ldelta_out : little delta aligned with 4th dim of dwi_out
         %   BDELTA_out : big delta aligned with 4th dim of dwi_out
         %   te_out     : echo time aligned with 4th dim of dwi_out
+        %   normMap    : per-voxel normalisation factor, dwi_out = Sl ./ normMap: the b=0 Sl0,
+        %                max(dwi_b0, epsilon), [x,y,z] for NTE = 1; 1 (no normalisation) for NTE > 1
         
             if nargin < 8; lmax = 0; end
         
@@ -127,7 +129,8 @@ classdef DWIutility
                 end
         
                 % Normalise and extract
-                dwi_out = dwi_raw(:,:,:, idx_nonb0) ./ max(dwi_b0, askadam.epsilon);
+                normMap = max(dwi_b0, askadam.epsilon);
+                dwi_out = dwi_raw(:,:,:, idx_nonb0) ./ normMap;
         
                 % Descriptors: one entry per non-b0 shell per Sl block
                 bval_out   = repmat(bval_loop(~isb0),   Nsl, 1);
@@ -152,6 +155,7 @@ classdef DWIutility
                 end
         
                 dwi_out = dwi_raw(:,:,:, idx_out);
+                normMap = 1;
         
                 % Descriptors aligned with output:
                 % Sl0 block: all shells (b=0 and non-b0)

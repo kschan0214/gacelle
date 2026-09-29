@@ -39,10 +39,16 @@ Likelihood
      - Description
    * - ``fitting.likelihood``
      - ``'gaussian'``
-     - ``'gaussian'`` | ``'marginal_noise'`` | ``'marginal_S0noise'`` | ``'marginal_S0noise_flat'``
+     - ``'gaussian'`` | ``'marginal_noise'`` | ``'marginal_S0noise'`` | ``'marginal_S0noise_flat'`` | ``'rician'`` | ``'gaussian_ricianmean'``; see :ref:`mcmc-bayes` (Choosing the likelihood)
    * - ``fitting.S0Param``
      - ``''``
      - name of the linear amplitude parameter in ``fitting.modelParams``; required by, and only allowed with, ``'marginal_S0noise(_flat)'``
+   * - ``fitting.ricianNav``
+     - ``[]``
+     - ``'gaussian_ricianmean'`` only: number of magnitude measurements averaged into each measurement, scalar or one entry per measurement (``> 0``); ``[]`` = 1. The single-measurement noise is ``sigma*sqrt(ricianNav/w)``
+   * - ``fitting.ricianSigma``
+     - ``[]``
+     - known noise of one magnitude measurement, ``'rician'`` and ``'gaussian_ricianmean'``: a scalar ``> 0``, or a per-voxel map with the spatial size of ``mask`` (or ``[1, Nvoxel]``), positive and finite inside the mask. ``'rician'``: the noise is fixed (not sampled; ``out.posterior.noise`` = the given value). ``'gaussian_ricianmean'``: fixes the noise inside the Rician mean, instead of ``ricianNav``. Model classes fill it from ``extraData.noiseSigma`` (map or scalar in input-data units, divided by the class's data normalisation) and slice it per GPU segment. Here it is in the units of the data passed to ``optimisation``
 
 Sampler
 ^^^^^^^
@@ -163,7 +169,7 @@ Output
    * - ``out.hyper``
      - hierarchical prior: ``.params``, ``.transform``, ``.posterior.mu``/``.Sigma`` (``.pi``), ``.mean``, ``.median``, ``.ess``, ``.rhat``; ``K > 1``: ``.membership [x,y,z,K]``, ``.mapLabel [x,y,z]``
    * - ``out.settings``
-     - resolved options (``.likelihood``, ``.prior``, ``.mrf``, ``.nuisance``, RNG states, ...)
+     - resolved options (``.likelihood``, ``.prior``, ``.mrf``, ``.nuisance``, RNG states, ...); ``.rician`` (log-likelihood form, resolved ``ricianNav`` / ``ricianSigma``) for ``'rician'`` and ``'gaussian_ricianmean'``
 
 Errors
 ^^^^^^
@@ -180,6 +186,12 @@ Errors
      - a hierarchical parameter whose transform does not map to the whole real line
    * - ``mcmc_bayes:hierarchicalMemory``, ``mcmc_bayes:mrfMemory``
      - the coupled run does not fit in GPU memory
+   * - ``mcmc_bayes:ricianOption``, ``mcmc_bayes:ricianNav``, ``mcmc_bayes:ricianSigma``
+     - ``ricianNav`` / ``ricianSigma`` with another likelihood or both set; not positive and finite (inside the mask); ``ricianNav`` neither scalar nor one entry per measurement; a ``ricianSigma`` map that does not match the mask; ``extraData.noiseSigma`` together with ``fitting.ricianSigma``
+   * - ``mcmc_bayes:noiseSigmaUnused`` (warning)
+     - (model classes) ``extraData.noiseSigma`` without ``fitting.mcmcClass = 'mcmc_bayes'``: ignored
+   * - ``mcmc_bayes:ricianNegativeData``
+     - ``'rician'`` with negative data (non-zero weight): the Rician density needs magnitudes
    * - ``mcmc:forwardSize``
      - the forward model output is not ``[Nmeas, Nvoxel]`` (e.g. single-slice data passed as ``[x,y,Nmeas]`` instead of ``[x,y,1,Nmeas]``)
    * - ``<Class>:singleSegment``

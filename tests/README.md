@@ -78,6 +78,10 @@ Tests for the experimental `utils/mcmc_bayes.m` subclass of `mcmc`:
 - **`McmcBayesLegacyTest.m`** (Tier 2, GPU) - with all new options absent
   or at their defaults, `mcmc_bayes` output must be bitwise identical to
   `mcmc` for the same seeds.
+- **`RicianUtilTest.m`** (Tier 1, one GPU test) - the Rician mean in
+  `utils/rician.m` (`rician_mean`, `rician_mean_gacelle`, `L12_gacelle`)
+  against numerical integration of the Rician density at low, moderate and
+  high SNR, the high-SNR limit, and `dlarray` gradients.
 
 ### Validation scripts (hand-run, not part of `run_tests`)
 

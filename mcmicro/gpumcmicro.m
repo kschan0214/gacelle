@@ -172,13 +172,14 @@ classdef gpumcmicro < handle
 
             % get all fitting algorithm parameters
             fitting = this.check_set_default(fitting);
+            [extraData, noiseMap] = mcmc_bayes.take_noise_map(extraData);    % extraData.noiseSigma (mcmc_bayes noise map), not seen by FWD
 
             %%%%%%%%%%%%%%%% Step 1: Validate all input data %%%%%%%%%%%%%%%%
             % if no pars input at all (not even empty) then use prior
             if nargin < 6; pars0        = []; end
 
             % compute rotationally invariant signal if needed
-            [data, mask] = this.prepare_dwi_data(data,mask,extraData,0);
+            [data, mask, normMap] = this.prepare_dwi_data(data,mask,extraData,0);
 
             % convert datatype to single or logical
             data    = single(data);
@@ -191,6 +192,7 @@ classdef gpumcmicro < handle
             
             % --- [Experimental] estimate memory usage using a small batch of data size ---
             % this method tends to be more conservative than the actual memory ussage
+            fitting = mcmc_bayes.noise_map_to_fitting(fitting, noiseMap, mask, normMap);   % -> fitting.ricianSigma, fitted-data units
             [seg,NSegment] = utils.find_optimal_segment_3D(this, data, mask, fitting, extraData);
             % priors coupling voxels (free hierarchical, MRF) need the whole volume in one call
             if strcmpi(fitting.solver,'mcmc') && strcmpi(fitting.mcmcClass,'mcmc_bayes') && NSegment > 1 && mcmc_bayes.needs_single_segment(fitting)
@@ -215,7 +217,7 @@ classdef gpumcmicro < handle
                 [dataSeg, maskSeg,extraDataSeg,pars0Seg]    = this.slice_segment(data, mask, fitRange, extraData, pars0);
 
                 % run fitting
-                [outSeg] = this.fit(dataSeg,maskSeg,fitting,extraDataSeg,pars0Seg);
+                [outSeg] = this.fit(dataSeg,maskSeg,mcmc_bayes.slice_noise_map(fitting, fitRange, size(mask,1:3)),extraDataSeg,pars0Seg);
 
                 % discard halo slices from this segment's output before restoring,
                 % so segment boundaries never keep voxels from a neighbour's
@@ -333,7 +335,10 @@ classdef gpumcmicro < handle
         %% Data preparation
 
         % compute rotationally invariant DWI signal if necessary
-        function [dwi,mask] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        function [dwi,mask,normMap] = prepare_dwi_data(this,dwi,mask,extradata,lmax)
+        % normMap : per-voxel factor the class divided the data by ([x,y,z]: b=0 signal, and/or the first
+        %           volume for multi-TE), 1 if none; used to put extraData.noiseSigma in the same units
+            normMap = 1;
             % full DWI data then compute rotaionally invariant signal
             if size(dwi,4)/(lmax/2+1) > numel(this.b) 
 
@@ -342,7 +347,7 @@ classdef gpumcmicro < handle
                     extradata.te = zeros(size(extradata.bval));
                 end
                 DWIutils    = DWIutility();
-                dwi         = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,[],[],extradata.te,lmax);
+                [dwi,~,~,~,~,normMap] = DWIutils.compute_rotationally_invariant_signal(dwi,extradata.bval,extradata.bvec,[],[],extradata.te,lmax);
                 
             elseif size(dwi,4) < numel(this.b)
                 error('There are more b-shells in the class object than available in the input data. Please check your input data.');
@@ -369,6 +374,7 @@ classdef gpumcmicro < handle
 
             % % normalised by the first volume if NTE >1
             if ~isscalar(unique(this.te))
+                normMap = normMap .* dwi(:,:,:,1);
                 dwi = dwi ./ dwi(:,:,:,1);
             end
 
