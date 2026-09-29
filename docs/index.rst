@@ -40,6 +40,7 @@ Table of Contents
    tutorial/mcmc_basic_tutorial
    tutorial/mcmc_metropolishastings_tutorial
    tutorial/mcmc_affineinvariantensemble_tutorial
+   tutorial/mcmc_bayes_tutorial
    tutorial/writing_a_new_model
 
 .. toctree::
@@ -50,6 +51,8 @@ Table of Contents
    advanced/automatic_memory_management
    advanced/askadam_convergence
    advanced/askadam_parameter_transform
+   advanced/mcmc_sampler_options
+   advanced/mcmc_bayes
 
 .. toctree::
    :maxdepth: 1
@@ -84,6 +87,9 @@ Table of Contents
    api/mcmc/optimisation
    api/mcmc/metropolis_hastings
    api/mcmc/goodman_weare
+   api/mcmc_bayes/optimisation
+   api/mcmc_bayes/run_two_stage
+   api/mcmc_bayes/estimate_hyper_subset
 
 .. Indices and tables
 .. ==================

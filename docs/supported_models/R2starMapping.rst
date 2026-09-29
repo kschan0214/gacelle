@@ -77,3 +77,13 @@ Example script for in vivo data:
 
 .. literalinclude:: ../../R2star/demo_gpuR2starMapping_invivo.m
     :language: matlab
+
+Bayesian priors (experimental)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With ``fitting.solver = 'mcmc'`` and ``fitting.mcmcClass = 'mcmc_bayes'``, ``gpuR2starMapping`` can be fitted with a hierarchical (population) prior and a spatial prior. The coupled priors need the whole volume in one GPU call. See :ref:`mcmc-bayes`.
+
+Example script for in vivo data with the hierarchical prior (BSP) and the hierarchical + spatial prior:
+
+.. literalinclude:: ../../R2star/demo_gpuR2starMapping_invivo_bayes.m
+    :language: matlab

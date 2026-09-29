@@ -37,7 +37,7 @@ I/O overview
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.ub                | 1xM numeric variable, fitting upper bound, same order as field 'modelParams', e.g. [2, 1, 0.1];             |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
-| fitting.algorithm         | MCMC algorithm, 'MH' (Metropolis-Hastings)|'GW' (Affline-invariant ensemble)                                 |
+| fitting.algorithm         | MCMC algorithm, 'MH' (Metropolis-Hastings)|'ensemble' (Affine-invariant ensemble; legacy label 'GW')        |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
 | fitting.iteration         | # MCMC iterations                                                                                            |
 +---------------------------+--------------------------------------------------------------------------------------------------------------+ 
@@ -74,6 +74,13 @@ I/O overview
 
 .. note::
     'noise' is always required in fitting.modelParams.
+
+Opt-in sampler options
+----------------------
+
+``fitting.parameterTransform``, ``fitting.updateScheme``, ``fitting.adaptStepSize``, ``fitting.adaptInterval``, ``fitting.adaptTarget``, ``fitting.adaptCovariance`` and ``fitting.overdisp`` (``'MH'``; ``'ensemble'`` supports ``parameterTransform`` only). All are off by default; setting any of them runs the adaptive sampler and adds ``out.diagnostics`` (acceptance, step sizes, R-hat, ESS) and ``out.settings`` to the output. See :ref:`mcmc-sampler-options`.
+
+For hierarchical and spatial priors, use the experimental subclass ``mcmc_bayes`` (:ref:`api-mcmc_bayes-optimisation`, :ref:`mcmc-bayes`).
 
 Memory management
 -------------------

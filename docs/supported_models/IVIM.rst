@@ -35,33 +35,39 @@ I/O overview
 
 ``obj = gpuIVIM(b);``
 
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| Input                     | Description                                                                                                  |
-+===========================+==============================================================================================================+
-| b                         | b-value of each volume of 'data', same order [ms/um2]; at least 3 distinct values                           |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
+.. list-table::
+   :widths: 25 75
+   :header-rows: 1
+
+   * - Input
+     - Description
+   * - b
+     - b-value of each volume of 'data', same order [ms/um2]; at least 3 distinct values
 
 ``[out] = obj.estimate( data, mask, extraData, fitting, pars0);``
 
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| Input                     | Description                                                                                                  |
-+===========================+==============================================================================================================+
-| data                      | 4D DWI, [x,y,z,dwi], one volume per b-value (direction-averaged or trace-weighted)                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| mask                      | 3D mask, [x,y,z]                                                                                             |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| extraData                 | Not used, kept for the common interface ([] is fine)                                                         |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting                   | Structure array for model parameter estimation (only class-specific options shown)                          |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting.solver            | Solver used for estimation, 'askadam' (default) | 'mcmc'                                                     |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting.start             | Starting point method, 'prior' (default, segmented fit) | 'default' | 1xM parameters array                   |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| fitting.bThreshold        | b-value separating the diffusion (b >= bThreshold) and perfusion regimes in the segmented start, 0.2 [ms/um2]|
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
-| pars0                     | Structure array of starting points, one field per model parameter, same spatial size as 'data' (Optional)    |
-+---------------------------+--------------------------------------------------------------------------------------------------------------+
+.. list-table::
+   :widths: 25 75
+   :header-rows: 1
+
+   * - Input
+     - Description
+   * - data
+     - 4D DWI, [x,y,z,dwi], one volume per b-value (direction-averaged or trace-weighted)
+   * - mask
+     - 3D mask, [x,y,z]
+   * - extraData
+     - Not used, kept for the common interface ([] is fine)
+   * - fitting
+     - Structure array for model parameter estimation (only class-specific options shown)
+   * - fitting.solver
+     - Solver used for estimation, 'askadam' (default) | 'mcmc'
+   * - fitting.start
+     - Starting point method, 'prior' (default, segmented fit) | 'default' | 1xM parameters array
+   * - fitting.bThreshold
+     - b-value separating the diffusion (b >= bThreshold) and perfusion regimes in the segmented start, 0.2 [ms/um2]
+   * - pars0
+     - Structure array of starting points, one field per model parameter, same spatial size as 'data' (Optional)
 
 .. note::
    The data are normalised voxel-wise by the mean signal at the lowest b-value before fitting, so ``S0`` is relative (about 1). ``out.signalScale`` holds that normalisation; ``S0`` in data units is ``out.final.S0 .* out.signalScale`` (askadam) or ``out.median.S0 .* out.signalScale`` (mcmc). Background voxels (lowest-b signal below 1% of its 99th percentile) are removed from the mask; use ``out.mask`` in later analysis.
@@ -81,3 +87,10 @@ Example script for noise propagation:
 
 .. literalinclude:: ../../IVIM/demo_noise_propagation.m
     :language: matlab
+
+Bayesian priors (experimental)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With ``fitting.solver = 'mcmc'`` and ``fitting.mcmcClass = 'mcmc_bayes'``, ``gpuIVIM`` can be fitted with a hierarchical (population) prior and a spatial prior. The coupled priors need the whole volume in one GPU call. See :ref:`mcmc-bayes`.
+
+See :ref:`tutorial-mcmc_bayes_tutorial` for a worked example. In our tests the IVIM population prior mixed slowly (see the convergence warning in :ref:`mcmc-bayes`), so check ``out.hyper.rhat`` with care.
