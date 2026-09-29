@@ -100,6 +100,24 @@ Phase 9a scripts (Rician likelihoods; characterisation, no pass/fail; GPU):
 `MCMC_BAYES_T9A_PILOT=1` runs both with small sizes and short chains (a
 script check that gives the time per run).
 
+Phase 9b scripts (Student-t population prior; GPU):
+
+- `test_T9b_0_studentt_exact.m` (pass/fail): 1D linear Gaussian toy with a
+  FIXED t prior (nu = 4), 100 typical and 50 tail voxels, 64 chains per voxel,
+  both update schemes: posterior quantiles (5-95%) and mean vs numerical
+  integration, between-chain MC error; criteria as T3.1. ~75 s on an A40.
+- `test_T9b_1_studentt_r2star.m` (characterisation): R2* phantom of Phase
+  6a/7 (12 echoes, SNR 10); K = 1 Normal vs K = 2 vs t (nu = 4): per-label
+  RMSE/bias/coverage (GP, dentate, GM, WM, ...), hyper R-hat, lambda map.
+- `test_T9b_2_studentt_meax.m` (characterisation): ME-AxCaliberSMT phantom;
+  the same three arms: per class (WM/GM/CSF-like) bias/RMSE/coverage of r,
+  R2e and the other parameters, hyper R-hat, lambda per class.
+
+T9b.1 and T9b.2 need the development data (not in the repository):
+`MCMC_BAYES_PHASE6_DIR` points to the folder with `build_r2star_phantom.m`
+and `phantom_meax.mat` (default: Kwok's local path). `MCMC_BAYES_T9B_PILOT=1`
+runs them with short chains (script check only).
+
 Shared helpers:
 
 - `lingauss_fwd.m`: linear toy forward model `s = A*[u1;...;ud]`.
